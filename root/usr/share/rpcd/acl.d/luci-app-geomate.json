@@ -1,0 +1,25 @@
+{
+    "luci-app-geomate": {
+        "description": "Grant access to Geomate configuration",
+        "read": {
+            "ubus": {
+                "luci": [ "getInitList", "setInitAction" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs" ],
+                "uci": [ "get", "state" ]
+            },
+            "uci": [ "geomate" ],
+            "file": {
+                "/etc/init.d/geomate": [ "read", "exec" ],
+                "/var/run/geomate.pid": [ "read" ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "luci": [ "setInitAction" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs" ],
+                "uci": [ "set", "commit", "apply" ]
+            },
+            "uci": [ "geomate" ]
+        }
+    }
+}
