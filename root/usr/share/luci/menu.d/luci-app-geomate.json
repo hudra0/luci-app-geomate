@@ -1,0 +1,28 @@
+{
+    "admin/services/geomate": {
+        "title": "Geomate",
+        "order": 90,
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-geomate" ]
+        }
+    },
+    "admin/services/geomate/view": {
+        "title": "View",
+        "order": 10,
+        "action": {
+            "type": "view",
+            "path": "geomate/view"
+        }
+    },
+    "admin/services/geomate/geofilters": {
+        "title": "Geo Filters",
+        "order": 20,
+        "action": {
+            "type": "view",
+            "path": "geomate/geofilters"
+        }
+    }
+}
