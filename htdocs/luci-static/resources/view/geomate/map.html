@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Geomate Map</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+
+    <!-- Leaflet.markercluster CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+
+    <style>
+        #map { height: 100vh; width: 100%; }
+        .home-buttons-container {
+            display: flex;
+        }
+        .home-button {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+            text-decoration: none;
+            text-align: center;
+            line-height: 30px;
+            background: white;
+            width: 30px;
+            height: 30px;
+        }
+        .set-home-button {
+            border-top-left-radius: 4px;
+            border-bottom-left-radius: 4px;
+            border-right: 1px solid #ccc;
+        }
+        .go-home-button {
+            border-top-right-radius: 4px;
+            border-bottom-right-radius: 4px;
+        }
+        .home-button:hover {
+            background: #f4f4f4;
+        }
+        .set-home-cursor,
+        .set-home-cursor * {
+            cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 100 100"><text y=".9em" font-size="90">📍</text></svg>') 20 20, auto !important;
+        }
+        .custom-div-icon i {
+            font-size: 20px;
+        }
+
+        /* Custom Cluster Icons */
+        .marker-cluster {
+            background-color: rgba(0, 0, 0, 0.3); /* Transparency */
+            border-radius: 50%;
+            color: white;
+            display: flex; /* Flexbox for centering */
+            align-items: center; /* Vertical centering */
+            justify-content: center; /* Horizontal centering */
+            font-weight: bold;
+            font-size: 14px;
+            line-height: 1;
+            width: 40px; /* Width */
+            height: 40px; /* Height */
+        }
+        .marker-cluster-allowed {
+            background-color: rgba(0, 128, 0, 0.6); /* Green with higher transparency */
+        }
+        .marker-cluster-blocked {
+            background-color: rgba(255, 0, 0, 0.6); /* Red with higher transparency */
+        }
+        .marker-cluster-mixed {
+            background-color: rgba(255, 165, 0, 0.6); /* Orange with higher transparency */
+        }
+        .marker-cluster-allowed-ip {
+            background-color: rgba(0, 0, 255, 0.6); /* Blue with higher transparency */
+        }        
+
+        /* Remove the icons within the clusters */
+        .marker-cluster i {
+            display: none;
+        }
+
+        /* Ensure that no additional margins or paddings are present */
+        .marker-cluster div {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+    <!-- Optional: OverlappingMarkerSpiderfier -->
+    <!-- <script src="https://unpkg.com/overlapping-marker-spiderfier-leaflet@1.0.3/oms.min.js"></script> -->
+    <script>
+        'use strict';
+
+        var map, drawnItems;
+        var regions = {};
+        var allowedIPMarkers = {}; // New layer for Allowed IPs
+        var allowedIPs = []; // New list to track allowed IPs
+        var homePosition = [51.505, -0.09];
+        var isSettingHome = false;
+
+        // Define specialized icons for different marker types
+        var blockedDivIcon = L.divIcon({
+            html: '<i class="fa fa-exclamation-triangle" style="color: red;"></i>',
+            iconSize: [25, 25],
+            className: 'custom-div-icon'
+        });
+
+        var allowedConnectionIcon = L.divIcon({
+            html: '<i class="fa fa-check-circle" style="color: green;"></i>',
+            iconSize: [25, 25],
+            className: 'custom-div-icon'
+        });
+
+        var allowedIPIcon = L.divIcon({
+            html: '<i class="fa fa-user" style="color: blue;"></i>',
+            iconSize: [25, 25],
+            className: 'custom-div-icon'
+        });
+
+        /**
+         * Generates a color based on the provided name.
+         * @param {string} name - The name to generate a color for.
+         * @returns {string} - A hex color code.
+         */
+        function getColorForName(name) {
+            var colors = ['#FF5733', '#33FF57', '#3357FF', '#FF33F1', '#33FFF1', '#F1FF33', '#FF8C33', '#8C33FF', '#33FFAF', '#FF3367'];
+            var hash = 0;
+            for (var i = 0; i < name.length; i++) {
+                hash = name.charCodeAt(i) + ((hash << 5) - hash);
+            }
+            return colors[Math.abs(hash) % colors.length];
+        }
+
+        var connectionMarkers = {};
+        var activeConnectionIPs = {}; // Set of active connection IPs
+
+        // Initialize MarkerCluster group with customized iconCreateFunction
+        var markerClusters = L.markerClusterGroup({
+            iconCreateFunction: function(cluster) {
+                var markers = cluster.getAllChildMarkers();
+                var allowed = 0;
+                var blocked = 0;
+                var allowedIPs = 0;
+
+                markers.forEach(function(marker) {
+                    if (marker.options.icon === allowedConnectionIcon) {
+                        allowed += 1;
+                    } else if (marker.options.icon === blockedDivIcon) {
+                        blocked += 1;
+                    } else if (marker.options.icon === allowedIPIcon) {
+                        allowedIPs += 1;
+                    }
+                });
+
+                var size = markers.length;
+                var className = '';
+                var html = '';
+
+                if (allowed > 0 && blocked === 0 && allowedIPs === 0) {
+                    className = 'marker-cluster marker-cluster-allowed';
+                    html = size;
+                } else if (blocked > 0 && allowed === 0 && allowedIPs === 0) {
+                    className = 'marker-cluster marker-cluster-blocked';
+                    html = size;
+                } else if (allowedIPs > 0 && allowed === 0 && blocked === 0) {
+                    className = 'marker-cluster marker-cluster-allowed-ip'; // Use the new class for Allowed IP Clusters
+                    html = size;
+                } else {
+                    className = 'marker-cluster marker-cluster-mixed';
+                    html = size;
+                }
+
+                return new L.DivIcon({
+                    html: '<div>' + html + '</div>',
+                    className: className,
+                    iconSize: L.point(40, 40) // Adjusted size to 40x40
+                });
+            }
+        });
+
+        // Optional: Initialize OverlappingMarkerSpiderfier
+        // var oms = new OverlappingMarkerSpiderfier(map, { keepSpiderfied: true });
+
+        /**
+         * Updates the map with the latest connection data.
+         * @param {Array} connections - An array of connection objects.
+         */
+        function updateConnections(connections) {
+            // Remove old connection markers from the cluster group
+            markerClusters.clearLayers();
+            connectionMarkers = {};
+            activeConnectionIPs = {};
+
+            connections.forEach(function(conn) {
+                if (!conn || !conn.geo) {
+                    console.warn('Connection is null or geo is missing:', conn);
+                    return;
+                }
+
+                var geo = conn.geo;
+                var ip = conn.dst;
+                var allowed = conn.allowed;
+                var filterName = conn.filter_name;
+                var isAllowedIP = conn.is_allowed_ip;
+
+                if (geo.lat && geo.lon && !Array.isArray(geo.lat) && !Array.isArray(geo.lon)) {
+                    activeConnectionIPs[ip] = true;
+
+                    var marker;
+                    if (isAllowedIP) {
+                        marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
+                        var popupContent = 'Allowed IP: ' + ip + '<br>' +
+                                        'Filter: ' + filterName;
+                        marker.bindPopup(popupContent);
+                        allowedIPMarkers[ip] = marker;
+                    } else if (allowed) {
+                        marker = L.marker([geo.lat, geo.lon], { icon: allowedConnectionIcon });
+                        var popupContent = 'IP: ' + ip + '<br>' +
+                                        'Status: Allowed<br>' +
+                                        'Filter: ' + filterName;
+                        marker.bindPopup(popupContent);
+                    } else {
+                        marker = L.marker([geo.lat, geo.lon], { icon: blockedDivIcon });
+                        var popupContent = 'IP: ' + ip + '<br>' +
+                                        'Status: Blocked<br>' +
+                                        'Filter: ' + filterName;
+                        marker.bindPopup(popupContent);
+                    }
+
+                    markerClusters.addLayer(marker);
+                    connectionMarkers[ip] = marker;
+                }
+            });
+
+            console.log('Active Connections:', activeConnectionIPs);
+            console.log('Current Allowed IP Markers:', allowedIPMarkers);
+        }
+
+        /**
+         * Updates the UI with the list of allowed IPs.
+         * @param {Array} allowedIPsData - An array of allowed IP objects.
+         */
+        function updateAllowedIPsUI(allowedIPsData) {
+            // Remove old Allowed IP markers from the cluster group
+            for (var ip in allowedIPMarkers) {
+                markerClusters.removeLayer(allowedIPMarkers[ip]);
+                delete allowedIPMarkers[ip];
+            }
+
+            // Add new Allowed IP markers only if the IP has an active connection
+            allowedIPsData.forEach(function(entry) {
+                var geo = entry.geo;
+                var ip = entry.ip;
+                var filter = entry.filter;
+
+                if (geo && geo.lat && geo.lon && activeConnectionIPs[ip]) { // Add only for active connections
+                    if (!allowedIPMarkers[ip]) { // Add only if not already present
+                        var marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
+                        var popupContent = 'Allowed IP: ' + ip + '<br>' +
+                                        'Filter: ' + filter;
+                        marker.bindPopup(popupContent);
+                        markerClusters.addLayer(marker);
+                        allowedIPMarkers[ip] = marker;
+                    }
+                } else {
+                    // If the IP is no longer active but still on the allowlist
+                    if (allowedIPMarkers[ip]) {
+                        markerClusters.removeLayer(allowedIPMarkers[ip]);
+                        delete allowedIPMarkers[ip];
+                    }
+                }
+            });
+
+            // Update the allowedIPs list only with active connections
+            allowedIPs = allowedIPsData
+                .filter(function(entry) { return activeConnectionIPs[entry.ip]; })
+                .map(function(entry) { return entry.ip; });
+
+            console.log('Updated Allowed IPs:', allowedIPs);
+        }
+
+        /**
+         * Initializes the map and its components.
+         */
+        function initMap() {
+            // Load the saved home position, if available
+            var savedPosition = localStorage.getItem('homePosition');
+            if (savedPosition) {
+                homePosition = JSON.parse(savedPosition);
+            }
+
+            map = L.map('map', {
+                center: homePosition,
+                zoom: 4,
+                minZoom: 2,
+                maxBounds: [[-90, -180], [90, 180]],
+                maxBoundsViscosity: 1.0
+            });
+
+            // Add OpenStreetMap tiles to the map
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors',
+                noWrap: true,
+                bounds: [[-90, -180], [90, 180]]
+            }).addTo(map);
+
+            // Add the MarkerCluster group to the map
+            map.addLayer(markerClusters);
+
+            // Optional: Add OverlappingMarkerSpiderfier to the map
+            // map.addLayer(oms);
+
+            // Define custom control for Home Buttons
+            L.Control.HomeButtons = L.Control.extend({
+                onAdd: function(map) {
+                    var container = L.DomUtil.create('div', 'leaflet-bar leaflet-control home-buttons-container');
+                    
+                    var setHomeButton = L.DomUtil.create('a', 'home-button set-home-button', container);
+                    setHomeButton.innerHTML = '📍';
+                    setHomeButton.href = '#';
+                    setHomeButton.title = 'Set home position';
+
+                    var goHomeButton = L.DomUtil.create('a', 'home-button go-home-button', container);
+                    goHomeButton.innerHTML = '🏠';
+                    goHomeButton.href = '#';
+                    goHomeButton.title = 'Go to home position';
+                    
+                    L.DomEvent.disableClickPropagation(container);
+                    
+                    L.DomEvent.on(setHomeButton, 'click', function(e) {
+                        L.DomEvent.stop(e);
+                        isSettingHome = true;
+                        setHomeButton.style.backgroundColor = '#ffff00';
+                        map.getContainer().classList.add('set-home-cursor');
+                        map.once('click', onMapClick);
+                    });
+                    
+                    L.DomEvent.on(goHomeButton, 'click', function(e) {
+                        L.DomEvent.stop(e);
+                        if (homePosition) {
+                            map.setView(homePosition, 4);
+                        }
+                    });
+                    
+                    return container;
+                }
+            });
+            
+            // Add Home Buttons control to the map
+            new L.Control.HomeButtons({ position: 'topleft' }).addTo(map);
+
+            drawnItems = new L.FeatureGroup();
+            map.addLayer(drawnItems);
+
+            // Initialize drawing controls
+            var drawControl = new L.Control.Draw({
+                edit: { featureGroup: drawnItems },
+                draw: {
+                    polygon: false,
+                    polyline: false,
+                    rectangle: false,
+                    circle: true,
+                    marker: false,
+                    circlemarker: false
+                }
+            });
+            map.addControl(drawControl);
+
+            // Event listeners for drawing actions
+            map.on(L.Draw.Event.CREATED, onDrawCreated);
+            map.on(L.Draw.Event.EDITED, onDrawEdited);
+            map.on(L.Draw.Event.DELETED, onDrawDeleted);
+
+            // Notify parent frame that the map is ready
+            window.parent.postMessage({ type: 'mapReady' }, '*');
+            
+            if (homePosition) {
+                map.setView(homePosition, 4);
+            }
+        }
+
+        /**
+         * Handles the map click event when setting a new home position.
+         * @param {Object} e - The event object containing latlng.
+         */
+        function onMapClick(e) {
+            homePosition = [e.latlng.lat, e.latlng.lng];
+            localStorage.setItem('homePosition', JSON.stringify(homePosition));
+            map.setView(homePosition, 4);
+            isSettingHome = false;
+            document.querySelector('.set-home-button').style.backgroundColor = '';
+            map.getContainer().classList.remove('set-home-cursor');
+            window.parent.postMessage({ type: 'homePositionSet', data: homePosition }, '*');
+        }
+
+        /**
+         * Handles the creation of new shapes on the map.
+         * @param {Object} event - The draw event object.
+         */
+        function onDrawCreated(event) {
+            var layer = event.layer;
+            var regionData = getRegionData(layer);
+            if (regionData) {
+                var name = prompt("Enter a name for this region:");
+                if (name) {
+                    // Initialize the region if it doesn't exist
+                    if (!regions[name]) {
+                        regions[name] = [];
+                    }
+                    setRegionColor(layer, name);
+                    layer.options.name = name;
+                    layer.bindTooltip(name); 
+                    drawnItems.addLayer(layer);
+                    regions[name].push(layer);
+                    window.parent.postMessage({ type: 'regionCreated', data: { name: name, region: regionData } }, '*');
+                } else {
+                    // Remove the layer if no name was provided
+                    drawnItems.removeLayer(layer);
+                    console.log('Region creation canceled by user.');
+                }
+            }
+        }
+
+        /**
+         * Handles the editing of existing shapes on the map.
+         * @param {Object} event - The edit event object.
+         */
+        function onDrawEdited(event) {
+            var layers = event.layers;
+            layers.eachLayer(function(layer) {
+                var name = layer.options.name;
+                if (name && regions[name]) {
+                    var regionData = getRegionData(layer);
+                    if (regionData) {
+                        window.parent.postMessage({ type: 'regionEdited', data: { name: name, region: regionData } }, '*');
+                    }
+                }
+            });
+        }
+
+        /**
+         * Handles the deletion of shapes from the map.
+         * @param {Object} event - The delete event object.
+         */
+        function onDrawDeleted(event) {
+            var layers = event.layers;
+            layers.eachLayer(function(layer) {
+                var name = layer.options.name;
+                if (name && regions[name]) {
+                    var index = regions[name].indexOf(layer);
+                    if (index > -1) {
+                        regions[name].splice(index, 1);
+                        window.parent.postMessage({ type: 'regionDeleted', data: { name: name, region: getRegionData(layer) } }, '*');
+                        if (regions[name].length === 0) {
+                            delete regions[name];
+                        }
+                    }
+                }
+            });
+        }
+
+        /**
+         * Retrieves the region data from a given layer.
+         * @param {Object} layer - The map layer.
+         * @returns {string|null} - The region data string or null.
+         */
+        function getRegionData(layer) {
+            if (layer.getRadius) {
+                var center = layer.getLatLng();
+                var radius = layer.getRadius();
+                return 'circle:' + center.lat.toFixed(6) + ':' + center.lng.toFixed(6) + ':' + Math.round(radius);
+            }
+            return null;
+        }
+
+        /**
+         * Sets the color of a region based on its name.
+         * @param {Object} layer - The map layer.
+         * @param {string} name - The name of the region.
+         */
+        function setRegionColor(layer, name) {
+            var color = getColorForName(name);
+            layer.setStyle({
+                color: color,
+                fillColor: color,
+                fillOpacity: 0.3
+            });
+        }
+
+        /**
+         * Adds a new region to the map.
+         * @param {string} name - The name of the region.
+         * @param {string} data - The data string representing the region.
+         */
+        function addRegion(name, data) {
+            var parts = data.split(':');
+            if (parts[0] === 'circle' && parts.length === 4) {
+                var lat = parseFloat(parts[1]);
+                var lng = parseFloat(parts[2]);
+                var radius = parseFloat(parts[3]);
+                var circle = L.circle([lat, lng], {
+                    radius: radius,
+                    name: name
+                });
+                setRegionColor(circle, name);
+                circle.bindTooltip(name);
+                drawnItems.addLayer(circle);
+                
+                if (!regions[name]) {
+                    regions[name] = [];
+                }
+                regions[name].push(circle);
+            }
+        }
+
+        /**
+         * Clears all markers and regions from the map.
+         */
+        function clearMap() {
+            drawnItems.clearLayers();
+            regions = {};
+            clearAllowedIPs();
+            markerClusters.clearLayers(); // Clear the cluster group
+            connectionMarkers = {};
+            allowedIPMarkers = {};
+            activeConnectionIPs = {};
+        }
+
+        /**
+         * Clears all allowed IP markers from the map.
+         */
+        function clearAllowedIPs() {
+            for (var ip in allowedIPMarkers) {
+                markerClusters.removeLayer(allowedIPMarkers[ip]);
+                delete allowedIPMarkers[ip];
+            }
+        }
+
+        // Listener for messages from the parent frame
+        window.addEventListener('message', function(event) {
+            if (event.data.type === 'addRegion') {
+                addRegion(event.data.name, event.data.data);
+            } else if (event.data.type === 'clearMap') {
+                clearMap();
+            } else if (event.data.type === 'updateConnections') {
+                updateConnections(event.data.data);
+            } else if (event.data.type === 'updateAllowedIPs') {
+                updateAllowedIPsUI(event.data.data);
+            }
+        }, false);
+
+        // Initialize the map on page load
+        initMap();
+    </script>
+</body>
+</html>
