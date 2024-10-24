@@ -1,0 +1,423 @@
+#!/usr/bin/env lua
+
+local jsonc = require "luci.jsonc"
+local uci = require "luci.model.uci".cursor()
+local nixio = require "nixio"
+
+local cache_file = "/tmp/geomate_ip_cache.json"
+local cache = {}
+
+-- Load the cache from file
+local function load_cache()
+    local f = io.open(cache_file, "r")
+    if f then
+        local content = f:read("*a")
+        cache = jsonc.parse(content) or {}
+        f:close()
+    end
+end
+
+-- Save the cache to file
+local function save_cache()
+    local f = io.open(cache_file, "w")
+    if f then
+        f:write(jsonc.stringify(cache))
+        f:close()
+    end
+end
+
+-- Geolocate an IP address
+local function geolocate_ip(ip)
+    if cache[ip] then
+        return cache[ip]
+    end
+
+    -- Use existing geodata from /etc/geomate.d
+    local geodata_dir = "/etc/geomate.d"
+    for file in nixio.fs.dir(geodata_dir) do
+        if file:match("_geo_data%.json$") then
+            local filepath = geodata_dir .. "/" .. file
+            local f = io.open(filepath, "r")
+            if f then
+                for line in f:lines() do
+                    local data = jsonc.parse(line)
+                    if data and data.query == ip and data.lat and data.lon then
+                        cache[ip] = { lat = data.lat, lon = data.lon }
+                        f:close()
+                        return cache[ip]
+                    end
+                end
+                f:close()
+            end
+        end
+    end
+
+    -- Fallback if geodata was not found
+    cache[ip] = { lat = nil, lon = nil }
+    return cache[ip]
+end
+
+-- Helper function to parse port lists and ranges
+local function parse_ports(port_str)
+    local ports = {}
+    for part in string.gmatch(port_str, '([^,]+)') do
+        if string.find(part, '-') then
+            local start_port, end_port = string.match(part, '(%d+)%-(%d+)')
+            if start_port and end_port then
+                for p = tonumber(start_port), tonumber(end_port) do
+                    ports[p] = true
+                end
+            else
+                local port = tonumber(part)
+                if port then
+                    ports[port] = true
+                end
+            end
+        else
+            local port = tonumber(part)
+            if port then
+                ports[port] = true
+            end
+        end
+    end
+    return ports
+end
+
+-- Check if a port is within the port list or range
+local function port_matches(port, port_set)
+    if port_set["any"] then
+        return true
+    end
+    return port_set[tonumber(port)] or false
+end
+
+-- Checks if a given position is within **any** allowed region
+local function is_within_any_allowed_region(lat, lon, allowed_regions)
+    if not lat or not lon or not allowed_regions then
+        return false
+    end
+
+    for _, allowed_region in ipairs(allowed_regions) do
+        local region_type, center_lat, center_lon, radius = allowed_region:match("([^:]+):([^:]+):([^:]+):([^:]+)")
+        if region_type == "circle" then
+            center_lat = tonumber(center_lat)
+            center_lon = tonumber(center_lon)
+            radius = tonumber(radius)
+
+            -- Haversine formula to calculate distance
+            local rad_lat1 = math.rad(lat)
+            local rad_lon1 = math.rad(lon)
+            local rad_lat2 = math.rad(center_lat)
+            local rad_lon2 = math.rad(center_lon)
+
+            local dlat = rad_lat2 - rad_lat1
+            local dlon = rad_lon2 - rad_lon1
+
+            local a = math.sin(dlat / 2)^2 + math.cos(rad_lat1) * math.cos(rad_lat2) * math.sin(dlon / 2)^2
+            local c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+            local earth_radius = 6371000 -- in meters
+            local distance = earth_radius * c
+
+            if distance <= radius then
+                return true
+            end
+        else
+            -- Other region types can be added here
+            -- For example, rectangles, polygons, etc.
+        end
+    end
+
+    return false
+end
+
+-- Function to retrieve the allowlist IPs as a set
+local function get_allowed_ips_set()
+    local allowed_ips_set = {}
+
+    uci:load('geomate')
+    uci:foreach('geomate', 'geo_filter', function(s)
+        if s.enabled == '1' and s.allowed_ip then
+            for _, ip in ipairs(s.allowed_ip) do
+                allowed_ips_set[ip] = true
+            end
+        end
+    end)
+
+    return allowed_ips_set
+end
+
+-- New function to read IPs from dynamic nftables sets
+local function get_ui_dynamic_ips()
+    local dynamic_ips = {}
+    local processed_ips = {}
+
+    uci:load('geomate')
+
+    -- Iterate through all GeoFilters
+    uci:foreach('geomate', 'geo_filter', function(s)
+        local name = s.name
+        local enabled = s.enabled
+        if enabled == '1' then
+            local set_name = "geomate_" .. (name:gsub(' ', '_')) .. "_ui_dynamic"
+            local cmd = "nft list set inet geomate " .. set_name
+            local handle = io.popen(cmd)
+            local result = handle:read("*a")
+            handle:close()
+
+            -- Extract IPs from the set
+            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
+                -- Prevent duplicates
+                if not processed_ips[ip] then
+                    processed_ips[ip] = true
+                    table.insert(dynamic_ips, { ip = ip, filter = s })
+                end
+            end
+        end
+    end)
+
+    return dynamic_ips
+end
+
+-- Function to check if an IP is allowed or blocked
+local function is_ip_allowed(ip, filter, allowed_ips_set)
+    -- First, check if the IP is on the allowlist
+    if allowed_ips_set[ip] then
+        return true, true  -- allowed = true, is_allowed_ip = true
+    end
+
+    -- Check if the IP is within **any** allowed region
+    local geo = geolocate_ip(ip)
+    local allowed = is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)
+
+    return allowed, false  -- allowed, is_allowed_ip = false
+end
+
+-- Retrieve active connections and filter based on criteria
+local function get_filtered_connections()
+    local connections = {}
+    local allowed_ips_set = get_allowed_ips_set()
+    local f = io.open("/proc/net/nf_conntrack", "r")
+    if not f then
+        return connections
+    end
+
+    -- Load active GeoFilters from the UCI configuration
+    local geo_filters = {}
+    uci:load('geomate')
+    uci:foreach('geomate', 'geo_filter', function(s)
+        if s.enabled == '1' then
+            -- Ensure that allowed_region is a list
+            if s.allowed_region then
+                if type(s.allowed_region) == "table" then
+                    -- Already a list
+                else
+                    -- Single entry, convert it to a list
+                    s.allowed_region = { s.allowed_region }
+                end
+            else
+                s.allowed_region = {}
+            end
+            table.insert(geo_filters, s)
+        end
+    end)
+
+    -- Parse ports for each filter
+    for _, filter in ipairs(geo_filters) do
+        if filter.dest_port then
+            filter.dest_port_set = parse_ports(filter.dest_port)
+        end
+        if filter.src_port then
+            filter.src_port_set = parse_ports(filter.src_port)
+        end
+        if filter.protocol then
+            local protocols = {}
+            for proto in filter.protocol:gmatch("[^,]+") do
+                table.insert(protocols, proto:lower())
+            end
+            filter.protocols = protocols
+        end
+    end
+
+    for line in f:lines() do
+        local conn = {}
+        conn.layer3, conn.layer4, conn.protocol, conn.timeout = line:match("(%w+)%s+(%d+)%s+(%w+)%s+(%d+)")
+        if conn.protocol then
+            local src, dst, sport, dport = line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)")
+            if src and dst and sport and dport then
+                conn.src = src
+                conn.dst = dst
+                conn.sport = sport
+                conn.dport = dport
+
+                -- Check against each active GeoFilter
+                for _, filter in ipairs(geo_filters) do
+                    local match = true
+
+                    -- Protocol check
+                    if filter.protocols then
+                        local protocol_lower = conn.protocol:lower()
+                        if not table_contains(filter.protocols, protocol_lower) then
+                            match = false
+                        end
+                    end
+
+                    -- Source IP check
+                    if filter.src_ip and filter.src_ip ~= conn.src then
+                        match = false
+                    end
+
+                    -- Source port check
+                    if filter.src_port_set then
+                        if not port_matches(conn.sport, filter.src_port_set) then
+                            match = false
+                        end
+                    end
+
+                    -- Destination port check
+                    if filter.dest_port_set then
+                        if not port_matches(conn.dport, filter.dest_port_set) then
+                            match = false
+                        end
+                    end
+
+                    if match then
+                        -- Geolocate the destination IP
+                        local geo = geolocate_ip(conn.dst)
+                        conn.geo = geo
+                        -- Check if the connection is within **any** allowed region
+                        local allowed = is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)
+
+                        -- Prioritize allowlist: If the IP is on the allowlist, set allowed to true
+                        if allowed_ips_set[conn.dst] then
+                            allowed = true
+                            conn.is_allowed_ip = true  -- Field to indicate allowed IPs
+                        else
+                            conn.is_allowed_ip = false
+                        end
+
+                        conn.allowed = allowed
+                        conn.filter_name = filter.name
+                        table.insert(connections, conn)
+                    end
+                end
+            end
+        end
+    end
+    f:close()
+
+    save_cache()
+    return connections
+end
+
+-- New main function to retrieve all connections, including those from dynamic sets
+local function get_all_connections()
+    load_cache()
+    local connections = get_filtered_connections()
+    local dynamic_ips = get_ui_dynamic_ips()
+    local allowed_ips_set = get_allowed_ips_set()
+
+    -- Create a quick lookup for existing connections
+    local processed_ips = {}
+    for _, conn in ipairs(connections) do
+        processed_ips[conn.dst] = true
+    end
+
+    -- Add IPs from dynamic sets
+    for _, entry in ipairs(dynamic_ips) do
+        local ip = entry.ip
+        local filter = entry.filter
+        local filter_name = filter.name
+
+        if not processed_ips[ip] then
+            local allowed, is_allowed_ip = is_ip_allowed(ip, filter, allowed_ips_set)
+            local geo = geolocate_ip(ip)
+
+            local conn = {
+                src = "unknown",
+                dst = ip,
+                protocol = "unknown",
+                sport = "unknown",
+                dport = "unknown",
+                allowed = allowed,
+                geo = geo,
+                filter_name = filter_name,
+                is_dynamic = true,        -- Indicates the connection is from a dynamic set
+                is_allowed_ip = is_allowed_ip  -- Indicates if the IP is on the allowlist
+            }
+
+            table.insert(connections, conn)
+            processed_ips[ip] = true
+        end
+    end
+
+    save_cache()
+    return connections
+end
+
+-- Retrieve allowlist IPs
+local function get_allowed_ips()
+    local allowed_ips = {}
+
+    uci:load('geomate')
+    uci:foreach('geomate', 'geo_filter', function(s)
+        if s.enabled == '1' and s.allowed_ip then
+            for _, ip in ipairs(s.allowed_ip) do
+                local geo = geolocate_ip(ip)
+                if geo.lat and geo.lon then
+                    table.insert(allowed_ips, { ip = ip, geo = geo, filter = s.name })
+                end
+            end
+        end
+    end)
+
+    return allowed_ips
+end
+
+-- Function to check if an element is in a table
+function table_contains(tbl, element)
+    for _, value in ipairs(tbl) do
+        if value == element then
+            return true
+        end
+    end
+    return false
+end
+
+-- Main function of the RPC script
+local methods = {
+    getGeomateConnections = {
+        call = function()
+            local connections = get_all_connections()
+            return { connections = connections }
+        end        
+    },
+    getAllowedIPs = {
+        call = function()
+            load_cache()
+            local allowed_ips = get_allowed_ips()
+            save_cache()
+            return { allowed_ips = allowed_ips }
+        end
+    }
+}
+
+-- Handle RPC calls
+if arg[1] == "list" then
+    local rv = {}
+    for k, v in pairs(methods) do
+        rv[k] = v.args or {}
+    end
+    print((jsonc.stringify(rv):gsub(":%[%]", ":{}")))
+elseif arg[1] == "call" then
+    local args = jsonc.parse(io.stdin:read("*a"))
+    local method = methods[arg[2]]
+    if method then
+        local result = method.call(args)
+        print(jsonc.stringify(result))
+        os.exit(result.code or 0)
+    else
+        print(jsonc.stringify({ error = "Method not found" }))
+        os.exit(1)
+    end
+end
