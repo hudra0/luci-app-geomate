@@ -49,7 +49,7 @@ return view.extend({
 
         // Geographic regions that are allowed for this filter
         o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'));
-        o.rmempty = false;
+        o.rmempty = true;
 
         // Enable/disable individual filters
         o = s.option(form.Flag, 'enabled', _('Enable'));
@@ -68,11 +68,13 @@ return view.extend({
 
         // Source port configuration
         o = s.option(form.Value, 'src_port', _('Source Port'));
-        o.datatype = 'port';
+        o.datatype = 'or(port,portrange,ports)';
+        o.placeholder = '25200 25300 or 27015-27020';
 
         // Destination port configuration
         o = s.option(form.Value, 'dest_port', _('Destination Port'));
-        o.datatype = 'port';
+        o.datatype = 'or(port,portrange,ports)';
+        o.placeholder = '25200 25300 or 27015-27020';
 
         // Whitelist for specific IP addresses
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
