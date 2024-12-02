@@ -443,9 +443,20 @@
             layers.eachLayer(function(layer) {
                 var name = layer.options.name;
                 if (name && regions[name]) {
-                    var regionData = getRegionData(layer);
-                    if (regionData) {
-                        window.parent.postMessage({ type: 'regionEdited', data: { name: name, region: regionData } }, '*');
+                    var oldRegionData = layer.options.regionData;
+                    var newRegionData = getRegionData(layer);
+                    if (newRegionData) {
+                        // Update the stored region
+                        layer.options.regionData = newRegionData;
+                        // Send both regions to the parent component
+                        window.parent.postMessage({
+                            type: 'regionEdited',
+                            data: {
+                                name: name,
+                                oldRegion: oldRegionData,
+                                region: newRegionData
+                            }
+                        }, '*');
                     }
                 }
             });
@@ -481,7 +492,7 @@
             if (layer.getRadius) {
                 var center = layer.getLatLng();
                 var radius = layer.getRadius();
-                return 'circle:' + center.lat.toFixed(6) + ':' + center.lng.toFixed(6) + ':' + Math.round(radius);
+                return 'circle:' + center.lat.toFixed(8) + ':' + center.lng.toFixed(8) + ':' + Math.round(radius);
             }
             return null;
         }
@@ -523,6 +534,7 @@
                     regions[name] = [];
                 }
                 regions[name].push(circle);
+                circle.options.regionData = data; // Save the original region
             }
         }
 
