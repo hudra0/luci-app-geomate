@@ -64,21 +64,25 @@ return view.extend({
 
         // Source IP configuration
         o = s.option(form.Value, 'src_ip', _('Source IP'));
-        o.datatype = 'ip4addr';
+        o.datatype = 'list(neg(ip4addr))';
+        o.placeholder = '192.168.1.0/24 or !192.168.1.128/25';
+        o.rmempty = true;
 
         // Source port configuration
         o = s.option(form.Value, 'src_port', _('Source Port'));
-        o.datatype = 'or(port,portrange,ports)';
+		o.datatype = 'list(neg(portrange))';
         o.placeholder = '25200 25300 or 27015-27020';
 
         // Destination port configuration
         o = s.option(form.Value, 'dest_port', _('Destination Port'));
-        o.datatype = 'or(port,portrange,ports)';
+		o.datatype = 'list(neg(portrange))';
         o.placeholder = '25200 25300 or 27015-27020';
 
         // Whitelist for specific IP addresses
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
-        o.datatype = 'ip4addr';
+        o.datatype = 'list(neg(ip4addr))';
+        o.placeholder = '192.168.1.0/24 or !192.168.1.128/25';
+        o.rmempty = true;
 
         // Path to the IP list file
         o = s.option(form.Value, 'ip_list', _('IP List File'));
