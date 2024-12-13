@@ -374,7 +374,29 @@ return view.extend({
         var self = this;
     
         if (isNewRegion) {
+            // Get existing filter settings if available
+            var existingSettings = null;
+            var sections = uci.sections('geomate', 'geo_filter');
+            var existingSection = sections.find(section => section.name === name);
+            
+            if (existingSection) {
+                existingSettings = {
+                    protocol: existingSection.protocol || 'udp',
+                    src_ip: existingSection.src_ip || '',
+                    src_port: existingSection.src_port || '',
+                    dest_port: existingSection.dest_port || '',
+                    allowed_ip: existingSection.allowed_ip || [],
+                    ip_list: existingSection.ip_list || ''
+                };
+            }
+
             // Modal Dialog for new filters
+            var dynlist = new ui.DynamicList('', null, {
+                name: 'allowed_ip',
+                datatype: 'list(neg(ip4addr))',
+                placeholder: _('192.168.1.0/24 or !192.168.1.128/25')
+            });
+
             ui.showModal(_('GeoFilter Settings'), [
                 E('div', { 'class': 'cbi-map' }, [
                     E('div', { 'class': 'cbi-section' }, [
@@ -397,10 +419,11 @@ return view.extend({
                                 E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
                                     E('select', { 
                                         'id': 'geomate-protocol',
-                                        'class': 'cbi-input-select'
+                                        'class': 'cbi-input-select',
+                                        'value': existingSettings ? existingSettings.protocol : 'udp'
                                     }, [
-                                        E('option', { 'value': 'tcp' }, 'TCP'),
-                                        E('option', { 'value': 'udp' }, 'UDP')
+                                        E('option', { 'value': 'tcp', 'selected': existingSettings && existingSettings.protocol === 'tcp' }, 'TCP'),
+                                        E('option', { 'value': 'udp', 'selected': !existingSettings || existingSettings.protocol === 'udp' }, 'UDP')
                                     ])
                                 ])
                             ]),
@@ -408,76 +431,46 @@ return view.extend({
                             E('div', { 'class': 'cbi-value' }, [
                                 E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Source IP')),
                                 E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('input', { 
-                                        'id': 'geomate-src-ip',
-                                        'type': 'text',
-                                        'class': 'cbi-input-text',
-                                        'placeholder': '192.168.1.0/24',
-                                        'datatype': 'ip4addr'
-                                    })
+                                    new ui.Textfield(existingSettings ? existingSettings.src_ip : '', {
+                                        id: 'geomate-src-ip',
+                                        name: 'src_ip',
+                                        placeholder: '192.168.1.0/24',
+                                        datatype: 'ip4addr',
+                                        optional: true
+                                    }).render()
                                 ])
                             ]),
                             // Source Port
                             E('div', { 'class': 'cbi-value' }, [
                                 E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Source Port')),
                                 E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('input', { 
-                                        'id': 'geomate-src-port',
-                                        'type': 'text',
-                                        'class': 'cbi-input-text',
-                                        'placeholder': '25200 25300 or 27015-27020',
-                                        'datatype': 'or(port,portrange,ports)'
-                                    })
+                                    new ui.Textfield(existingSettings ? existingSettings.src_port : '', {
+                                        id: 'geomate-src-port',
+                                        name: 'src_port',
+                                        placeholder: '25200 25300 or 27015-27020',
+                                        datatype: 'list(neg(portrange))',
+                                        optional: true
+                                    }).render()
                                 ])
                             ]),
                             // Destination Port
                             E('div', { 'class': 'cbi-value' }, [
                                 E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Destination Port')),
                                 E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('input', { 
-                                        'id': 'geomate-dest-port',
-                                        'type': 'text',
-                                        'class': 'cbi-input-text',
-                                        'placeholder': '25200 25300 or 27015-27020',
-                                        'datatype': 'or(port,portrange,ports)'
-                                    })
+                                    new ui.Textfield(existingSettings ? existingSettings.dest_port : '', {
+                                        id: 'geomate-dest-port',
+                                        name: 'dest_port',
+                                        placeholder: '25200 25300 or 27015-27020',
+                                        datatype: 'list(neg(portrange))',
+                                        optional: true
+                                    }).render()
                                 ])
                             ]),
-                            // Allowed IPs (DynamicList)
+                            // Allowed IPs
                             E('div', { 'class': 'cbi-value' }, [
                                 E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Allowed IPs')),
                                 E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('div', { 'id': 'allowed-ips-container' }, [
-                                        E('input', { 
-                                            'id': 'geomate-allowed-ips',
-                                            'type': 'text',
-                                            'class': 'cbi-input-text',
-                                            'placeholder': _('Add IP address'),
-                                            'datatype': 'ip4addr'
-                                        }),
-                                        E('button', {
-                                            'class': 'cbi-button cbi-button-add',
-                                            'click': function(ev) {
-                                                ev.preventDefault();
-                                                var input = document.getElementById('geomate-allowed-ips');
-                                                var container = document.getElementById('allowed-ips-list');
-                                                if (input.value) {
-                                                    container.appendChild(E('div', {}, [
-                                                        E('span', {}, input.value),
-                                                        E('button', {
-                                                            'class': 'cbi-button cbi-button-remove',
-                                                            'click': function(ev) {
-                                                                ev.preventDefault();
-                                                                ev.target.parentElement.remove();
-                                                            }
-                                                        }, '✕')
-                                                    ]));
-                                                    input.value = '';
-                                                }
-                                            }
-                                        }, _('Add'))
-                                    ]),
-                                    E('div', { 'id': 'allowed-ips-list', 'class': 'cbi-dynlist' })
+                                    dynlist.render()
                                 ])
                             ]),
                             // IP List File
@@ -487,7 +480,8 @@ return view.extend({
                                     E('input', { 
                                         'id': 'geomate-ip-list',
                                         'type': 'text',
-                                        'class': 'cbi-input-text'
+                                        'class': 'cbi-input-text',
+                                        'value': existingSettings ? existingSettings.ip_list : ''
                                     })
                                 ])
                             ])
@@ -505,11 +499,10 @@ return view.extend({
                         'click': function() {
                             var settings = {
                                 protocol: document.getElementById('geomate-protocol').value,
-                                src_ip: document.getElementById('geomate-src-ip').value,
-                                src_port: document.getElementById('geomate-src-port').value,
-                                dest_port: document.getElementById('geomate-dest-port').value,
-                                allowed_ip: Array.from(document.getElementById('allowed-ips-list').children)
-                                    .map(div => div.firstChild.textContent),
+                                src_ip: document.querySelector('input[name="src_ip"]').value,
+                                src_port: document.querySelector('input[name="src_port"]').value,
+                                dest_port: document.querySelector('input[name="dest_port"]').value,
+                                allowed_ip: dynlist.getValue(),
                                 ip_list: document.getElementById('geomate-ip-list').value
                             };
     
@@ -519,6 +512,16 @@ return view.extend({
                     }, _('Save'))
                 ])
             ]);
+
+            // Set DynamicList values after modal is rendered
+            requestAnimationFrame(function() {
+                if (existingSettings && existingSettings.allowed_ip) {
+                    if (!Array.isArray(existingSettings.allowed_ip)) {
+                        existingSettings.allowed_ip = [existingSettings.allowed_ip];
+                    }
+                    dynlist.setValue(existingSettings.allowed_ip);
+                }
+            });
         } else {
             // Logic for updating existing regions
             return uci.load('geomate')
@@ -613,24 +616,6 @@ return view.extend({
 
                 return uci.save();
             });
-    },
-
-    // Helper function for port validation
-    validatePorts: function(portString) {
-        if (!portString) return true;
-        
-        const ports = portString.split(',');
-        const portRegex = /^\d+(-\d+)?$/;
-        
-        return ports.every(port => {
-            if (!portRegex.test(port.trim())) return false;
-            
-            const [start, end] = port.split('-').map(Number);
-            if (end) {
-                return start >= 1 && start <= 65535 && end >= 1 && end <= 65535 && start <= end;
-            }
-            return start >= 1 && start <= 65535;
-        });
     },
 
     // Send a generic message to the map iframe
