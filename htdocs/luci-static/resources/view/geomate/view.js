@@ -481,8 +481,59 @@ return view.extend({
                                         'id': 'geomate-ip-list',
                                         'type': 'text',
                                         'class': 'cbi-input-text',
-                                        'value': existingSettings ? existingSettings.ip_list : ''
-                                    })
+                                        'readonly': true,
+                                        'value': existingSettings ? existingSettings.ip_list : '',
+                                        'style': 'margin-bottom: 8px; width: 100%'
+                                    }),
+                                    E('div', { 'class': 'cbi-value-field-buttons' }, [
+                                        E('button', {
+                                            'class': 'btn cbi-button-neutral',
+                                            'click': function() {
+                                                var filename = name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
+                                                var filepath = '/etc/geomate.d/' + filename;
+                                                
+                                                fs.write(filepath, '').then(function() {
+                                                    document.getElementById('geomate-ip-list').value = filepath;
+                                                }).catch(function(error) {
+                                                    ui.addNotification(null, E('p', {}, _('Failed to create empty file: ' + error.message)));
+                                                });
+                                            }
+                                        }, _('Create Empty List')),
+                                        ' ',
+                                        E('div', { 'class': 'cbi-value-field', 'style': 'display: inline-block' }, [
+                                            E('input', {
+                                                'type': 'file',
+                                                'id': 'geomate-ip-list-upload',
+                                                'style': 'display: none',
+                                                'change': function(ev) {
+                                                    var file = ev.target.files[0];
+                                                    if (!file) return;
+
+                                                    var filename = name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
+                                                    var filepath = '/etc/geomate.d/' + filename;
+
+                                                    var reader = new FileReader();
+                                                    reader.onload = function(e) {
+                                                        fs.write(filepath, e.target.result).then(function() {
+                                                            var ipListInput = document.getElementById('geomate-ip-list');
+                                                            if (ipListInput) {
+                                                                ipListInput.value = filepath;
+                                                            }
+                                                        }).catch(function(error) {
+                                                            ui.addNotification(null, E('p', {}, _('Failed to upload file: ' + error.message)));
+                                                        });
+                                                    };
+                                                    reader.readAsText(file);
+                                                }
+                                            }),
+                                            E('button', {
+                                                'class': 'btn cbi-button-action',
+                                                'click': function() {
+                                                    document.getElementById('geomate-ip-list-upload').click();
+                                                }
+                                            }, _('Upload IP List'))
+                                        ])
+                                    ])
                                 ])
                             ])
                         ])
@@ -534,7 +585,7 @@ return view.extend({
                         if (!Array.isArray(regions)) {
                             regions = [regions];
                         }
-                        
+
                         // Find and replace the old region
                         var index = regions.indexOf(oldRegion);
                         if (index > -1) {
