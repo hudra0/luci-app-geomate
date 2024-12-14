@@ -438,7 +438,7 @@
          * Handles the editing of existing shapes on the map.
          * @param {Object} event - The edit event object.
          */
-        function onDrawEdited(event) {
+         function onDrawEdited(event) {
             var layers = event.layers;
             layers.eachLayer(function(layer) {
                 var name = layer.options.name;
@@ -446,17 +446,27 @@
                     var oldRegionData = layer.options.regionData;
                     var newRegionData = getRegionData(layer);
                     if (newRegionData) {
-                        // Update the stored region
-                        layer.options.regionData = newRegionData;
-                        // Send both regions to the parent component
-                        window.parent.postMessage({
-                            type: 'regionEdited',
-                            data: {
-                                name: name,
-                                oldRegion: oldRegionData,
-                                region: newRegionData
-                            }
-                        }, '*');
+                        // Find the existing circle in the regions array
+                        var existingCircle = regions[name].find(function(circle) {
+                            return circle.options.regionData === oldRegionData;
+                        });
+
+                        if (existingCircle) {
+                            // Update the existing circle's properties instead of creating a new one
+                            existingCircle.setLatLng(layer.getLatLng());
+                            existingCircle.setRadius(layer.getRadius());
+                            existingCircle.options.regionData = newRegionData;
+                            
+                            // Send both regions to the parent component
+                            window.parent.postMessage({
+                                type: 'regionEdited',
+                                data: {
+                                    name: name,
+                                    oldRegion: oldRegionData,
+                                    region: newRegionData
+                                }
+                            }, '*');
+                        }
                     }
                 }
             });
