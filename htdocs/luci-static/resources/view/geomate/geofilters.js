@@ -3,6 +3,7 @@
 'require form';
 'require uci';
 'require ui';
+'require fs';
 
 return view.extend({
     render: function() {
@@ -87,6 +88,65 @@ return view.extend({
         // Path to the IP list file
         o = s.option(form.Value, 'ip_list', _('IP List File'));
         o.rmempty = false;
+
+        // Helper function to generate and set the IP list path
+        function setIpListPath(section_id, map) {
+            var name_field = map.lookupOption('name', section_id)[0];
+            var ip_list_field = map.lookupOption('ip_list', section_id)[0];
+            
+            var name = name_field.formvalue(section_id);
+            if (!name) {
+                ui.addNotification(null, E('p', _('Please specify a filter name first.')));
+                return null;
+            }
+
+            var filepath = '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
+            ip_list_field.getUIElement(section_id).setValue(filepath);
+            return filepath;
+        }
+
+        // Create Empty List button
+        o = s.option(form.Button, '_create_empty', _(''));
+        o.inputtitle = _('Create Empty List');
+        o.inputstyle = 'apply';
+        o.modalonly = true;
+        o.onclick = function(ev) {
+            setIpListPath(this.section.section, this.map);
+        };
+
+        // Upload List button
+        o = s.option(form.Button, '_upload', _(''));
+        o.inputtitle = _('Upload List');
+        o.inputstyle = 'apply';
+        o.modalonly = true;
+        o.onclick = function(ev) {
+            var filepath = setIpListPath(this.section.section, this.map);
+            if (!filepath) return;
+
+            var fileInput = E('input', {
+                'type': 'file',
+                'style': 'display:none',
+                'change': function(ev) {
+                    if (!ev.target.files[0]) return;
+
+                    var reader = new FileReader();
+                    reader.onload = function() {
+                        var content = reader.result;
+                        L.resolveDefault(fs.write(filepath, content), null).then(function(rc) {
+                            if (rc === null)
+                                ui.addNotification(null, E('p', _('Failed to upload file.')));
+                            else
+                                ui.addNotification(null, E('p', _('File uploaded successfully.')));
+                        });
+                    };
+                    reader.readAsText(ev.target.files[0]);
+                }
+            });
+
+            document.body.appendChild(fileInput);
+            fileInput.click();
+            document.body.removeChild(fileInput);
+        };
 
         return m.render();
     }
