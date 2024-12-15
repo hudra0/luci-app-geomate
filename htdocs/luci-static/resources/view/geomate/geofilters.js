@@ -38,6 +38,15 @@ return view.extend({
         o.placeholder = '0';
         o.rmempty = false;
 
+        // **Operational Mode Option**
+        // Choose between dynamic (automatic) and static (predefined) IP lists
+        o = s.option(form.ListValue, 'operational_mode', _('Operational Mode'),
+            _('Choose between dynamic (automatic) or static (predefined) IP lists'));
+        o.value('dynamic', _('Dynamic - Build IP lists automatically'));
+        o.value('static', _('Static - Use predefined IP lists'));
+        o.default = 'dynamic';
+        o.rmempty = false;
+
         // **Geo Filters Section**
         // Main section for configuring individual geographic filters
         s = m.section(form.GridSection, 'geo_filter', _('Geo Filters'));
