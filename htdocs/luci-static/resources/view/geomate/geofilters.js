@@ -27,7 +27,10 @@ return view.extend({
         // **Strict Mode Option**
         // When disabled, untracked connections are allowed. When enabled, all untracked connections are blocked
         o = s.option(form.Flag, 'strict_mode', _('Strict Mode'),
-            _('Enable or disable strict mode'));
+            _('When enabled, only known and allowed game servers are accessible. When disabled, both allowed and untracked server connections are permitted. ' +
+              'Keep this disabled when you start using a new game or have no complete IP list - this allows Geomate to learn new server IPs ' +
+              'while you play. Once Geomate has detected all/most required game servers and added them to its list, you can enable ' +
+              'Strict Mode to fully apply your geographic filters.'));
         o.rmempty = false;
 
         // **Debug Level Option**
@@ -45,6 +48,15 @@ return view.extend({
         o.value('dynamic', _('Dynamic - Build IP lists automatically'));
         o.value('static', _('Static - Use predefined IP lists'));
         o.default = 'dynamic';
+        o.rmempty = false;
+
+        // **Geolocation Mode Option**
+        // Choose how often to update IP geolocation data
+        o = s.option(form.ListValue, 'geolocation_mode', _('Geolocation Update Mode'),
+            _('Choose how often to update IP geolocation data'));
+        o.value('frequent', _('Frequent - Update every 30-60 minutes'));
+        o.value('daily', _('Daily - Update once per day'));
+        o.default = 'frequent';
         o.rmempty = false;
 
         // **Geo Filters Section**
