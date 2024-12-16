@@ -10,7 +10,9 @@
             "uci": [ "geomate" ],
             "file": {
                 "/etc/init.d/geomate": [ "read", "exec" ],
-                "/var/run/geomate.pid": [ "read" ]
+                "/etc/geolocate.sh": [ "read", "exec" ],
+                "/var/run/geomate.pid": [ "read" ],
+                "/etc/geomate.d/*": [ "read" ]
             }
         },
         "write": {
@@ -19,7 +21,10 @@
                 "luci.geomate": [ "getGeomateConnections", "getAllowedIPs" ],
                 "uci": [ "set", "commit", "apply" ]
             },
-            "uci": [ "geomate" ]
+            "uci": [ "geomate" ],
+            "file": {
+                "/etc/geomate.d/*": [ "write" ]
+            }
         }
     }
 }
