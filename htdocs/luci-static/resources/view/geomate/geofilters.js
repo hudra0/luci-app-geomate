@@ -41,6 +41,48 @@ return view.extend({
         o.placeholder = '0';
         o.rmempty = false;
 
+        // Manual Geolocation Button
+        o = s.option(form.Button, '_manual_geolocation', _('Manual Geolocation'));
+        o.inputtitle = _('Run Manual Geolocation');
+        o.inputstyle = 'action';
+        o.onclick = function() {
+            return ui.showModal(_('Manual Geolocation'), [
+                E('div', { 'class': 'alert-message warning' }, [
+                    E('strong', {}, _('Warning:')),
+                    E('p', {}, _('Running manual geolocation may:')),
+                    E('ul', {}, [
+                        E('li', {}, _('Temporarily affect the filtering of game servers')),
+                        E('li', {}, _('Disconnect you from your current game')),
+                        E('li', {}, _('Take several minutes to complete')),
+                        E('li', {}, _('Use API quota for IP geolocation'))
+                    ])
+                ]),
+                E('div', { 'class': 'right' }, [
+                    E('button', {
+                        'class': 'btn',
+                        'click': ui.hideModal
+                    }, _('Cancel')),
+                    E('button', {
+                        'class': 'btn cbi-button-positive',
+                        'click': function() {
+                            ui.hideModal();
+                            ui.addNotification(null, E('p', {}, _('Manual geolocation started. This may take several minutes.')));
+                            
+                            return fs.exec('/etc/geolocate.sh').then(function(res) {
+                                if (res.code === 0) {
+                                    ui.addNotification(null, E('p', {}, _('Manual geolocation completed successfully.')));
+                                } else {
+                                    ui.addNotification(null, E('p', {}, _('Failed to complete geolocation: ') + (res.stderr || 'Unknown error')), 'error');
+                                }
+                            }).catch(function(err) {
+                                ui.addNotification(null, E('p', {}, _('Failed to start manual geolocation: ') + err.message), 'error');
+                            });
+                        }
+                    }, _('Proceed'))
+                ])
+            ]);
+        };
+
         // **Operational Mode Option**
         // Choose between dynamic (automatic) and static (predefined) IP lists
         o = s.option(form.ListValue, 'operational_mode', _('Operational Mode'),
