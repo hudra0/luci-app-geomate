@@ -381,7 +381,7 @@ return view.extend({
             
             if (existingSection) {
                 existingSettings = {
-                    protocol: existingSection.protocol || 'udp',
+                    protocol: existingSection.protocol,
                     src_ip: existingSection.src_ip || '',
                     src_port: existingSection.src_port || '',
                     dest_port: existingSection.dest_port || '',
@@ -419,11 +419,16 @@ return view.extend({
                                 E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
                                     E('select', { 
                                         'id': 'geomate-protocol',
-                                        'class': 'cbi-input-select',
-                                        'value': existingSettings ? existingSettings.protocol : 'udp'
+                                        'class': 'cbi-input-select'
                                     }, [
-                                        E('option', { 'value': 'tcp', 'selected': existingSettings && existingSettings.protocol === 'tcp' }, 'TCP'),
-                                        E('option', { 'value': 'udp', 'selected': !existingSettings || existingSettings.protocol === 'udp' }, 'UDP')
+                                        E('option', { 
+                                            'value': 'tcp',
+                                            'selected': (existingSettings && existingSettings.protocol === 'tcp') ? 'selected' : null 
+                                        }, 'TCP'),
+                                        E('option', { 
+                                            'value': 'udp',
+                                            'selected': (!existingSettings || existingSettings.protocol === 'udp') ? 'selected' : null
+                                        }, 'UDP')
                                     ])
                                 ])
                             ]),
