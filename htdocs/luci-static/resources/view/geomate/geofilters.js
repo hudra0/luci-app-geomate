@@ -45,7 +45,7 @@ return view.extend({
         o = s.option(form.Button, '_manual_geolocation', _('Manual Geolocation'));
         o.inputtitle = _('Run Manual Geolocation');
         o.inputstyle = 'action';
-        o.onclick = function() {
+        o.onclick = function(ev) {
             return ui.showModal(_('Manual Geolocation'), [
                 E('div', { 'class': 'alert-message warning' }, [
                     E('strong', {}, _('Warning:')),
@@ -66,17 +66,12 @@ return view.extend({
                         'class': 'btn cbi-button-positive',
                         'click': function() {
                             ui.hideModal();
-                            ui.addNotification(null, E('p', {}, _('Manual geolocation started. This may take several minutes.')));
+                            ui.addNotification(null, E('p', {}, _('Manual geolocation process started. This process runs in the background and may take several minutes to complete.')), 'info');
                             
-                            return fs.exec('/etc/geolocate.sh').then(function(res) {
-                                if (res.code === 0) {
-                                    ui.addNotification(null, E('p', {}, _('Manual geolocation completed successfully.')));
-                                } else {
-                                    ui.addNotification(null, E('p', {}, _('Failed to complete geolocation: ') + (res.stderr || 'Unknown error')), 'error');
-                                }
-                            }).catch(function(err) {
-                                ui.addNotification(null, E('p', {}, _('Failed to start manual geolocation: ') + err.message), 'error');
-                            });
+                            return fs.exec_direct('/etc/init.d/geomate', ['geolocate'])
+                                .catch(function(err) {
+                                    ui.addNotification(null, E('p', {}, _('Failed to start geolocation process: ') + err.message), 'error');
+                                });
                         }
                     }, _('Proceed'))
                 ])
