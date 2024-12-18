@@ -68,7 +68,7 @@ return view.extend({
                             ui.hideModal();
                             ui.addNotification(null, E('p', {}, _('Manual geolocation process started. This process runs in the background and may take several minutes to complete.')), 'info');
                             
-                            return fs.exec_direct('/etc/init.d/geomate', ['geolocate'])
+                            return fs.exec_direct('/etc/geolocate.sh', [])
                                 .catch(function(err) {
                                     ui.addNotification(null, E('p', {}, _('Failed to start geolocation process: ') + err.message), 'error');
                                 });
