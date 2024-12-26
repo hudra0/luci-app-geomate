@@ -92,6 +92,44 @@
             margin: 0;
             padding: 0;
         }
+
+        /* Custom Legend Control */
+        .legend-control {
+            background: white;
+            padding: 10px;
+            border-radius: 4px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+            max-width: 250px;
+        }
+        .legend-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            cursor: pointer;
+        }
+        .legend-content {
+            font-size: 12px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+        }
+        .legend-icon {
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .legend-circle {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
     </style>
 </head>
 <body>
@@ -383,6 +421,69 @@
             map.on(L.Draw.Event.CREATED, onDrawCreated);
             map.on(L.Draw.Event.EDITED, onDrawEdited);
             map.on(L.Draw.Event.DELETED, onDrawDeleted);
+
+            // Add legend control
+            var legendControl = L.control({ position: 'bottomright' });
+            legendControl.onAdd = function (map) {
+                var div = L.DomUtil.create('div', 'legend-control');
+                var content = `
+                    <div class="legend-header">
+                        <strong>Legend</strong>
+                        <span class="toggle-legend" style="cursor:pointer;">▼</span>
+                    </div>
+                    <div class="legend-content">
+                        <div class="legend-item">
+                            <div class="legend-icon"><i class="fa fa-check-circle" style="color: green;"></i></div>
+                            <span>Allowed Connection (within region)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-icon"><i class="fa fa-exclamation-triangle" style="color: red;"></i></div>
+                            <span>Blocked Connection (outside region)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-icon"><i class="fa fa-user" style="color: blue;"></i></div>
+                            <span>Whitelisted IP</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-circle" style="background-color: rgba(0, 128, 0, 0.6);"></div>
+                            <span>Multiple Allowed Connections</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-circle" style="background-color: rgba(255, 0, 0, 0.6);"></div>
+                            <span>Multiple Blocked Connections</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-circle" style="background-color: rgba(0, 0, 255, 0.6);"></div>
+                            <span>Multiple Whitelisted IPs</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-circle" style="background-color: rgba(255, 165, 0, 0.6);"></div>
+                            <span>Mixed Connection Types</span>
+                        </div>
+                    </div>
+                `;
+                div.innerHTML = content;
+
+                // Add click handler for legend toggle
+                setTimeout(() => {
+                    var header = div.querySelector('.legend-header');
+                    var content = div.querySelector('.legend-content');
+                    var toggle = div.querySelector('.toggle-legend');
+                    
+                    header.addEventListener('click', function() {
+                        if (content.style.display === 'none') {
+                            content.style.display = 'block';
+                            toggle.innerHTML = '▼';
+                        } else {
+                            content.style.display = 'none';
+                            toggle.innerHTML = '▶';
+                        }
+                    });
+                }, 0);
+
+                return div;
+            };
+            legendControl.addTo(map);
 
             // Notify parent frame that the map is ready
             window.parent.postMessage({ type: 'mapReady' }, '*');
