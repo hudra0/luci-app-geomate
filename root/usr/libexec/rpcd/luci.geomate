@@ -154,7 +154,41 @@ local function get_ui_dynamic_ips()
 
     uci:load('geomate')
 
-    -- Iterate through all GeoFilters
+    -- First pass: Get blocked IPs for each filter
+    local filter_blocked_ips = {}
+    local filter_allowed_ips = {}
+
+    uci:foreach('geomate', 'geo_filter', function(s)
+        local name = s.name
+        if s.enabled == '1' then
+            local set_name = "geomate_" .. (name:gsub(' ', '_'))
+
+            filter_blocked_ips[name] = {}
+            filter_allowed_ips[name] = {}  
+
+            -- Get blocked IPs
+            local cmd = "nft list set inet geomate " .. set_name .. "_blocked"
+            local handle = io.popen(cmd)
+            local result = handle:read("*a")
+            handle:close()
+
+            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
+                filter_blocked_ips[name][ip] = true
+            end
+
+            -- Get allowed IPs
+            cmd = "nft list set inet geomate " .. set_name .. "_allowed"
+            handle = io.popen(cmd)
+            result = handle:read("*a")
+            handle:close()
+
+            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
+                filter_allowed_ips[name][ip] = true
+            end
+        end
+    end)
+
+    -- Second pass: Get dynamic IPs and match them to their filters
     uci:foreach('geomate', 'geo_filter', function(s)
         local name = s.name
         local enabled = s.enabled
@@ -165,12 +199,15 @@ local function get_ui_dynamic_ips()
             local result = handle:read("*a")
             handle:close()
 
-            -- Extract IPs from the set
             for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
-                -- Prevent duplicates
                 if not processed_ips[ip] then
-                    processed_ips[ip] = true
-                    table.insert(dynamic_ips, { ip = ip, filter = s })
+                    -- Check if this IP is in the blocked or allowed set for this filter
+                    if filter_blocked_ips[name][ip] or filter_allowed_ips[name][ip] then
+                        processed_ips[ip] = true
+                        -- Each dynamic IP gets inserted; in get_all_connections() 
+                        -- we'll finalize whether it's actually blocked or allowed
+                        table.insert(dynamic_ips, { ip = ip, filter = s })
+                    end
                 end
             end
         end
@@ -218,6 +255,30 @@ local function get_filtered_connections()
             else
                 s.allowed_region = {}
             end
+            
+            -- Get allowed and blocked IPs for this filter
+            local set_name = "geomate_" .. (s.name:gsub(' ', '_'))
+            s.allowed_ips = {}
+            s.blocked_ips = {}
+            
+            -- Get allowed IPs
+            local cmd = "nft list set inet geomate " .. set_name .. "_allowed"
+            local handle = io.popen(cmd)
+            local result = handle:read("*a")
+            handle:close()
+            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
+                s.allowed_ips[ip] = true
+            end
+            
+            -- Get blocked IPs
+            cmd = "nft list set inet geomate " .. set_name .. "_blocked"
+            handle = io.popen(cmd)
+            result = handle:read("*a")
+            handle:close()
+            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
+                s.blocked_ips[ip] = true
+            end
+            
             table.insert(geo_filters, s)
         end
     end)
@@ -281,17 +342,24 @@ local function get_filtered_connections()
                         end
                     end
 
-                    if match then
-                        -- Geolocate the destination IP
-                        local geo = geolocate_ip(conn.dst)
+                    -- First geolocate the destination IP, so we can use the position in our condition
+                    local geo = geolocate_ip(conn.dst)
+
+                    -- Only process if IP is in this filter's sets or allowed by region
+                    if match and (filter.allowed_ips[conn.dst] 
+                        or filter.blocked_ips[conn.dst]
+                        or is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)) then
+                        
+                        -- handle region-allowed IP addresses
                         conn.geo = geo
-                        -- Check if the connection is within **any** allowed region
+
+                        -- Check if the connection is within any allowed region
                         local allowed = is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)
 
                         -- Prioritize allowlist: If the IP is on the allowlist, set allowed to true
                         if allowed_ips_set[conn.dst] then
                             allowed = true
-                            conn.is_allowed_ip = true  -- Field to indicate allowed IPs
+                            conn.is_allowed_ip = true
                         else
                             conn.is_allowed_ip = false
                         end
