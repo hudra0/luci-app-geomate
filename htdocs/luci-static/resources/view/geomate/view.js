@@ -734,7 +734,13 @@ return view.extend({
     
         var connections = this.currentConnectionsData;
     
+        // Skip any connection object lacking filter_name to avoid errors
         connections.forEach(function(conn) {
+            if (!conn || !conn.filter_name) {
+                console.warn('Skipping a connection with no filter_name:', conn);
+                return;  // Safely skip this item
+            }
+    
             var geoFilterName = conn.filter_name || _('Unknown');
             var status = _('Unknown');
     
@@ -743,7 +749,8 @@ return view.extend({
                 status = _('Allowed (Whitelist)');
             } else if (conn.allowed === true) {
                 status = _('Allowed');
-            } else if ((!conn.geo || !conn.geo.lat || !conn.geo.lon) && (conn.allowed === false || typeof conn.allowed === 'undefined')) {
+            } else if ((!conn.geo || !conn.geo.lat || !conn.geo.lon) &&
+                       (conn.allowed === false || typeof conn.allowed === 'undefined')) {
                 status = _('Untracked');
             } else if (conn.allowed === false) {
                 status = _('Blocked');
@@ -751,14 +758,11 @@ return view.extend({
                 status = _('Unknown');
             }
     
-            // Extract the destination IP address
             var destIP = conn.dst || _('Unknown');
-    
-            // Create a table row with the connection details
             var tr = E('tr', {}, [
-                E('td', {}, destIP),         // Destination IP
-                E('td', {}, geoFilterName),  // Name of the Geo-Filter
-                E('td', {}, status)          // Connection status
+                E('td', {}, destIP),
+                E('td', {}, geoFilterName),
+                E('td', {}, status)
             ]);
             tbody.appendChild(tr);
         });
