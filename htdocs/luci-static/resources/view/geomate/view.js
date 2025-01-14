@@ -36,6 +36,17 @@ function getServiceStatus() {
     });
 }
 
+// Function to check if /tmp/geomate_loading exists
+function getLoadingStatus() {
+    return fs.stat('/tmp/geomate_loading').then(function() {
+        console.log('Loading file /tmp/geomate_loading is present.');
+        return true; // File exists
+    }).catch(function(err) {
+        // If stat fails, file likely doesn't exist
+        return false;
+    });
+}
+
 return view.extend({
     geoFilters: {},
     map: null,
@@ -99,7 +110,12 @@ return view.extend({
                     `
                 }),
                 // Text displaying the service status
-                E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText)
+                E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText),
+                // Loading message (hidden by default)
+                E('p', {
+                    id: 'geomate-loading-indicator',
+                    style: 'margin: 0; margin-left: 12px; display: none; color: orange;'
+                }, _('Loading GeoFilter data ...'))
             ]);
         };
 
@@ -243,19 +259,35 @@ return view.extend({
 
             // Regularly update the service status
             poll.add(function() {
-                return getServiceStatus().then(function(serviceStatus) {
+                return Promise.all([
+                    getServiceStatus(),
+                    getLoadingStatus()
+                ]).then(function(results) {
+                    var serviceStatus = results[0];
+                    var loadingStatus = results[1];
+
                     self.serviceStatus = serviceStatus;
                     var statusElement = document.getElementById('service-status-text');
                     var indicatorElement = document.getElementById('service-status-indicator');
+                    var loadingElement = document.getElementById('geomate-loading-indicator');
 
                     if (statusElement) {
-                        var statusText = serviceStatus === 'Running' ? _('Running') : _('Not Running');
+                        var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
                         statusElement.textContent = _('Service Status: ') + statusText;
                     }
 
                     if (indicatorElement) {
-                        var statusColor = serviceStatus === 'Running' ? 'green' : 'red';
+                        var statusColor = (serviceStatus === 'Running') ? 'green' : 'red';
                         indicatorElement.style.backgroundColor = statusColor;
+                    }
+
+                    // Show or hide the loading message
+                    if (loadingElement) {
+                        if (loadingStatus === true) {
+                            loadingElement.style.display = 'inline';
+                        } else {
+                            loadingElement.style.display = 'none';
+                        }
                     }
                 });
             }, 5); // Update every 5 seconds
