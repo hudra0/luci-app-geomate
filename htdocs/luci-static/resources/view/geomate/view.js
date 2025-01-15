@@ -86,7 +86,17 @@ return view.extend({
         var self = this;
         var m, s, o;
         var geomateConfig = data[0];
-        var originalMapHeight = null;
+
+        // We only handle connectionsResult, allowedIPsResult after map is ready
+        // to prevent heavy parallel load
+        var connectionsResult = data[1];
+        var allowedIPsResult = data[2];
+        // We'll defer serviceStatus calls to after mapReady event
+        // var serviceStatus = data[3]; // remove immediate usage
+
+        this.currentConnectionsData = connectionsResult.connections || [];
+        this.allowedIPsData = allowedIPsResult.allowed_ips || [];
+        // No immediate console here for serviceStatus; wait until poll
 
         m = new form.Map('geomate', '', '');
 
@@ -254,63 +264,63 @@ return view.extend({
                             self.sendConnectionsToMap(self.currentConnectionsData || []);
                             self.updateActiveConnectionsList();
                         });
+
+                    // Regularly update the service status - only after map is ready
+                    poll.add(function() {
+                        return Promise.all([
+                            getServiceStatus(),
+                            getLoadingStatus()
+                        ]).then(function(results) {
+                            var serviceStatus = results[0];
+                            var loadingStatus = results[1];
+                            self.serviceStatus = serviceStatus;
+
+                            var statusElement = document.getElementById('service-status-text');
+                            var indicatorElement = document.getElementById('service-status-indicator');
+                            var loadingElement = document.getElementById('geomate-loading-indicator');
+
+                            if (statusElement) {
+                                var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
+                                statusElement.textContent = _('Service Status: ') + statusText;
+                            }
+
+                            if (indicatorElement) {
+                                var statusColor = (serviceStatus === 'Running') ? 'green' : 'red';
+                                indicatorElement.style.backgroundColor = statusColor;
+                            }
+
+                            // Show or hide the loading message                            
+                            if (loadingElement) {
+                                if (loadingStatus === true) {
+                                    loadingElement.style.display = 'inline';
+                                } else {
+                                    loadingElement.style.display = 'none';
+                                }
+                            }
+                        });
+                    }, 5); // check service status every 5 seconds
+
+                    // Polling connections+allowedIPs
+                    poll.add(function() {
+                        return Promise.all([
+                            callGeomateConnections(),
+                            callGeomateAllowedIPs()
+                        ]).then(function(results) {
+                            var connectionsData = results[0].connections || [];
+                            var allowedIPsData = results[1].allowed_ips || [];
+                            self.currentConnectionsData = connectionsData;
+                            self.allowedIPsData = allowedIPsData;
+                            console.log('Polled connectionsData:', connectionsData);
+                            console.log('Polled allowedIPsData:', allowedIPsData);
+                            self.sendConnectionsToMap(connectionsData);
+                            self.sendAllowedIPsToMap(allowedIPsData);
+                            self.updateActiveConnectionsList();
+                        }).catch(function(error) {
+                            console.error('Error fetching data:', error);
+                        });
+                    }, 2); // Interval in seconds
                 }
             }, false);
-
-            // Regularly update the service status
-            poll.add(function() {
-                return Promise.all([
-                    getServiceStatus(),
-                    getLoadingStatus()
-                ]).then(function(results) {
-                    var serviceStatus = results[0];
-                    var loadingStatus = results[1];
-
-                    self.serviceStatus = serviceStatus;
-                    var statusElement = document.getElementById('service-status-text');
-                    var indicatorElement = document.getElementById('service-status-indicator');
-                    var loadingElement = document.getElementById('geomate-loading-indicator');
-
-                    if (statusElement) {
-                        var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
-                        statusElement.textContent = _('Service Status: ') + statusText;
-                    }
-
-                    if (indicatorElement) {
-                        var statusColor = (serviceStatus === 'Running') ? 'green' : 'red';
-                        indicatorElement.style.backgroundColor = statusColor;
-                    }
-
-                    // Show or hide the loading message
-                    if (loadingElement) {
-                        if (loadingStatus === true) {
-                            loadingElement.style.display = 'inline';
-                        } else {
-                            loadingElement.style.display = 'none';
-                        }
-                    }
-                });
-            }, 5); // Update every 5 seconds
-
-            // Polling to fetch connections and allowed IPs every 2 seconds
-            poll.add(function() {
-                return Promise.all([
-                    callGeomateConnections(),
-                    callGeomateAllowedIPs()
-                ]).then(function(results) {
-                    var connectionsData = results[0].connections || [];
-                    var allowedIPsData = results[1].allowed_ips || [];
-                    self.currentConnectionsData = connectionsData;
-                    self.allowedIPsData = allowedIPsData;
-                    console.log('Polled connectionsData:', connectionsData);
-                    console.log('Polled allowedIPsData:', allowedIPsData);
-                    self.sendConnectionsToMap(connectionsData);
-                    self.sendAllowedIPsToMap(allowedIPsData);
-                    self.updateActiveConnectionsList();
-                }).catch(function(error) {
-                    console.error('Error fetching data:', error);
-                });
-            }, 2); // Interval in seconds
 
             return rendered;
         });
