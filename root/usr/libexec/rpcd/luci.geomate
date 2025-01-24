@@ -147,7 +147,7 @@ local function get_allowed_ips_set()
     return allowed_ips_set
 end
 
--- New function to read IPs from dynamic nftables sets
+-- Function to read IPs from dynamic nftables sets
 local function get_ui_dynamic_ips()
     local dynamic_ips = {}
     local processed_ips = {}
@@ -230,158 +230,10 @@ local function is_ip_allowed(ip, filter, allowed_ips_set)
     return allowed, false  -- allowed, is_allowed_ip = false
 end
 
--- Retrieve active connections and filter based on criteria
-local function get_filtered_connections()
-    local connections = {}
-    local allowed_ips_set = get_allowed_ips_set()
-    local f = io.open("/proc/net/nf_conntrack", "r")
-    if not f then
-        return connections
-    end
-
-    -- Load active GeoFilters from the UCI configuration
-    local geo_filters = {}
-    uci:load('geomate')
-    uci:foreach('geomate', 'geo_filter', function(s)
-        if s.enabled == '1' then
-            -- Ensure that allowed_region is a list
-            if s.allowed_region then
-                if type(s.allowed_region) == "table" then
-                    -- Already a list
-                else
-                    -- Single entry, convert it to a list
-                    s.allowed_region = { s.allowed_region }
-                end
-            else
-                s.allowed_region = {}
-            end
-            
-            -- Get allowed and blocked IPs for this filter
-            local set_name = "geomate_" .. (s.name:gsub(' ', '_'))
-            s.allowed_ips = {}
-            s.blocked_ips = {}
-            
-            -- Get allowed IPs
-            local cmd = "nft list set inet geomate " .. set_name .. "_allowed"
-            local handle = io.popen(cmd)
-            local result = handle:read("*a")
-            handle:close()
-            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
-                s.allowed_ips[ip] = true
-            end
-            
-            -- Get blocked IPs
-            cmd = "nft list set inet geomate " .. set_name .. "_blocked"
-            handle = io.popen(cmd)
-            result = handle:read("*a")
-            handle:close()
-            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
-                s.blocked_ips[ip] = true
-            end
-            
-            table.insert(geo_filters, s)
-        end
-    end)
-
-    -- Parse ports for each filter
-    for _, filter in ipairs(geo_filters) do
-        if filter.dest_port then
-            filter.dest_port_set = parse_ports(filter.dest_port)
-        end
-        if filter.src_port then
-            filter.src_port_set = parse_ports(filter.src_port)
-        end
-        if filter.protocol then
-            local protocols = {}
-            for proto in filter.protocol:gmatch("[^,]+") do
-                table.insert(protocols, proto:lower())
-            end
-            filter.protocols = protocols
-        end
-    end
-
-    for line in f:lines() do
-        local conn = {}
-        conn.layer3, conn.layer4, conn.protocol, conn.timeout = line:match("(%w+)%s+(%d+)%s+(%w+)%s+(%d+)")
-        if conn.protocol then
-            local src, dst, sport, dport = line:match("src=(%S+)%s+dst=(%S+)%s+sport=(%d+)%s+dport=(%d+)")
-            if src and dst and sport and dport then
-                conn.src = src
-                conn.dst = dst
-                conn.sport = sport
-                conn.dport = dport
-
-                -- Check against each active GeoFilter
-                for _, filter in ipairs(geo_filters) do
-                    local match = true
-
-                    -- Protocol check
-                    if filter.protocols then
-                        local protocol_lower = conn.protocol:lower()
-                        if not table_contains(filter.protocols, protocol_lower) then
-                            match = false
-                        end
-                    end
-
-                    -- Source IP check
-                    if filter.src_ip and filter.src_ip ~= conn.src then
-                        match = false
-                    end
-
-                    -- Source port check
-                    if filter.src_port_set then
-                        if not port_matches(conn.sport, filter.src_port_set) then
-                            match = false
-                        end
-                    end
-
-                    -- Destination port check
-                    if filter.dest_port_set then
-                        if not port_matches(conn.dport, filter.dest_port_set) then
-                            match = false
-                        end
-                    end
-
-                    -- First geolocate the destination IP, so we can use the position in our condition
-                    local geo = geolocate_ip(conn.dst)
-
-                    -- Only process if IP is in this filter's sets or allowed by region
-                    if match and (filter.allowed_ips[conn.dst] 
-                        or filter.blocked_ips[conn.dst]
-                        or is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)) then
-                        
-                        -- handle region-allowed IP addresses
-                        conn.geo = geo
-
-                        -- Check if the connection is within any allowed region
-                        local allowed = is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)
-
-                        -- Prioritize allowlist: If the IP is on the allowlist, set allowed to true
-                        if allowed_ips_set[conn.dst] then
-                            allowed = true
-                            conn.is_allowed_ip = true
-                        else
-                            conn.is_allowed_ip = false
-                        end
-
-                        conn.allowed = allowed
-                        conn.filter_name = filter.name
-                        table.insert(connections, conn)
-                    end
-                end
-            end
-        end
-    end
-    f:close()
-
-    save_cache()
-    return connections
-end
-
--- New main function to retrieve all connections, including those from dynamic sets
+-- Main function to retrieve all connections, only those from dynamic ui sets (previously also loaded from conntrack)
 local function get_all_connections()
     load_cache()
-    local connections = get_filtered_connections()
+    local connections = {}
     local dynamic_ips = get_ui_dynamic_ips()
     local allowed_ips_set = get_allowed_ips_set()
 
