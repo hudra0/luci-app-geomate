@@ -84,6 +84,7 @@ return view.extend({
             _('Choose between dynamic (automatic) or static (predefined) IP lists'));
         o.value('dynamic', _('Dynamic - Build IP lists automatically'));
         o.value('static', _('Static - Use predefined IP lists'));
+        o.value('monitor', _('Monitor - Only visualize connections, no blocking'));
         o.default = 'dynamic';
         o.rmempty = false;
 
