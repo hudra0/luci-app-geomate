@@ -1,0 +1,9 @@
+# Directory fixups for luci-app-geomate frontend
+# Format: old_directory_path=new_directory_path
+# Maps repository structure to OpenWrt filesystem structure
+/root/usr/share/luci/menu.d=/usr/share/luci/menu.d
+/root/usr/share/rpcd/acl.d=/usr/share/rpcd/acl.d
+/root/usr/libexec/rpcd=/usr/libexec/rpcd
+/htdocs/luci-static/resources/view=/www/luci-static/resources/view
+# This file is used during updates to handle directory structure changes
+# Example: /www/luci-static/resources/view/old_name=/www/luci-static/resources/view/geomate 
