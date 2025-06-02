@@ -7,6 +7,10 @@
 'require poll';
 'require fs';
 
+// Version and update channel information
+const UI_VERSION = '1.0.0';
+const UI_UPD_CHANNEL = 'release';
+
 // Declare RPC methods to interact with the Geomate backend
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
@@ -107,25 +111,38 @@ return view.extend({
             var statusColor = self.serviceStatus === 'Running' ? 'green' : 'red';
             var statusText = self.serviceStatus === 'Running' ? _('Running') : _('Not Running');
         
-            return E('div', { style: 'display: flex; align-items: center; margin-left: 8px;' }, [
-                // Colored circle indicating service status
-                E('div', {
-                    id: 'service-status-indicator',
-                    style: `
-                        width: 12px;
-                        height: 12px;
-                        border-radius: 50%;
-                        background-color: ${statusColor};
-                        margin-right: 8px;
-                    `
-                }),
-                // Text displaying the service status
-                E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText),
-                // Loading message (hidden by default)
-                E('p', {
-                    id: 'geomate-loading-indicator',
-                    style: 'margin: 0; margin-left: 12px; display: none; color: orange;'
-                }, _('Loading GeoFilter data ...'))
+            return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
+                // Service status row
+                E('div', { style: 'display: flex; align-items: center;' }, [
+                    // Colored circle indicating service status
+                    E('div', {
+                        id: 'service-status-indicator',
+                        style: `
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 50%;
+                            background-color: ${statusColor};
+                            margin-right: 8px;
+                        `
+                    }),
+                    // Text displaying the service status
+                    E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText),
+                    // Loading message (hidden by default)
+                    E('p', {
+                        id: 'geomate-loading-indicator',
+                        style: 'margin: 0; margin-left: 12px; display: none; color: orange;'
+                    }, _('Loading GeoFilter data ...'))
+                ]),
+                // Operational mode row
+                E('div', { 
+                    id: 'operational-mode-container',
+                    style: 'margin-top: 8px; display: none;' 
+                }, [
+                    E('p', { 
+                        id: 'operational-mode-text',
+                        style: 'margin: 0; font-weight: normal;'
+                    }, '')
+                ])
             ]);
         };
 
@@ -269,15 +286,22 @@ return view.extend({
                     poll.add(function() {
                         return Promise.all([
                             getServiceStatus(),
-                            getLoadingStatus()
+                            getLoadingStatus(),
+                            uci.load('geomate').then(function() {
+                                var globalConfig = uci.sections('geomate', 'global')[0];
+                                return globalConfig ? globalConfig.operational_mode : 'dynamic';
+                            })
                         ]).then(function(results) {
                             var serviceStatus = results[0];
                             var loadingStatus = results[1];
+                            var operationalMode = results[2];
                             self.serviceStatus = serviceStatus;
 
                             var statusElement = document.getElementById('service-status-text');
                             var indicatorElement = document.getElementById('service-status-indicator');
                             var loadingElement = document.getElementById('geomate-loading-indicator');
+                            var modeContainer = document.getElementById('operational-mode-container');
+                            var modeElement = document.getElementById('operational-mode-text');
 
                             if (statusElement) {
                                 var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
@@ -296,6 +320,27 @@ return view.extend({
                                 } else {
                                     loadingElement.style.display = 'none';
                                 }
+                            }
+
+                            // Show operational mode
+                            if (modeContainer && modeElement) {
+                                var modeText = '';
+                                var modeStyle = '';
+                                
+                                if (operationalMode === 'monitor') {
+                                    modeText = _('Mode: Monitor Only - Connections are tracked but NOT blocked');
+                                    modeStyle = 'color: orange; font-weight: bold;';
+                                } else if (operationalMode === 'static') {
+                                    modeText = _('Mode: Static - Using predefined IP lists');
+                                    modeStyle = 'color: blue;';
+                                } else {
+                                    modeText = _('Mode: Dynamic - Building IP lists automatically');
+                                    modeStyle = 'color: green;';
+                                }
+                                
+                                modeElement.textContent = modeText;
+                                modeElement.style.cssText = 'margin: 0; ' + modeStyle;
+                                modeContainer.style.display = 'block';
                             }
                         });
                     }, 5); // check service status every 5 seconds
