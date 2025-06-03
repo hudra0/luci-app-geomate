@@ -1,0 +1,4 @@
+# File fixups for luci-app-geomate frontend
+# Format: old_file_path=new_file_path
+# This file is used during updates to handle file path changes
+# Example: /www/luci-static/resources/view/geomate/old_file.js=/www/luci-static/resources/view/geomate/new_file.js 

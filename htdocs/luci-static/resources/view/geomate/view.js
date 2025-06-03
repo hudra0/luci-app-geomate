@@ -7,6 +7,10 @@
 'require poll';
 'require fs';
 
+// Version and update channel information
+const UI_VERSION = '1.1.0';
+const UI_UPD_CHANNEL = 'release';
+
 // Declare RPC methods to interact with the Geomate backend
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
@@ -107,25 +111,47 @@ return view.extend({
             var statusColor = self.serviceStatus === 'Running' ? 'green' : 'red';
             var statusText = self.serviceStatus === 'Running' ? _('Running') : _('Not Running');
         
-            return E('div', { style: 'display: flex; align-items: center; margin-left: 8px;' }, [
-                // Colored circle indicating service status
-                E('div', {
-                    id: 'service-status-indicator',
-                    style: `
-                        width: 12px;
-                        height: 12px;
-                        border-radius: 50%;
-                        background-color: ${statusColor};
-                        margin-right: 8px;
-                    `
-                }),
-                // Text displaying the service status
-                E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText),
-                // Loading message (hidden by default)
-                E('p', {
-                    id: 'geomate-loading-indicator',
-                    style: 'margin: 0; margin-left: 12px; display: none; color: orange;'
-                }, _('Loading GeoFilter data ...'))
+            return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
+                // Service status row
+                E('div', { style: 'display: flex; align-items: center;' }, [
+                    // Colored circle indicating service status
+                    E('div', {
+                        id: 'service-status-indicator',
+                        style: `
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 50%;
+                            background-color: ${statusColor};
+                            margin-right: 8px;
+                        `
+                    }),
+                    // Text displaying the service status
+                    E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText),
+                    // Loading message (hidden by default)
+                    E('p', {
+                        id: 'geomate-loading-indicator',
+                        style: 'margin: 0; margin-left: 12px; display: none; color: orange;'
+                    }, _('Loading GeoFilter data ...'))
+                ]),
+                // Operational mode row
+                E('div', { 
+                    id: 'operational-mode-container',
+                    style: 'margin-top: 8px; display: none; justify-content: space-between; align-items: center;' 
+                }, [
+                    E('p', { 
+                        id: 'operational-mode-text',
+                        style: 'margin: 0; font-weight: normal;'
+                    }, ''),
+                    E('div', { 
+                        style: 'font-size: 13px; color: #6b7280;' 
+                    }, [
+                        'Backend: ' + UI_VERSION + ' | Frontend: ' + UI_VERSION,
+                        E('span', { 
+                            id: 'version-update-status',
+                            style: 'margin-left: 8px; font-style: italic;'
+                        }, '')
+                    ])
+                ])
             ]);
         };
 
@@ -263,21 +289,30 @@ return view.extend({
                             self.sendAllowedIPsToMap(self.allowedIPsData || []);
                             self.sendConnectionsToMap(self.currentConnectionsData || []);
                             self.updateActiveConnectionsList();
+                            // Initial version check
+                            self.checkForUpdates();
                         });
 
                     // Regularly update the service status - only after map is ready
                     poll.add(function() {
                         return Promise.all([
                             getServiceStatus(),
-                            getLoadingStatus()
+                            getLoadingStatus(),
+                            uci.load('geomate').then(function() {
+                                var globalConfig = uci.sections('geomate', 'global')[0];
+                                return globalConfig ? globalConfig.operational_mode : 'dynamic';
+                            })
                         ]).then(function(results) {
                             var serviceStatus = results[0];
                             var loadingStatus = results[1];
+                            var operationalMode = results[2];
                             self.serviceStatus = serviceStatus;
 
                             var statusElement = document.getElementById('service-status-text');
                             var indicatorElement = document.getElementById('service-status-indicator');
                             var loadingElement = document.getElementById('geomate-loading-indicator');
+                            var modeContainer = document.getElementById('operational-mode-container');
+                            var modeElement = document.getElementById('operational-mode-text');
 
                             if (statusElement) {
                                 var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
@@ -296,6 +331,27 @@ return view.extend({
                                 } else {
                                     loadingElement.style.display = 'none';
                                 }
+                            }
+
+                            // Show operational mode
+                            if (modeContainer && modeElement) {
+                                var modeText = '';
+                                var modeStyle = '';
+                                
+                                if (operationalMode === 'monitor') {
+                                    modeText = _('Mode: Monitor Only - Connections are tracked but NOT blocked');
+                                    modeStyle = 'color: orange; font-weight: bold;';
+                                } else if (operationalMode === 'static') {
+                                    modeText = _('Mode: Static - Using predefined IP lists');
+                                    modeStyle = 'color: blue;';
+                                } else {
+                                    modeText = _('Mode: Dynamic - Building IP lists automatically');
+                                    modeStyle = 'color: green;';
+                                }
+                                
+                                modeElement.textContent = modeText;
+                                modeElement.style.cssText = 'margin: 0; ' + modeStyle;
+                                modeContainer.style.display = 'flex';
                             }
                         });
                     }, 5); // check service status every 5 seconds
@@ -319,6 +375,11 @@ return view.extend({
                             console.error('Error fetching data:', error);
                         });
                     }, 2); // Interval in seconds
+
+                    // Check for version updates every 60 minutes
+                    poll.add(function() {
+                        return self.checkForUpdates();
+                    }, 3600); // 3600 seconds
                 }
             }, false);
 
@@ -845,5 +906,67 @@ return view.extend({
                 }
                 return Promise.resolve();
             });
+    },
+
+    // Check for updates
+    checkForUpdates: function() {
+        var statusElement = document.getElementById('version-update-status');
+        
+        if (!statusElement) {
+            return Promise.resolve();
+        }
+        
+        statusElement.textContent = _('Checking...');
+        statusElement.style.color = '#6b7280';
+
+        return fs.exec('/etc/init.d/geomate', ['check_version']).then(function(result) {
+            var output = result.stdout || '';
+            var backendUpdateAvailable = false;
+            var frontendUpdateAvailable = false;
+            
+            // Parse backend and frontend information separately
+            var backendMatch = output.match(/Backend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
+            var frontendMatch = output.match(/Frontend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
+            
+            if (backendMatch) {
+                var backendCurrentMatch = backendMatch[1].match(/Current version: (.+)/);
+                var backendLatestMatch = backendMatch[1].match(/Latest version: (.+)/);
+                if (backendCurrentMatch && backendLatestMatch && 
+                    backendCurrentMatch[1].trim() !== backendLatestMatch[1].trim()) {
+                    backendUpdateAvailable = true;
+                }
+            }
+            
+            if (frontendMatch) {
+                var frontendCurrentMatch = frontendMatch[1].match(/Current version: (.+)/);
+                var frontendLatestMatch = frontendMatch[1].match(/Latest version: (.+)/);
+                if (frontendCurrentMatch && frontendLatestMatch && 
+                    frontendCurrentMatch[1].trim() !== frontendLatestMatch[1].trim()) {
+                    frontendUpdateAvailable = true;
+                }
+            }
+            
+            // Display appropriate status
+            if (backendUpdateAvailable && frontendUpdateAvailable) {
+                statusElement.textContent = _('Updates available (Backend + Frontend)');
+                statusElement.style.color = '#dc2626';
+            } else if (backendUpdateAvailable) {
+                statusElement.textContent = _('Backend update available');
+                statusElement.style.color = '#dc2626';
+            } else if (frontendUpdateAvailable) {
+                statusElement.textContent = _('Frontend update available');
+                statusElement.style.color = '#dc2626';
+            } else if (result.code === 0 || (backendMatch && frontendMatch)) {
+                statusElement.textContent = _('Up to date');
+                statusElement.style.color = '#059669';
+            } else {
+                statusElement.textContent = _('Check failed');
+                statusElement.style.color = '#dc2626';
+            }
+        }).catch(function(error) {
+            console.error('Error checking for updates:', error);
+            statusElement.textContent = _('Check failed');
+            statusElement.style.color = '#dc2626';
+        });
     }
 });
