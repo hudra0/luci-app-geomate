@@ -145,7 +145,7 @@ return view.extend({
                     E('div', { 
                         style: 'font-size: 13px; color: #6b7280;' 
                     }, [
-                        _('Version: ') + UI_VERSION + ' (' + UI_UPD_CHANNEL + ')',
+                        'Backend: ' + UI_VERSION + ' | Frontend: ' + UI_VERSION,
                         E('span', { 
                             id: 'version-update-status',
                             style: 'margin-left: 8px; font-style: italic;'
@@ -921,11 +921,42 @@ return view.extend({
 
         return fs.exec('/etc/init.d/geomate', ['check_version']).then(function(result) {
             var output = result.stdout || '';
+            var backendUpdateAvailable = false;
+            var frontendUpdateAvailable = false;
             
-            if (result.code === 254 || output.includes('new version') || output.includes('update available')) {
-                statusElement.textContent = _('Update available');
+            // Parse backend and frontend information separately
+            var backendMatch = output.match(/Backend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
+            var frontendMatch = output.match(/Frontend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
+            
+            if (backendMatch) {
+                var backendCurrentMatch = backendMatch[1].match(/Current version: (.+)/);
+                var backendLatestMatch = backendMatch[1].match(/Latest version: (.+)/);
+                if (backendCurrentMatch && backendLatestMatch && 
+                    backendCurrentMatch[1].trim() !== backendLatestMatch[1].trim()) {
+                    backendUpdateAvailable = true;
+                }
+            }
+            
+            if (frontendMatch) {
+                var frontendCurrentMatch = frontendMatch[1].match(/Current version: (.+)/);
+                var frontendLatestMatch = frontendMatch[1].match(/Latest version: (.+)/);
+                if (frontendCurrentMatch && frontendLatestMatch && 
+                    frontendCurrentMatch[1].trim() !== frontendLatestMatch[1].trim()) {
+                    frontendUpdateAvailable = true;
+                }
+            }
+            
+            // Display appropriate status
+            if (backendUpdateAvailable && frontendUpdateAvailable) {
+                statusElement.textContent = _('Updates available (Backend + Frontend)');
                 statusElement.style.color = '#dc2626';
-            } else if (result.code === 0) {
+            } else if (backendUpdateAvailable) {
+                statusElement.textContent = _('Backend update available');
+                statusElement.style.color = '#dc2626';
+            } else if (frontendUpdateAvailable) {
+                statusElement.textContent = _('Frontend update available');
+                statusElement.style.color = '#dc2626';
+            } else if (result.code === 0 || (backendMatch && frontendMatch)) {
                 statusElement.textContent = _('Up to date');
                 statusElement.style.color = '#059669';
             } else {
