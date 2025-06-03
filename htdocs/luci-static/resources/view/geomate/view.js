@@ -136,12 +136,21 @@ return view.extend({
                 // Operational mode row
                 E('div', { 
                     id: 'operational-mode-container',
-                    style: 'margin-top: 8px; display: none;' 
+                    style: 'margin-top: 8px; display: none; justify-content: space-between; align-items: center;' 
                 }, [
                     E('p', { 
                         id: 'operational-mode-text',
                         style: 'margin: 0; font-weight: normal;'
-                    }, '')
+                    }, ''),
+                    E('div', { 
+                        style: 'font-size: 13px; color: #6b7280;' 
+                    }, [
+                        _('Version: ') + UI_VERSION + ' (' + UI_UPD_CHANNEL + ')',
+                        E('span', { 
+                            id: 'version-update-status',
+                            style: 'margin-left: 8px; font-style: italic;'
+                        }, '')
+                    ])
                 ])
             ]);
         };
@@ -280,6 +289,8 @@ return view.extend({
                             self.sendAllowedIPsToMap(self.allowedIPsData || []);
                             self.sendConnectionsToMap(self.currentConnectionsData || []);
                             self.updateActiveConnectionsList();
+                            // Initial version check
+                            self.checkForUpdates();
                         });
 
                     // Regularly update the service status - only after map is ready
@@ -340,7 +351,7 @@ return view.extend({
                                 
                                 modeElement.textContent = modeText;
                                 modeElement.style.cssText = 'margin: 0; ' + modeStyle;
-                                modeContainer.style.display = 'block';
+                                modeContainer.style.display = 'flex';
                             }
                         });
                     }, 5); // check service status every 5 seconds
@@ -364,6 +375,11 @@ return view.extend({
                             console.error('Error fetching data:', error);
                         });
                     }, 2); // Interval in seconds
+
+                    // Check for version updates every 60 minutes
+                    poll.add(function() {
+                        return self.checkForUpdates();
+                    }, 3600); // 3600 seconds
                 }
             }, false);
 
@@ -890,5 +906,36 @@ return view.extend({
                 }
                 return Promise.resolve();
             });
+    },
+
+    // Check for updates
+    checkForUpdates: function() {
+        var statusElement = document.getElementById('version-update-status');
+        
+        if (!statusElement) {
+            return Promise.resolve();
+        }
+        
+        statusElement.textContent = _('Checking...');
+        statusElement.style.color = '#6b7280';
+
+        return fs.exec('/etc/init.d/geomate', ['check_version']).then(function(result) {
+            var output = result.stdout || '';
+            
+            if (result.code === 254 || output.includes('new version') || output.includes('update available')) {
+                statusElement.textContent = _('Update available');
+                statusElement.style.color = '#dc2626';
+            } else if (result.code === 0) {
+                statusElement.textContent = _('Up to date');
+                statusElement.style.color = '#059669';
+            } else {
+                statusElement.textContent = _('Check failed');
+                statusElement.style.color = '#dc2626';
+            }
+        }).catch(function(error) {
+            console.error('Error checking for updates:', error);
+            statusElement.textContent = _('Check failed');
+            statusElement.style.color = '#dc2626';
+        });
     }
 });
