@@ -11,6 +11,20 @@
 const UI_VERSION = 'dev';
 const UI_UPD_CHANNEL = 'release';
 
+// Format version for display (shorten commit hashes to 8 characters)
+function formatVersionDisplay(version) {
+    if (!version) return version;
+    
+    // Check if it's a 40-character commit hash (only lowercase hex characters)
+    if (/^[a-f0-9]{40}$/.test(version)) {
+        // 40-char commit hash - show first 8 characters with ellipsis
+        return version.substring(0, 8) + '...';
+    }
+    
+    // Not a full commit hash - show as is
+    return version;
+}
+
 // Declare RPC methods to interact with the Geomate backend
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
@@ -145,7 +159,7 @@ return view.extend({
                     E('div', { 
                         style: 'font-size: 13px; color: #6b7280;' 
                     }, [
-                        'Backend: ' + UI_VERSION + ' | Frontend: ' + UI_VERSION,
+                        'Backend: ' + formatVersionDisplay(UI_VERSION) + ' | Frontend: ' + formatVersionDisplay(UI_VERSION),
                         E('span', { 
                             id: 'version-update-status',
                             style: 'margin-left: 8px; font-style: italic;'
