@@ -8,7 +8,7 @@
 'require fs';
 
 // Version and update channel information
-const UI_VERSION = '1.1.0';
+const UI_VERSION = 'dev';
 const UI_UPD_CHANNEL = 'release';
 
 // Declare RPC methods to interact with the Geomate backend
