@@ -159,7 +159,10 @@ return view.extend({
                     E('div', { 
                         style: 'font-size: 13px; color: #6b7280;' 
                     }, [
-                        'Backend: ' + formatVersionDisplay(UI_VERSION) + ' | Frontend: ' + formatVersionDisplay(UI_VERSION),
+                        E('span', {
+                            id: 'version-display',
+                            style: 'color: #6b7280;'
+                        }, _('Loading version...')),
                         E('span', { 
                             id: 'version-update-status',
                             style: 'margin-left: 8px; font-style: italic;'
@@ -925,6 +928,7 @@ return view.extend({
     // Check for updates
     checkForUpdates: function() {
         var statusElement = document.getElementById('version-update-status');
+        var versionDisplayElement = document.getElementById('version-display');
         
         if (!statusElement) {
             return Promise.resolve();
@@ -937,6 +941,8 @@ return view.extend({
             var output = result.stdout || '';
             var backendUpdateAvailable = false;
             var frontendUpdateAvailable = false;
+            var backendCurrentVersion = '';
+            var frontendCurrentVersion = '';
             
             // Parse backend and frontend information separately
             var backendMatch = output.match(/Backend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
@@ -945,6 +951,9 @@ return view.extend({
             if (backendMatch) {
                 var backendCurrentMatch = backendMatch[1].match(/Current version: (.+)/);
                 var backendLatestMatch = backendMatch[1].match(/Latest version: (.+)/);
+                if (backendCurrentMatch) {
+                    backendCurrentVersion = backendCurrentMatch[1].trim();
+                }
                 if (backendCurrentMatch && backendLatestMatch && 
                     backendCurrentMatch[1].trim() !== backendLatestMatch[1].trim()) {
                     backendUpdateAvailable = true;
@@ -954,10 +963,20 @@ return view.extend({
             if (frontendMatch) {
                 var frontendCurrentMatch = frontendMatch[1].match(/Current version: (.+)/);
                 var frontendLatestMatch = frontendMatch[1].match(/Latest version: (.+)/);
+                if (frontendCurrentMatch) {
+                    frontendCurrentVersion = frontendCurrentMatch[1].trim();
+                }
                 if (frontendCurrentMatch && frontendLatestMatch && 
                     frontendCurrentMatch[1].trim() !== frontendLatestMatch[1].trim()) {
                     frontendUpdateAvailable = true;
                 }
+            }
+            
+            // Update version display with actual current versions
+            if (versionDisplayElement && backendCurrentVersion && frontendCurrentVersion) {
+                versionDisplayElement.textContent = 
+                    'Backend: ' + formatVersionDisplay(backendCurrentVersion) + 
+                    ' | Frontend: ' + formatVersionDisplay(frontendCurrentVersion);
             }
             
             // Display appropriate status
