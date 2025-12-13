@@ -86,11 +86,6 @@ return view.extend({
         s = m.section(form.TypedSection, 'global', _('Global Settings'));
         s.anonymous = true;
 
-        // **Global Settings Section**
-        // This section contains the main configuration options for the Geomate service
-        s = m.section(form.TypedSection, 'global', _('Global Settings'));
-        s.anonymous = true;
-
         // **Enable Option**
         // Main switch to enable/disable the entire Geomate service
         o = s.option(form.Flag, 'enabled', _('Enable'),
