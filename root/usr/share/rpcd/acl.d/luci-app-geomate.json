@@ -4,7 +4,7 @@
         "read": {
             "ubus": {
                 "luci": [ "getInitList", "setInitAction" ],
-                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus" ],
                 "uci": [ "get", "state" ]
             },
             "uci": [ "geomate" ],
@@ -12,13 +12,15 @@
                 "/etc/init.d/geomate": [ "read", "exec" ],
                 "/etc/geolocate.sh": [ "read", "exec" ],
                 "/var/run/geomate.pid": [ "read" ],
-                "/etc/geomate.d/*": [ "read" ]
+                "/etc/geomate.d/*": [ "read" ],
+                "/etc/geomate.d/runtime/*": [ "read" ],
+                "/tmp/geomate_nft_errors.log": [ "read" ]
             }
         },
         "write": {
             "ubus": {
                 "luci": [ "setInitAction" ],
-                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus" ],
                 "uci": [ "set", "commit", "apply" ]
             },
             "uci": [ "geomate" ],
