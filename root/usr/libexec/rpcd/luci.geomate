@@ -304,13 +304,268 @@ function table_contains(tbl, element)
     return false
 end
 
+-- Get service status information
+local function get_service_status()
+    local status = {
+        running = false,
+        loading = false,
+        pid = nil,
+        autostart = false,
+        config_enabled = false,
+        operational_mode = "dynamic",
+        debug_level = 0,
+        nft_active = false,
+        nft_sets_count = 0,
+        filters = {},
+        nft_errors = {}
+    }
+
+    -- Check if filters are currently loading
+    local loading_file = nixio.fs.stat("/tmp/geomate_loading")
+    status.loading = (loading_file ~= nil)
+
+    -- Check if service is running
+    local pid_file = io.open("/var/run/geomate.pid", "r")
+    if pid_file then
+        local pid = pid_file:read("*l")
+        pid_file:close()
+        if pid then
+            status.pid = tonumber(pid)
+            -- Check if process is actually running
+            local check = io.popen("kill -0 " .. pid .. " 2>/dev/null && echo running")
+            if check then
+                local result = check:read("*l")
+                check:close()
+                status.running = (result == "running")
+            end
+        end
+    end
+
+    -- Check autostart
+    local autostart_check = io.popen("/etc/init.d/geomate enabled && echo enabled 2>/dev/null")
+    if autostart_check then
+        local result = autostart_check:read("*l")
+        autostart_check:close()
+        status.autostart = (result == "enabled")
+    end
+
+    -- Load UCI config
+    uci:load('geomate')
+    status.config_enabled = (uci:get('geomate', 'global', 'enabled') == '1')
+    status.operational_mode = uci:get('geomate', 'global', 'operational_mode') or 'dynamic'
+    status.debug_level = tonumber(uci:get('geomate', 'global', 'debug_level')) or 0
+
+    -- Check nftables status
+    local nft_check = io.popen("nft list table inet geomate 2>/dev/null")
+    if nft_check then
+        local result = nft_check:read("*a")
+        nft_check:close()
+        status.nft_active = (result ~= nil and result ~= "")
+    end
+
+    -- Count nft sets
+    local nft_sets = io.popen("nft list sets inet geomate 2>/dev/null | grep -c 'set geomate_'")
+    if nft_sets then
+        local count = nft_sets:read("*l")
+        nft_sets:close()
+        status.nft_sets_count = tonumber(count) or 0
+    end
+
+    -- Get filter information
+    uci:foreach('geomate', 'geo_filter', function(s)
+        local filter_info = {
+            name = s.name,
+            enabled = (s.enabled == '1'),
+            allowed_count = 0,
+            blocked_count = 0
+        }
+
+        if filter_info.enabled and status.nft_active then
+            local set_name = s.name:gsub(' ', '_')
+
+            -- Count allowed IPs
+            local allowed_cmd = io.popen("nft list set inet geomate geomate_" .. set_name .. "_allowed 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | wc -l")
+            if allowed_cmd then
+                filter_info.allowed_count = tonumber(allowed_cmd:read("*l")) or 0
+                allowed_cmd:close()
+            end
+
+            -- Count blocked IPs
+            local blocked_cmd = io.popen("nft list set inet geomate geomate_" .. set_name .. "_blocked 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | wc -l")
+            if blocked_cmd then
+                filter_info.blocked_count = tonumber(blocked_cmd:read("*l")) or 0
+                blocked_cmd:close()
+            end
+        end
+
+        table.insert(status.filters, filter_info)
+    end)
+
+    -- Get recent nft errors (last 5 lines)
+    local error_log = io.open("/tmp/geomate_nft_errors.log", "r")
+    if error_log then
+        local lines = {}
+        for line in error_log:lines() do
+            table.insert(lines, line)
+        end
+        error_log:close()
+        -- Get last 5 errors
+        local start = math.max(1, #lines - 4)
+        for i = start, #lines do
+            table.insert(status.nft_errors, lines[i])
+        end
+    end
+
+    return status
+end
+
+-- Run health check and return structured results
+local function run_health_check()
+    local health = {
+        healthy = true,
+        loading = false,
+        errors = 0,
+        checks = {}
+    }
+
+    -- Check 0: Loading status (informational, not an error)
+    local loading_file = nixio.fs.stat("/tmp/geomate_loading")
+    health.loading = (loading_file ~= nil)
+    if health.loading then
+        health.checks.loading = { status = "info", message = "Filters are being loaded - please wait" }
+    else
+        health.checks.loading = { status = "ok", message = "Not loading" }
+    end
+
+    -- Check 1: Config file
+    local config_file = io.open("/etc/config/geomate", "r")
+    if config_file then
+        config_file:close()
+        health.checks.config = { status = "ok", message = "Config file exists" }
+    else
+        health.checks.config = { status = "error", message = "Config file missing" }
+        health.errors = health.errors + 1
+    end
+
+    -- Check 2: Required files
+    local required_files = {
+        "/etc/geomate.sh",
+        "/etc/geolocate.sh",
+        "/etc/geomate_trigger.sh"
+    }
+    local files_ok = true
+    local missing_files = {}
+    for _, file in ipairs(required_files) do
+        local f = io.open(file, "r")
+        if f then
+            f:close()
+        else
+            files_ok = false
+            table.insert(missing_files, file)
+        end
+    end
+    if files_ok then
+        health.checks.files = { status = "ok", message = "All required files present" }
+    else
+        health.checks.files = { status = "error", message = "Missing files: " .. table.concat(missing_files, ", ") }
+        health.errors = health.errors + 1
+    end
+
+    -- Check 3: Data directory
+    local data_dir = nixio.fs.stat("/etc/geomate.d")
+    if data_dir and data_dir.type == "dir" then
+        health.checks.datadir = { status = "ok", message = "Data directory exists" }
+    else
+        health.checks.datadir = { status = "error", message = "Data directory missing" }
+        health.errors = health.errors + 1
+    end
+
+    -- Check 4: Service enabled status
+    uci:load('geomate')
+    local config_enabled = (uci:get('geomate', 'global', 'enabled') == '1')
+
+    local autostart_check = io.popen("/etc/init.d/geomate enabled && echo enabled 2>/dev/null")
+    local autostart = false
+    if autostart_check then
+        local result = autostart_check:read("*l")
+        autostart_check:close()
+        autostart = (result == "enabled")
+    end
+
+    if config_enabled and autostart then
+        health.checks.service = { status = "ok", message = "Service enabled" }
+    elseif not config_enabled and not autostart then
+        health.checks.service = { status = "info", message = "Service disabled" }
+    else
+        health.checks.service = { status = "warning", message = "Inconsistent state: config=" .. tostring(config_enabled) .. ", autostart=" .. tostring(autostart) }
+    end
+
+    -- Check 5: nftables table (only if service is enabled)
+    if config_enabled then
+        local nft_check = io.popen("nft list table inet geomate 2>/dev/null")
+        if nft_check then
+            local result = nft_check:read("*a")
+            nft_check:close()
+            if result and result ~= "" then
+                health.checks.nft = { status = "ok", message = "nftables table active" }
+            else
+                health.checks.nft = { status = "error", message = "nftables table not active" }
+                health.errors = health.errors + 1
+            end
+        end
+
+        -- Check 6: Process running
+        local pid_file = io.open("/var/run/geomate.pid", "r")
+        if pid_file then
+            local pid = pid_file:read("*l")
+            pid_file:close()
+            if pid then
+                local check = io.popen("kill -0 " .. pid .. " 2>/dev/null && echo running")
+                if check then
+                    local result = check:read("*l")
+                    check:close()
+                    if result == "running" then
+                        health.checks.process = { status = "ok", message = "Process running (PID: " .. pid .. ")" }
+                    else
+                        health.checks.process = { status = "error", message = "Process not running (stale PID)" }
+                        health.errors = health.errors + 1
+                    end
+                end
+            end
+        else
+            health.checks.process = { status = "error", message = "Process not running" }
+            health.errors = health.errors + 1
+        end
+    else
+        health.checks.nft = { status = "info", message = "Skipped (service disabled)" }
+        health.checks.process = { status = "info", message = "Skipped (service disabled)" }
+    end
+
+    -- Check 7: nft error log
+    local error_log = io.open("/tmp/geomate_nft_errors.log", "r")
+    if error_log then
+        local content = error_log:read("*a")
+        error_log:close()
+        if content and content ~= "" then
+            health.checks.nft_errors = { status = "warning", message = "nft error log has entries" }
+        else
+            health.checks.nft_errors = { status = "ok", message = "No nft errors logged" }
+        end
+    else
+        health.checks.nft_errors = { status = "ok", message = "No nft error log" }
+    end
+
+    health.healthy = (health.errors == 0)
+    return health
+end
+
 -- Main function of the RPC script
 local methods = {
     getGeomateConnections = {
         call = function()
             local connections = get_all_connections()
             return { connections = connections }
-        end        
+        end
     },
     getAllowedIPs = {
         call = function()
@@ -318,6 +573,77 @@ local methods = {
             local allowed_ips = get_allowed_ips()
             save_cache()
             return { allowed_ips = allowed_ips }
+        end
+    },
+    getStatus = {
+        call = function()
+            local status = get_service_status()
+            return { status = status }
+        end
+    },
+    getHealthCheck = {
+        call = function()
+            local health = run_health_check()
+            return { health = health }
+        end
+    },
+    getGeolocationStatus = {
+        call = function()
+            -- Read pre-computed geolocation status from JSON file
+            -- This file is updated every 30 minutes by geomate.sh
+            local status_file = "/etc/geomate.d/runtime/geolocation_status.json"
+            local nft_error_file = "/tmp/geomate_nft_errors.log"
+            local f = io.open(status_file, "r")
+            local data = nil
+            
+            if f then
+                local content = f:read("*a")
+                f:close()
+                data = jsonc.parse(content)
+                if data then
+                    -- Add human-readable timestamps
+                    local now = os.time()
+                    data.last_update_ago = now - (data.timestamp or now)
+                    data.next_cycle_in = (data.next_cycle or now) - now
+                    if data.next_cycle_in < 0 then data.next_cycle_in = 0 end
+                    
+                    if data.geolocation then
+                        data.geolocation.last_run_ago = now - (data.geolocation.last_run or 0)
+                        data.geolocation.next_run_in = (data.geolocation.next_run or now) - now
+                        if data.geolocation.next_run_in < 0 then data.geolocation.next_run_in = 0 end
+                    end
+                end
+            end
+            
+            -- Initialize data if not loaded
+            if not data then
+                data = {
+                    timestamp = 0,
+                    message = "No geolocation data available yet. Start the service and wait for the first cycle."
+                }
+            end
+            
+            -- Check for NFT errors and extract affected filter names
+            data.nft_errors = false
+            data.nft_error_filters = {}
+            local ef = io.open(nft_error_file, "r")
+            if ef then
+                local error_content = ef:read("*a")
+                ef:close()
+                if error_content and #error_content > 0 then
+                    data.nft_errors = true
+                    -- Extract filter names from set references like @geomate_filtername_dynamic
+                    local seen = {}
+                    for filter_name in error_content:gmatch("@geomate_([^_]+)_") do
+                        if not seen[filter_name] then
+                            seen[filter_name] = true
+                            table.insert(data.nft_error_filters, filter_name)
+                        end
+                    end
+                end
+            end
+            
+            return { status = data }
         end
     }
 }
