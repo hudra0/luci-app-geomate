@@ -607,10 +607,18 @@ local methods = {
                     data.next_cycle_in = (data.next_cycle or now) - now
                     if data.next_cycle_in < 0 then data.next_cycle_in = 0 end
                     
+                    -- Frequent geolocation timing
                     if data.geolocation then
                         data.geolocation.last_run_ago = now - (data.geolocation.last_run or 0)
                         data.geolocation.next_run_in = (data.geolocation.next_run or now) - now
                         if data.geolocation.next_run_in < 0 then data.geolocation.next_run_in = 0 end
+                    end
+                    
+                    -- Daily geolocation timing
+                    if data.geolocation_daily then
+                        data.geolocation_daily.last_run_ago = now - (data.geolocation_daily.last_run or 0)
+                        data.geolocation_daily.next_run_in = (data.geolocation_daily.next_run or now) - now
+                        if data.geolocation_daily.next_run_in < 0 then data.geolocation_daily.next_run_in = 0 end
                     end
                 end
             end
@@ -619,6 +627,8 @@ local methods = {
             if not data then
                 data = {
                     timestamp = 0,
+                    operational_mode = "unknown",
+                    geolocation_mode = "unknown",
                     message = "No geolocation data available yet. Start the service and wait for the first cycle."
                 }
             end
