@@ -298,6 +298,16 @@ return view.extend({
         o = s.option(form.Value, 'ip_list', _('IP List File'));
         o.rmempty = false;
 
+        // IP expiry days - removes inactive IPs after specified days
+        o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
+            _('Automatically remove IPs not seen for this many days. Set to 0 to disable. ' +
+              'Useful for games with dynamic servers where IPs change frequently.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '0';
+        o.default = '0';  // Default for existing filters: disabled
+        o.rmempty = true;
+        o.modalonly = true;
+
         // Helper function to generate and set the IP list path
         function setIpListPath(section_id, map) {
             var name_field = map.lookupOption('name', section_id)[0];
