@@ -39,11 +39,10 @@ return view.extend({
     render: function() {
         var m, s, o;
 
-        // Create main configuration map for Geomate
-        m = new form.Map('geomate', _('Geo Filters'),
-            _('Configure geographic filters and global settings for game server access.'));
+        // Create main configuration map for Geomate (no header - redundant with page title)
+        m = new form.Map('geomate', '', '');
 
-        // **Geolocation Status Section** - Shows current IP geolocation progress
+        // **Geolocation Status Section** - Shows cycle and geolocation progress
         s = m.section(form.TypedSection, 'global', _('Geolocation Status'));
         s.anonymous = true;
         s.addremove = false;
@@ -55,50 +54,44 @@ return view.extend({
                 return '<em>' + _('No geolocation data available. Start the service and wait for the first cycle.') + '</em>';
             }
 
-            var html = '<div class="cbi-value-description" style="padding: 10px; border: 1px solid var(--border-color-medium, #ccc); border-radius: 4px; margin-bottom: 10px;">';
+            var html = '<div style="padding: 8px 0;">';
             
             var opMode = geoStats.operational_mode || 'dynamic';
             var geoMode = geoStats.geolocation_mode || 'frequent';
             
-            // Show mode-specific info
-            if (opMode === 'static') {
-                html += '<strong>' + _('Mode:') + '</strong> ' + _('Static - no automatic IP collection');
-            } else if (opMode === 'monitor') {
-                html += '<strong>' + _('Mode:') + '</strong> ' + _('Monitor - IPs collected but not blocked');
-                // Show cycle info for monitor mode
+            // Cycle info (not shown for static mode)
+            if (opMode !== 'static') {
                 var lastUpdate = geoStats.last_update_ago || 0;
                 var nextCycle = geoStats.next_cycle_in || 0;
-                html += '<br><strong>' + _('Cycle:') + '</strong> ';
-                html += _('Last update') + ' ' + formatTime(lastUpdate) + ' ' + _('ago');
-                html += ', ' + _('next in') + ' ' + formatTime(nextCycle);
-            } else {
-                // Dynamic mode - show cycle info
-                var lastUpdate = geoStats.last_update_ago || 0;
-                var nextCycle = geoStats.next_cycle_in || 0;
+                html += '<div style="margin-bottom: 4px;">';
                 html += '<strong>' + _('Cycle:') + '</strong> ';
                 html += _('Last update') + ' ' + formatTime(lastUpdate) + ' ' + _('ago');
                 html += ', ' + _('next in') + ' ' + formatTime(nextCycle);
+                html += '</div>';
             }
             
-            // Show frequent geolocation info (only in frequent mode)
+            // Frequent geolocation info (only in frequent mode)
             if (geoMode === 'frequent' && geoStats.geolocation) {
                 var geoLastRun = geoStats.geolocation.last_run_ago || 0;
                 var pendingIps = geoStats.geolocation.pending_ips || 0;
-                html += '<br><strong>' + _('Geolocation (frequent):') + '</strong> ';
-                if (geoLastRun > 0 && geoLastRun < 86400) {  // Show if run in last 24h
+                html += '<div style="margin-bottom: 4px;">';
+                html += '<strong>' + _('Geolocation (frequent):') + '</strong> ';
+                if (geoLastRun > 0 && geoLastRun < 86400) {
                     html += _('Last') + ' ' + formatTime(geoLastRun) + ' ' + _('ago');
                     html += ', <strong>' + pendingIps + '</strong> ' + _('IPs pending');
                 } else {
                     html += '<em>' + _('Not yet run') + '</em>';
                 }
+                html += '</div>';
             }
             
-            // Show daily geolocation info (always runs)
+            // Daily geolocation info (always shown)
             if (geoStats.geolocation_daily) {
                 var dailyLastRun = geoStats.geolocation_daily.last_run_ago || 0;
                 var dailyNextRun = geoStats.geolocation_daily.next_run_in || 0;
-                html += '<br><strong>' + _('Geolocation (daily):') + '</strong> ';
-                if (dailyLastRun > 0 && dailyLastRun < 172800) {  // Show if run in last 48h
+                html += '<div>';
+                html += '<strong>' + _('Geolocation (daily):') + '</strong> ';
+                if (dailyLastRun > 0 && dailyLastRun < 172800) {
                     var lastHours = Math.floor(dailyLastRun / 3600);
                     var nextHours = Math.floor(dailyNextRun / 3600);
                     html += _('Last') + ' ' + lastHours + 'h ' + _('ago');
@@ -106,6 +99,7 @@ return view.extend({
                 } else {
                     html += '<em>' + _('Not yet run') + '</em>';
                 }
+                html += '</div>';
             }
             
             html += '</div>';
