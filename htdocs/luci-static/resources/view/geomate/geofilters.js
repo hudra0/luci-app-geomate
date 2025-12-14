@@ -57,21 +57,52 @@ return view.extend({
 
             var html = '<div class="cbi-value-description" style="padding: 10px; border: 1px solid var(--border-color-medium, #ccc); border-radius: 4px; margin-bottom: 10px;">';
             
-            // Cycle info
-            var lastUpdate = geoStats.last_update_ago || 0;
-            var nextCycle = geoStats.next_cycle_in || 0;
-            html += '<strong>' + _('Cycle:') + '</strong> ';
-            html += _('Last update') + ' ' + formatTime(lastUpdate) + ' ' + _('ago');
-            html += ', ' + _('next in') + ' ' + formatTime(nextCycle);
+            var opMode = geoStats.operational_mode || 'dynamic';
+            var geoMode = geoStats.geolocation_mode || 'frequent';
             
-            // Geolocation info
-            if (geoStats.geolocation) {
+            // Show mode-specific info
+            if (opMode === 'static') {
+                html += '<strong>' + _('Mode:') + '</strong> ' + _('Static - no automatic IP collection');
+            } else if (opMode === 'monitor') {
+                html += '<strong>' + _('Mode:') + '</strong> ' + _('Monitor - IPs collected but not blocked');
+                // Show cycle info for monitor mode
+                var lastUpdate = geoStats.last_update_ago || 0;
+                var nextCycle = geoStats.next_cycle_in || 0;
+                html += '<br><strong>' + _('Cycle:') + '</strong> ';
+                html += _('Last update') + ' ' + formatTime(lastUpdate) + ' ' + _('ago');
+                html += ', ' + _('next in') + ' ' + formatTime(nextCycle);
+            } else {
+                // Dynamic mode - show cycle info
+                var lastUpdate = geoStats.last_update_ago || 0;
+                var nextCycle = geoStats.next_cycle_in || 0;
+                html += '<strong>' + _('Cycle:') + '</strong> ';
+                html += _('Last update') + ' ' + formatTime(lastUpdate) + ' ' + _('ago');
+                html += ', ' + _('next in') + ' ' + formatTime(nextCycle);
+            }
+            
+            // Show frequent geolocation info (only in frequent mode)
+            if (geoMode === 'frequent' && geoStats.geolocation) {
                 var geoLastRun = geoStats.geolocation.last_run_ago || 0;
                 var pendingIps = geoStats.geolocation.pending_ips || 0;
-                html += '<br><strong>' + _('Geolocation:') + '</strong> ';
-                if (geoLastRun > 0) {
-                    html += _('Last run') + ' ' + formatTime(geoLastRun) + ' ' + _('ago');
+                html += '<br><strong>' + _('Geolocation (frequent):') + '</strong> ';
+                if (geoLastRun > 0 && geoLastRun < 86400) {  // Show if run in last 24h
+                    html += _('Last') + ' ' + formatTime(geoLastRun) + ' ' + _('ago');
                     html += ', <strong>' + pendingIps + '</strong> ' + _('IPs pending');
+                } else {
+                    html += '<em>' + _('Not yet run') + '</em>';
+                }
+            }
+            
+            // Show daily geolocation info (always runs)
+            if (geoStats.geolocation_daily) {
+                var dailyLastRun = geoStats.geolocation_daily.last_run_ago || 0;
+                var dailyNextRun = geoStats.geolocation_daily.next_run_in || 0;
+                html += '<br><strong>' + _('Geolocation (daily):') + '</strong> ';
+                if (dailyLastRun > 0 && dailyLastRun < 172800) {  // Show if run in last 48h
+                    var lastHours = Math.floor(dailyLastRun / 3600);
+                    var nextHours = Math.floor(dailyNextRun / 3600);
+                    html += _('Last') + ' ' + lastHours + 'h ' + _('ago');
+                    html += ', ' + _('next in') + ' ~' + nextHours + 'h';
                 } else {
                     html += '<em>' + _('Not yet run') + '</em>';
                 }
