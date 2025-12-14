@@ -205,7 +205,12 @@ return view.extend({
         o.modalonly = false;
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
+            var enabled = uci.get('geomate', section_id, 'enabled');
+            
             if (!filterName) return '-';
+            
+            // Disabled filters show neutral status
+            if (enabled !== '1') return '-';
             
             // Check if this filter has NFT errors
             if (geoStats && geoStats.nft_error_filters && geoStats.nft_error_filters.length > 0) {
