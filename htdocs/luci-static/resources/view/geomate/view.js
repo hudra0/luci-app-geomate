@@ -371,15 +371,13 @@ return view.extend({
                                 var html = '';
                                 
                                 // Build compact health check display
-                                var checkOrder = ['config', 'files', 'datadir', 'service', 'nft', 'process', 'nft_errors'];
+                                var checkOrder = ['config', 'files', 'datadir', 'service', 'nft'];
                                 var checkLabels = {
                                     'config': 'Config',
                                     'files': 'Files', 
                                     'datadir': 'Data',
-                                    'service': 'Service',
-                                    'nft': 'nftables',
-                                    'process': 'Process',
-                                    'nft_errors': 'Errors'
+                                    'service': 'Autostart',
+                                    'nft': 'nftables'
                                 };
                                 
                                 checkOrder.forEach(function(key) {
