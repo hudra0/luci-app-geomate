@@ -480,7 +480,7 @@ local function run_health_check()
         health.errors = health.errors + 1
     end
 
-    -- Check 4: Service enabled status
+    -- Check 4: Autostart enabled status
     uci:load('geomate')
     local config_enabled = (uci:get('geomate', 'global', 'enabled') == '1')
 
@@ -493,9 +493,9 @@ local function run_health_check()
     end
 
     if config_enabled and autostart then
-        health.checks.service = { status = "ok", message = "Service enabled" }
+        health.checks.service = { status = "ok", message = "Autostart enabled" }
     elseif not config_enabled and not autostart then
-        health.checks.service = { status = "info", message = "Service disabled" }
+        health.checks.service = { status = "info", message = "Autostart disabled" }
     else
         health.checks.service = { status = "warning", message = "Inconsistent state: config=" .. tostring(config_enabled) .. ", autostart=" .. tostring(autostart) }
     end
