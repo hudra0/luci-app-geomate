@@ -38,6 +38,12 @@ var callGeomateAllowedIPs = rpc.declare({
     params: []
 });
 
+var callGetHealthCheck = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getHealthCheck',
+    expect: { health: {} }
+});
+
 // Function to retrieve the current status of the Geomate service
 function getServiceStatus() {
     return fs.exec('/etc/init.d/geomate', ['status']).then(function(res) {
@@ -126,25 +132,31 @@ return view.extend({
             var statusText = self.serviceStatus === 'Running' ? _('Running') : _('Not Running');
         
             return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
-                // Service status row
-                E('div', { style: 'display: flex; align-items: center;' }, [
-                    // Colored circle indicating service status
-                    E('div', {
-                        id: 'service-status-indicator',
-                        style: `
-                            width: 12px;
-                            height: 12px;
-                            border-radius: 50%;
-                            background-color: ${statusColor};
-                            margin-right: 8px;
-                        `
-                    }),
-                    // Text displaying the service status
-                    E('p', { id: 'service-status-text', style: 'margin: 0;' }, _('Service Status: ') + statusText),
+                // Service status + Health checks row (combined)
+                E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
+                    // Colored circle + status text
+                    E('div', { style: 'display: flex; align-items: center;' }, [
+                        E('div', {
+                            id: 'service-status-indicator',
+                            style: `
+                                width: 12px;
+                                height: 12px;
+                                border-radius: 50%;
+                                background-color: ${statusColor};
+                                margin-right: 8px;
+                            `
+                        }),
+                        E('span', { id: 'service-status-text', style: 'margin: 0; font-weight: bold;' }, statusText)
+                    ]),
+                    // Health check status (inline)
+                    E('span', { 
+                        id: 'health-check-status',
+                        style: 'font-size: 13px; margin-left: 8px;'
+                    }, ''),
                     // Loading message (hidden by default)
-                    E('p', {
+                    E('span', {
                         id: 'geomate-loading-indicator',
-                        style: 'margin: 0; margin-left: 12px; display: none; color: orange;'
+                        style: 'display: none; color: orange; margin-left: 8px;'
                     }, _('Loading GeoFilter data ...'))
                 ]),
                 // Operational mode row
@@ -318,11 +330,13 @@ return view.extend({
                             uci.load('geomate').then(function() {
                                 var globalConfig = uci.sections('geomate', 'global')[0];
                                 return globalConfig ? globalConfig.operational_mode : 'dynamic';
-                            })
+                            }),
+                            callGetHealthCheck()
                         ]).then(function(results) {
                             var serviceStatus = results[0];
                             var loadingStatus = results[1];
                             var operationalMode = results[2];
+                            var healthData = results[3] || {};
                             self.serviceStatus = serviceStatus;
 
                             var statusElement = document.getElementById('service-status-text');
@@ -330,10 +344,11 @@ return view.extend({
                             var loadingElement = document.getElementById('geomate-loading-indicator');
                             var modeContainer = document.getElementById('operational-mode-container');
                             var modeElement = document.getElementById('operational-mode-text');
+                            var healthElement = document.getElementById('health-check-status');
 
                             if (statusElement) {
                                 var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
-                                statusElement.textContent = _('Service Status: ') + statusText;
+                                statusElement.textContent = statusText;
                             }
 
                             if (indicatorElement) {
@@ -348,6 +363,50 @@ return view.extend({
                                 } else {
                                     loadingElement.style.display = 'none';
                                 }
+                            }
+
+                            // Show health check status (inline with Running)
+                            if (healthElement && healthData.checks) {
+                                var checks = healthData.checks;
+                                var html = '';
+                                
+                                // Build compact health check display
+                                var checkOrder = ['config', 'files', 'datadir', 'service', 'nft', 'process', 'nft_errors'];
+                                var checkLabels = {
+                                    'config': 'Config',
+                                    'files': 'Files', 
+                                    'datadir': 'Data',
+                                    'service': 'Service',
+                                    'nft': 'nftables',
+                                    'process': 'Process',
+                                    'nft_errors': 'Errors'
+                                };
+                                
+                                checkOrder.forEach(function(key) {
+                                    if (checks[key]) {
+                                        var check = checks[key];
+                                        var icon = '✓';
+                                        var color = '#10b981'; // green
+                                        
+                                        if (check.status === 'error') {
+                                            icon = '✗';
+                                            color = '#ef4444'; // red
+                                        } else if (check.status === 'warning') {
+                                            icon = '⚠';
+                                            color = '#f59e0b'; // orange
+                                        } else if (check.status === 'info') {
+                                            icon = '○';
+                                            color = '#6b7280'; // gray
+                                        }
+                                        
+                                        html += '<span style="margin-right: 10px;" title="' + (check.message || '') + '">';
+                                        html += '<span style="color: ' + color + ';">' + icon + '</span> ';
+                                        html += checkLabels[key] || key;
+                                        html += '</span>';
+                                    }
+                                });
+                                
+                                healthElement.innerHTML = html;
                             }
 
                             // Show operational mode
