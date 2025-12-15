@@ -196,6 +196,12 @@ return view.extend({
         s.addremove = true;  // Allow adding and removing filters
         s.anonymous = true;
 
+        // Enable/disable individual filters
+        o = s.option(form.Flag, 'enabled', _('Enable'));
+        o.editable = true;
+        o.rmempty = false;
+        o.default = '1';
+
         // Filter name identifier
         o = s.option(form.Value, 'name', _('Name'));
         o.rmempty = false;
@@ -260,11 +266,6 @@ return view.extend({
         // Geographic regions that are allowed for this filter
         o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'));
         o.rmempty = true;
-
-        // Enable/disable individual filters
-        o = s.option(form.Flag, 'enabled', _('Enable'));
-        o.rmempty = false;
-        o.default = '1';
 
         // Protocol selection (TCP/UDP)
         o = s.option(form.ListValue, 'protocol', _('Protocol'));
