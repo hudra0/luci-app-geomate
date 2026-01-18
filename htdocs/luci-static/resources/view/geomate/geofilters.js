@@ -196,6 +196,12 @@ return view.extend({
         s.addremove = true;  // Allow adding and removing filters
         s.anonymous = true;
 
+        // Enable/disable individual filters
+        o = s.option(form.Flag, 'enabled', _('Enable'));
+        o.editable = true;
+        o.rmempty = false;
+        o.default = '1';
+
         // Filter name identifier
         o = s.option(form.Value, 'name', _('Name'));
         o.rmempty = false;
@@ -261,11 +267,6 @@ return view.extend({
         o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'));
         o.rmempty = true;
 
-        // Enable/disable individual filters
-        o = s.option(form.Flag, 'enabled', _('Enable'));
-        o.rmempty = false;
-        o.default = '1';
-
         // Protocol selection (TCP/UDP)
         o = s.option(form.ListValue, 'protocol', _('Protocol'));
         o.value('tcp', 'TCP');
@@ -297,6 +298,16 @@ return view.extend({
         // Path to the IP list file
         o = s.option(form.Value, 'ip_list', _('IP List File'));
         o.rmempty = false;
+
+        // IP expiry days - removes inactive IPs after specified days
+        o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
+            _('Automatically remove IPs not seen for this many days. Set to 0 to disable. ' +
+              'Useful for games with dynamic servers where IPs change frequently.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '0';
+        o.default = '0';  // Default for existing filters: disabled
+        o.rmempty = true;
+        o.modalonly = true;
 
         // Helper function to generate and set the IP list path
         function setIpListPath(section_id, map) {
