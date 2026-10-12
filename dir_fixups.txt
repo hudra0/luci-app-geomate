@@ -6,4 +6,4 @@
 /root/usr/libexec/rpcd=/usr/libexec/rpcd
 /htdocs/luci-static/resources/view=/www/luci-static/resources/view
 # This file is used during updates to handle directory structure changes
-# Example: /www/luci-static/resources/view/old_name=/www/luci-static/resources/view/geomate 
+# Example: /www/luci-static/resources/view/old_name=/www/luci-static/resources/view/geomate
