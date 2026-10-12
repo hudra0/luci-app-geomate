@@ -76,7 +76,6 @@ return view.extend({
     map: null,
     currentConnectionsData: [],
     allowedIPsData: [],
-    unlocatedIPs: [],
 
     // Load initial data required for the view
     load: function() {
@@ -466,15 +465,8 @@ return view.extend({
         var self = this;
         window.addEventListener('message', function(event) {
             console.log('Received message from iframe:', event.data);
-            if (event.data.type === 'mapReady') {
-                console.log('Map is ready, loading geo filters');
-                self.loadGeoFilters()
-                    .then(() => {
-                        self.sendConnectionsToMap(self.currentConnectionsData || []);
-                        self.sendAllowedIPsToMap(self.allowedIPsData || []);
-                        self.updateActiveConnectionsList();
-                    });
-            } else if (event.data.type === 'regionCreated') {
+            // 'mapReady' is handled by the listener in render(), which also starts the polls
+            if (event.data.type === 'regionCreated') {
                 console.log('New geo filter:', event.data.data);
                 self.updateGeoFilter(event.data.data.name, null, event.data.data.region, true);
             } else if (event.data.type === 'regionEdited') {
@@ -490,10 +482,6 @@ return view.extend({
                     .catch(error => {
                         console.error('Error deleting region:', error);
                     });
-            } else if (event.data.type === 'unlocatedIPs') {
-                console.log('Received unlocated IPs:', event.data.data);
-                self.unlocatedIPs = event.data.data;
-                self.updateUnlocatedIPsList();
             }
         }, false);
     },
