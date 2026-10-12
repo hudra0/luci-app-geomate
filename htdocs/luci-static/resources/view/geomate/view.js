@@ -475,10 +475,9 @@ return view.extend({
                 self.updateGeoFilter(data.name, data.oldRegion, data.region, false);
             } else if (event.data.type === 'regionDeleted') {
                 console.log('Deleting geo filter:', event.data.data.name, event.data.data.region);
+                // The map has removed the circle itself; reloading the filters here would
+                // draw every remaining region a second time
                 self.deleteGeoFilter(event.data.data.name, event.data.data.region)
-                    .then(() => {
-                        return self.loadGeoFilters();
-                    })
                     .catch(error => {
                         console.error('Error deleting region:', error);
                     });
