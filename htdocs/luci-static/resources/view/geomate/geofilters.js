@@ -132,6 +132,7 @@ return view.extend({
             _('Set the debug level (e.g., 0, 1, 2)'));
         o.datatype = 'uinteger';
         o.placeholder = '0';
+        o.default = '0';  // Same default as the backend
         o.rmempty = false;
 
         // Manual Geolocation Button
