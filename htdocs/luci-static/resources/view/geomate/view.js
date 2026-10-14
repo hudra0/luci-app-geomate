@@ -365,26 +365,26 @@ return view.extend({
         // shows the ones connected right now, with their filter and status.)
 
         return m.render().then(function(rendered) {
-            rendered.classList.add('geomate-dumaos-theme');
+            rendered.classList.add('geomate-dark-theme');
             // The stylesheet lives in <head> (not inside the form), so it survives the form being re-rendered, e.g. by Reset
             var themeCss = `
-/* DumaOS-inspired presentation only */
-.geomate-dumaos-theme{--gm-panel:#17232d;--gm-border:#30414d;--gm-text:#eaf1f5;--gm-muted:#9eafb9;--gm-accent:#9bdc28;color:var(--gm-text)}
-.geomate-dumaos-theme .cbi-section,.geomate-dumaos-theme .cbi-section-node{background:var(--gm-panel)!important;color:var(--gm-text)!important;border:1px solid var(--gm-border)!important;border-radius:10px!important;padding:16px!important;margin:12px 0 18px!important;box-shadow:0 6px 20px rgba(0,0,0,.16)}
-.geomate-dumaos-theme .cbi-section h3,.geomate-dumaos-theme .cbi-section .cbi-section-title{color:var(--gm-text)!important;font-size:1.05rem;font-weight:700;letter-spacing:.02em}
-.geomate-dumaos-theme #geomate-map-container{overflow:hidden;border:1px solid #344651;border-left:0;border-right:0;border-radius:0;background:#0b1117;box-shadow:0 10px 28px rgba(0,0,0,.28);box-sizing:border-box}
-.geomate-dumaos-theme #geomate-map-container iframe{display:block;border-radius:0;min-height:380px}
-@media (max-width:700px),(max-height:500px){.geomate-dumaos-theme #geomate-map-container iframe{min-height:240px}}
-.geomate-dumaos-theme #geomate-map-container:fullscreen{background:#0b1117;border:0;border-radius:0;width:100%!important;height:100%!important;margin-left:0!important;transform:none!important;left:0!important}
-.geomate-dumaos-theme #geomate-map-container:fullscreen iframe{height:100%!important;width:100%!important;border-radius:0}
-.geomate-dumaos-theme #service-status-indicator{box-shadow:0 0 0 4px rgba(155,220,40,.12)}
-.geomate-dumaos-theme #service-status-text{color:var(--gm-text);letter-spacing:.04em;text-transform:uppercase;font-size:.85rem}
-.geomate-dumaos-theme #health-check-status,.geomate-dumaos-theme #version-display,.geomate-dumaos-theme #version-update-status{color:var(--gm-muted)!important}
-.geomate-dumaos-theme #operational-mode-container{display:none!important}
-.geomate-dumaos-theme .cbi-section:has(#service-status-indicator){display:none!important}
-.geomate-dumaos-theme #service-status-indicator{display:none!important}
-.geomate-dumaos-theme .cbi-button,.geomate-dumaos-theme button{border-radius:6px}
-.geomate-dumaos-theme input,.geomate-dumaos-theme select,.geomate-dumaos-theme textarea{border-radius:6px!important}
+/* Geomate dark theme (presentation only) */
+.geomate-dark-theme{--gm-panel:#17232d;--gm-border:#30414d;--gm-text:#eaf1f5;--gm-muted:#9eafb9;--gm-accent:#9bdc28;color:var(--gm-text)}
+.geomate-dark-theme .cbi-section,.geomate-dark-theme .cbi-section-node{background:var(--gm-panel)!important;color:var(--gm-text)!important;border:1px solid var(--gm-border)!important;border-radius:10px!important;padding:16px!important;margin:12px 0 18px!important;box-shadow:0 6px 20px rgba(0,0,0,.16)}
+.geomate-dark-theme .cbi-section h3,.geomate-dark-theme .cbi-section .cbi-section-title{color:var(--gm-text)!important;font-size:1.05rem;font-weight:700;letter-spacing:.02em}
+.geomate-dark-theme #geomate-map-container{overflow:hidden;border:1px solid #344651;border-left:0;border-right:0;border-radius:0;background:#0b1117;box-shadow:0 10px 28px rgba(0,0,0,.28);box-sizing:border-box}
+.geomate-dark-theme #geomate-map-container iframe{display:block;border-radius:0;min-height:380px}
+@media (max-width:700px),(max-height:500px){.geomate-dark-theme #geomate-map-container iframe{min-height:240px}}
+.geomate-dark-theme #geomate-map-container:fullscreen{background:#0b1117;border:0;border-radius:0;width:100%!important;height:100%!important;margin-left:0!important;transform:none!important;left:0!important}
+.geomate-dark-theme #geomate-map-container:fullscreen iframe{height:100%!important;width:100%!important;border-radius:0}
+.geomate-dark-theme #service-status-indicator{box-shadow:0 0 0 4px rgba(155,220,40,.12)}
+.geomate-dark-theme #service-status-text{color:var(--gm-text);letter-spacing:.04em;text-transform:uppercase;font-size:.85rem}
+.geomate-dark-theme #health-check-status,.geomate-dark-theme #version-display,.geomate-dark-theme #version-update-status{color:var(--gm-muted)!important}
+.geomate-dark-theme #operational-mode-container{display:none!important}
+.geomate-dark-theme .cbi-section:has(#service-status-indicator){display:none!important}
+.geomate-dark-theme #service-status-indicator{display:none!important}
+.geomate-dark-theme .cbi-button,.geomate-dark-theme button{border-radius:6px}
+.geomate-dark-theme input,.geomate-dark-theme select,.geomate-dark-theme textarea{border-radius:6px!important}
 
 /* the map stretched over the whole screen (see geomateImmersive) */
 html.geomate-immersive,html.geomate-immersive body{overflow:hidden!important}
@@ -2118,7 +2118,7 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                 // Reset rebuilds the form, so put the presentation back on the new content
                 var box = document.getElementById('geomate-map-container');
                 var root = box && box.closest ? box.closest('.cbi-map') : null;
-                if (root) root.classList.add('geomate-dumaos-theme');
+                if (root) root.classList.add('geomate-dark-theme');
                 if (view.hideStatusSection) view.hideStatusSection(root || document);
                 if (view.fitMapToWindow) { view.fitMapToWindow(); setTimeout(view.fitMapToWindow, 300); setTimeout(view.fitMapToWindow, 1200); }
                 view.sendMessageToMap('clearMap');

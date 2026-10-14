@@ -487,54 +487,54 @@ return view.extend({
         };
 
         return m.render().then(function(rendered) {
-            rendered.classList.add('geomate-dumaos-theme');
+            rendered.classList.add('geomate-dark-theme');
             rendered.classList.add('geomate-filters-page');   // (lets this page use more of the window, see the style below)
             // The colours go in the page header, not inside the form: LuCI rebuilds the form's contents after Save & Apply,
             // which used to throw the style away and leave the page in the plain theme.
             var oldThemeStyle = document.getElementById('geomate-filters-theme-style');
             if (oldThemeStyle && oldThemeStyle.parentNode) oldThemeStyle.parentNode.removeChild(oldThemeStyle);
             document.head.appendChild(E('style', { id: 'geomate-filters-theme-style' }, `
-/* DumaOS-inspired settings presentation only */
-.geomate-dumaos-theme{--gm-panel:#17232d;--gm-border:#30414d;--gm-text:#eaf1f5;--gm-muted:#9eafb9;--gm-accent:#9bdc28;color:var(--gm-text)}
-.geomate-dumaos-theme .cbi-section,.geomate-dumaos-theme .cbi-section-node{background:var(--gm-panel)!important;color:var(--gm-text)!important;border:1px solid var(--gm-border)!important;border-radius:10px!important;padding:16px!important;margin:12px 0 18px!important;box-shadow:0 6px 20px rgba(0,0,0,.16)}
-.geomate-dumaos-theme .cbi-section h3,.geomate-dumaos-theme .cbi-section .cbi-section-title{color:var(--gm-text)!important;font-weight:700;letter-spacing:.02em}
-.geomate-dumaos-theme .cbi-value-title,.geomate-dumaos-theme label,.geomate-dumaos-theme .cbi-section p,.geomate-dumaos-theme .cbi-section em,.geomate-dumaos-theme .cbi-section strong{color:var(--gm-text)}
-.geomate-dumaos-theme .cbi-value-description,.geomate-dumaos-theme .description{color:var(--gm-muted)!important}
-.geomate-dumaos-theme input,.geomate-dumaos-theme select,.geomate-dumaos-theme textarea{background:#0f1921!important;color:var(--gm-text)!important;border:1px solid #3a4d59!important;border-radius:6px!important}
-.geomate-dumaos-theme input:focus,.geomate-dumaos-theme select:focus,.geomate-dumaos-theme textarea:focus{border-color:var(--gm-accent)!important;box-shadow:0 0 0 2px rgba(155,220,40,.14)!important}
-.geomate-dumaos-theme .cbi-button,.geomate-dumaos-theme button{border-radius:6px!important}
-.geomate-dumaos-theme .cbi-button-positive,.geomate-dumaos-theme .cbi-button-action{background:var(--gm-accent)!important;color:#111b12!important;border-color:var(--gm-accent)!important;font-weight:750}
+/* Geomate dark theme for the settings page (presentation only) */
+.geomate-dark-theme{--gm-panel:#17232d;--gm-border:#30414d;--gm-text:#eaf1f5;--gm-muted:#9eafb9;--gm-accent:#9bdc28;color:var(--gm-text)}
+.geomate-dark-theme .cbi-section,.geomate-dark-theme .cbi-section-node{background:var(--gm-panel)!important;color:var(--gm-text)!important;border:1px solid var(--gm-border)!important;border-radius:10px!important;padding:16px!important;margin:12px 0 18px!important;box-shadow:0 6px 20px rgba(0,0,0,.16)}
+.geomate-dark-theme .cbi-section h3,.geomate-dark-theme .cbi-section .cbi-section-title{color:var(--gm-text)!important;font-weight:700;letter-spacing:.02em}
+.geomate-dark-theme .cbi-value-title,.geomate-dark-theme label,.geomate-dark-theme .cbi-section p,.geomate-dark-theme .cbi-section em,.geomate-dark-theme .cbi-section strong{color:var(--gm-text)}
+.geomate-dark-theme .cbi-value-description,.geomate-dark-theme .description{color:var(--gm-muted)!important}
+.geomate-dark-theme input,.geomate-dark-theme select,.geomate-dark-theme textarea{background:#0f1921!important;color:var(--gm-text)!important;border:1px solid #3a4d59!important;border-radius:6px!important}
+.geomate-dark-theme input:focus,.geomate-dark-theme select:focus,.geomate-dark-theme textarea:focus{border-color:var(--gm-accent)!important;box-shadow:0 0 0 2px rgba(155,220,40,.14)!important}
+.geomate-dark-theme .cbi-button,.geomate-dark-theme button{border-radius:6px!important}
+.geomate-dark-theme .cbi-button-positive,.geomate-dark-theme .cbi-button-action{background:var(--gm-accent)!important;color:#111b12!important;border-color:var(--gm-accent)!important;font-weight:750}
 /* This page uses more of the window (the theme keeps every page in a 1180px column) */
 html:has(.geomate-filters-page) #maincontent{max-width:min(1800px,100%)!important;padding-left:16px!important;padding-right:16px!important;box-sizing:border-box}
 html:has(.geomate-filters-page) header{padding-left:max(16px,calc((100% - 1800px) / 2))!important;padding-right:max(16px,calc((100% - 1800px) / 2))!important}
 html:has(.geomate-filters-page) footer{padding-left:max(16px,calc((100% - 1800px) / 2))!important;padding-right:max(16px,calc((100% - 1800px) / 2))!important}
 /* The settings: label and field side by side with room for the longer descriptions */
-.geomate-dumaos-theme .cbi-value-field{max-width:900px}
+.geomate-dark-theme .cbi-value-field{max-width:900px}
 /* The filters table: full width, words kept whole (addresses, ports and file names no longer break letter by letter) */
-.geomate-dumaos-theme .cbi-tblsection{overflow-x:auto;max-width:100%}
-.geomate-dumaos-theme .cbi-tblsection .cbi-section-table{width:100%}
-.geomate-dumaos-theme .cbi-tblsection .tr.cbi-section-table-descr{display:none}
-.geomate-dumaos-theme .cbi-tblsection .td,.geomate-dumaos-theme .cbi-tblsection td,.geomate-dumaos-theme .cbi-tblsection .th{overflow-wrap:normal;word-break:normal;padding-left:8px;padding-right:8px;vertical-align:middle}
-.geomate-dumaos-theme .cbi-tblsection [data-name="name"]{min-width:90px}
-.geomate-dumaos-theme .cbi-tblsection [data-name="src_ip"],.geomate-dumaos-theme .cbi-tblsection [data-name="src_port"],.geomate-dumaos-theme .cbi-tblsection [data-name="dest_port"]{max-width:200px}
-.geomate-dumaos-theme .cbi-tblsection [data-name="ip_list"]{min-width:150px;max-width:260px;font-size:12px;overflow-wrap:anywhere}
-.geomate-dumaos-theme .cbi-tblsection .cbi-section-actions{white-space:nowrap}
-.geomate-dumaos-theme .geomate-addr{display:block;white-space:nowrap}
-.geomate-dumaos-theme .cbi-tblsection [data-name="allowed_region"]{min-width:190px;max-width:520px;word-break:normal;overflow-wrap:anywhere;font-size:12px;line-height:1.4}
-.geomate-dumaos-theme .cbi-tblsection [data-name="allowed_ip"]{min-width:150px;max-width:240px;font-size:12px;line-height:1.4}
-.geomate-dumaos-theme .geomate-ip-count{color:var(--gm-text);margin-bottom:4px}
-.geomate-dumaos-theme .cbi-button.geomate-ip-toggle{font-size:12px!important;padding:2px 10px!important;line-height:1.6!important;min-height:0!important;background:#263944!important;color:var(--gm-text)!important;border:1px solid #3a4d59!important}
-.geomate-dumaos-theme .cbi-button.geomate-ip-toggle:hover{border-color:var(--gm-accent)!important}
-.geomate-dumaos-theme .geomate-ip-list{margin-top:6px;max-height:220px;overflow-y:auto;padding:4px 6px;background:#0f1921;border:1px solid #30414d;border-radius:6px;font-family:monospace;font-size:12px;overflow-wrap:anywhere}
-.geomate-dumaos-theme .geomate-ip-list>div+div{border-top:1px solid rgba(255,255,255,.06);padding-top:2px;margin-top:2px}
+.geomate-dark-theme .cbi-tblsection{overflow-x:auto;max-width:100%}
+.geomate-dark-theme .cbi-tblsection .cbi-section-table{width:100%}
+.geomate-dark-theme .cbi-tblsection .tr.cbi-section-table-descr{display:none}
+.geomate-dark-theme .cbi-tblsection .td,.geomate-dark-theme .cbi-tblsection td,.geomate-dark-theme .cbi-tblsection .th{overflow-wrap:normal;word-break:normal;padding-left:8px;padding-right:8px;vertical-align:middle}
+.geomate-dark-theme .cbi-tblsection [data-name="name"]{min-width:90px}
+.geomate-dark-theme .cbi-tblsection [data-name="src_ip"],.geomate-dark-theme .cbi-tblsection [data-name="src_port"],.geomate-dark-theme .cbi-tblsection [data-name="dest_port"]{max-width:200px}
+.geomate-dark-theme .cbi-tblsection [data-name="ip_list"]{min-width:150px;max-width:260px;font-size:12px;overflow-wrap:anywhere}
+.geomate-dark-theme .cbi-tblsection .cbi-section-actions{white-space:nowrap}
+.geomate-dark-theme .geomate-addr{display:block;white-space:nowrap}
+.geomate-dark-theme .cbi-tblsection [data-name="allowed_region"]{min-width:190px;max-width:520px;word-break:normal;overflow-wrap:anywhere;font-size:12px;line-height:1.4}
+.geomate-dark-theme .cbi-tblsection [data-name="allowed_ip"]{min-width:150px;max-width:240px;font-size:12px;line-height:1.4}
+.geomate-dark-theme .geomate-ip-count{color:var(--gm-text);margin-bottom:4px}
+.geomate-dark-theme .cbi-button.geomate-ip-toggle{font-size:12px!important;padding:2px 10px!important;line-height:1.6!important;min-height:0!important;background:#263944!important;color:var(--gm-text)!important;border:1px solid #3a4d59!important}
+.geomate-dark-theme .cbi-button.geomate-ip-toggle:hover{border-color:var(--gm-accent)!important}
+.geomate-dark-theme .geomate-ip-list{margin-top:6px;max-height:220px;overflow-y:auto;padding:4px 6px;background:#0f1921;border:1px solid #30414d;border-radius:6px;font-family:monospace;font-size:12px;overflow-wrap:anywhere}
+.geomate-dark-theme .geomate-ip-list>div+div{border-top:1px solid rgba(255,255,255,.06);padding-top:2px;margin-top:2px}
 .cbi-value[data-name="allowed_ip"] .cbi-dynlist{max-height:260px;overflow-y:auto}
-.geomate-dumaos-theme .geomate-region{padding:1px 0}
-.geomate-dumaos-theme .geomate-region+.geomate-region{border-top:1px solid rgba(255,255,255,.08);margin-top:3px;padding-top:4px}
-.geomate-dumaos-theme .cbi-button.geomate-manual-geo,.geomate-dumaos-theme .cbi-value[data-name="_manual_geolocation"] .cbi-button{background:#3b82f6!important;color:#ffffff!important;border-color:#3b82f6!important;font-weight:750}
-.geomate-dumaos-theme .cbi-button.geomate-manual-geo:hover,.geomate-dumaos-theme .cbi-value[data-name="_manual_geolocation"] .cbi-button:hover{background:#5a9bff!important;border-color:#5a9bff!important}
-.geomate-dumaos-theme table,.geomate-dumaos-theme .table{color:var(--gm-text)}
-.geomate-dumaos-theme th{background:#263944!important;color:#eaf1f5!important}
-.geomate-dumaos-theme td,.geomate-dumaos-theme th{border-color:#30414d!important}
+.geomate-dark-theme .geomate-region{padding:1px 0}
+.geomate-dark-theme .geomate-region+.geomate-region{border-top:1px solid rgba(255,255,255,.08);margin-top:3px;padding-top:4px}
+.geomate-dark-theme .cbi-button.geomate-manual-geo,.geomate-dark-theme .cbi-value[data-name="_manual_geolocation"] .cbi-button{background:#3b82f6!important;color:#ffffff!important;border-color:#3b82f6!important;font-weight:750}
+.geomate-dark-theme .cbi-button.geomate-manual-geo:hover,.geomate-dark-theme .cbi-value[data-name="_manual_geolocation"] .cbi-button:hover{background:#5a9bff!important;border-color:#5a9bff!important}
+.geomate-dark-theme table,.geomate-dark-theme .table{color:var(--gm-text)}
+.geomate-dark-theme th{background:#263944!important;color:#eaf1f5!important}
+.geomate-dark-theme td,.geomate-dark-theme th{border-color:#30414d!important}
 `));
             return rendered;
         });
