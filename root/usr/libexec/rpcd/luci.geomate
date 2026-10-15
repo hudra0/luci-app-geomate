@@ -745,6 +745,87 @@ local function fl_denied_setup(flt)
     return ok
 end
 
+-- ----- Keep games on IPv4 (filter option "ipv4_only", set by the Mobile Filtering preset) -----
+-- Geomate's rules only match IPv4 ("ip saddr ..."). Phones and tablets send much of their game traffic over IPv6 when
+-- the home network has it, and that traffic was then not filtered at all. With this option the device's IPv6 to ports
+-- the filter covers (its protocol and destination ports; ports 1024 and up, UDP and TCP, when it names none) is refused
+-- at once, so that traffic falls back to IPv4, where the filter sees it. Everything else keeps using IPv6. The device
+-- is recognised by its MAC address (its IPv6 addresses keep changing), looked up from its IPv4 address in the DHCP
+-- leases and the neighbour table.
+local function fl_v6_macs(s)
+    local want = {}
+    local src = s.src_ip
+    if type(src) == "table" then src = table.concat(src, " ") end
+    for tok in tostring(src or ""):gmatch("[^%s{},]+") do
+        if tok:match("^%d+%.%d+%.%d+%.%d+$") then want[tok] = true end   -- single addresses only (not networks or "!")
+    end
+    local macs, seen = {}, {}
+    local function add(ip, mac)
+        mac = (mac or ""):lower()
+        if want[ip] and mac:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") and mac ~= "00:00:00:00:00:00" and not seen[mac] then
+            seen[mac] = true
+            macs[#macs + 1] = mac
+        end
+    end
+    for line in (fl_read("/tmp/dhcp.leases") or ""):gmatch("[^\n]+") do
+        local mac, ip = line:match("^%S+%s+(%S+)%s+(%S+)")
+        if ip then add(ip, mac) end
+    end
+    for line in (fl_read("/proc/net/arp") or ""):gmatch("[^\n]+") do
+        local ip, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+%S+%s+%S+%s+(%S+)")
+        if ip then add(ip, mac) end
+    end
+    table.sort(macs)
+    return macs
+end
+
+-- what the IPv6 rule matches: the filter's own protocol and destination ports
+local function fl_v6_match(s)
+    local function str(v) if type(v) == "table" then return table.concat(v, " ") end return v or "" end
+    local proto, ports = str(s.protocol), str(s.dest_port)
+    local l4 = (proto == "tcp" or proto == "udp") and ("meta l4proto " .. proto) or "meta l4proto { tcp, udp }"
+    ports = ports:gsub("^%s+", ""):gsub("%s+$", "")
+    if ports == "" or ports == "any" or not ports:match("^[%d%- ]+$") then ports = "1024-65535" end
+    if ports:find(" ") then ports = "{ " .. ports:gsub(" +", ", ") .. " }" end
+    return l4 .. " th dport " .. ports
+end
+
+-- takes the rule and set away (the option was turned off, the filter is gone, or the rule is made anew)
+local function fl_v6_remove(set)
+    local h = io.popen("nft -a list chain inet geomate fl_first 2>/dev/null")
+    local out = h and h:read("*a") or ""
+    if h then h:close() end
+    local lines = {}
+    for line in out:gmatch("[^\n]+") do
+        if line:find("@" .. set .. " ", 1, true) then
+            local handle = line:match("# handle (%d+)")
+            if handle then lines[#lines + 1] = "delete rule inet geomate fl_first handle " .. handle end
+        end
+    end
+    lines[#lines + 1] = "delete set inet geomate " .. set
+    fl_nft_file(lines)
+end
+
+local function fl_v6_setup(flt, macs, key, match)
+    local set = flt.base .. "_v6games"
+    local lines = {}
+    -- the filter's protocol or ports changed (or the helper started again): the rule is made anew
+    if flt.v6_match ~= match and fl_set_exists(set) then fl_v6_remove(set) end
+    if not fl_set_exists(set) then
+        lines[#lines + 1] = "add chain inet geomate fl_first { type filter hook forward priority -151; policy accept; }"
+        lines[#lines + 1] = "add set inet geomate " .. set .. " { type ether_addr; }"
+        lines[#lines + 1] = "add rule inet geomate fl_first ether saddr @" .. set ..
+            " meta nfproto ipv6 " .. match .. " counter reject with icmpx type admin-prohibited"
+    else
+        lines[#lines + 1] = "flush set inet geomate " .. set
+    end
+    if #macs > 0 then lines[#lines + 1] = "add element inet geomate " .. set .. " { " .. table.concat(macs, ", ") .. " }" end
+    local ok = fl_nft_file(lines)
+    if ok then flt.v6_sig, flt.v6_match = key, match end
+    return ok
+end
+
+
 local function fl_sleep(seconds)
     local whole = math.floor(seconds)
     nixio.nanosleep(whole, math.floor((seconds - whole) * 1e9))
@@ -804,6 +885,8 @@ local function fast_locate_worker()
                 local f = { name = s.name, base = base, regions = regions, cfg = s, sig = sig, dyn = {}, dyn_at = -1,
                             denied = denied, denied_key = table.concat(dkeys, ",") }
                 if old[base] then f.denied_sig = old[base].denied_sig end
+                f.v6 = (s.ipv4_only == '1')
+                if old[base] and old[base].v6 then f.v6_sig, f.v6_match = old[base].v6_sig, old[base].v6_match end
                 if old[base] and old[base].sig == sig then
                     f.nets, f.dyn, f.dyn_at = old[base].nets, old[base].dyn, old[base].dyn_at
                     f.burst_until, f.burst_refresh, f.burst_timeout = old[base].burst_until, old[base].burst_refresh, old[base].burst_timeout
@@ -828,6 +911,24 @@ local function fast_locate_worker()
                 flt.denied_sig = ""   -- no blocks and no set: nothing to do
             elseif flt.denied_sig ~= flt.denied_key or (check_sets and flt.denied_key ~= "" and not have(flt.base .. "_denied")) then
                 if have(flt.base .. "_allowed") then fl_denied_setup(flt) end
+            end
+        end
+        -- keep games on IPv4: the device's MAC addresses (they change with a new private Wi-Fi address), checked now and then
+        for _, flt in ipairs(filters) do
+            if flt.v6 and (check_sets or flt.v6_sig == nil) and have(flt.base .. "_allowed") then
+                local macs = fl_v6_macs(flt.cfg)
+                local match = fl_v6_match(flt.cfg)
+                local key = match .. "|" .. table.concat(macs, ",")
+                if flt.v6_sig ~= key or not have(flt.base .. "_v6games") then fl_v6_setup(flt, macs, key, match) end
+            end
+        end
+        if check_sets then
+            -- and away again for filters that no longer use it
+            local keep = {}
+            for _, flt in ipairs(filters) do if flt.v6 then keep[flt.base .. "_v6games"] = true end end
+            if not names then names = fl_set_names() end
+            for set in pairs(names) do
+                if set:match("_v6games$") and not keep[set] then fl_v6_remove(set) end
             end
         end
         -- the network sets and rules: made when missing (first run, or Geomate restarted) or the regions changed

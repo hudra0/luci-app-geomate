@@ -5,16 +5,18 @@
             "ubus": {
                 "luci": [ "getInitList", "setInitAction" ],
                 "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus" ],
-                "uci": [ "get", "state" ]
+                "uci": [ "get", "state" ],
+                "luci-rpc": [ "getDHCPLeases" ]
             },
-            "uci": [ "geomate" ],
+            "uci": [ "geomate", "ping_adjuster" ],
             "file": {
                 "/etc/init.d/geomate": [ "read", "exec" ],
                 "/etc/geolocate.sh": [ "read", "exec" ],
                 "/var/run/geomate.pid": [ "read" ],
                 "/etc/geomate.d/*": [ "read" ],
                 "/etc/geomate.d/runtime/*": [ "read" ],
-                "/tmp/geomate_nft_errors.log": [ "read" ]
+                "/tmp/geomate_nft_errors.log": [ "read" ],
+                "/usr/libexec/ping-adjuster": [ "exec" ]
             }
         },
         "write": {
@@ -23,7 +25,7 @@
                 "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus" ],
                 "uci": [ "set", "commit", "apply" ]
             },
-            "uci": [ "geomate" ],
+            "uci": [ "geomate", "ping_adjuster" ],
             "file": {
                 "/etc/geomate.d/*": [ "write" ]
             }

@@ -1,0 +1,239 @@
+#!/bin/sh
+# Ping Adjuster for Geomate: adds delay (and, if wanted, jitter and packet loss) to the traffic of chosen devices,
+# using the kernel's netem queue.
+#
+#   ping-adjuster apply    set everything up from /etc/config/ping_adjuster (takes away the old setup first)
+#   ping-adjuster stop     take everything away
+#   ping-adjuster status   what is set up, as JSON (for the Ping Adjuster page)
+#
+# How: on the LAN side of the router, a device's packets are picked out with u32 filters on the interface it is
+# reached through (clsact ingress = from the device, upload; clsact egress = to the device, download) and redirected
+# through an ifb device of their own, whose root queue is netem. Only traffic that goes through the router is
+# delayed (not traffic between two LAN devices). Nothing is changed on the WAN side, so SQM / QoS keep working.
+#
+# Needs: tc (tc-tiny or tc-full), kmod-sched-core (clsact, u32, mirred), kmod-ifb, kmod-netem.
+
+CONFIG=ping_adjuster
+STATE=/tmp/ping_adjuster.state       # what was set up: "filter <dev> <ingress|egress> <pref>", "clsact <dev>"
+ERRORS=/tmp/ping_adjuster.errors     # problems of the last apply, for the page
+PREF_BASE=49152                       # filter priorities of this tool (kept apart from other tools' filters)
+IFB_PREFIX=pingadj                    # ifb devices: pingadj<rule>u (upload), pingadj<rule>d (download)
+LIMIT=10000                           # packets netem may hold (a long delay on a busy device needs room)
+
+TC=${TC:-tc}
+IP=${IP:-ip}
+
+log() { logger -t ping-adjuster "$*" 2>/dev/null; }
+err() { echo "$*" >> "$ERRORS"; log "$*"; }
+
+# The rules, one per line: index|enabled|addresses|delay|jitter|loss|direction|traffic
+# (read from "uci export", which keeps the order the page shows them in)
+read_rules() {
+	uci -q export "$CONFIG" | awk '
+		function val(s) { sub(/^[ \t]*[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", s); gsub(/^'\''|'\''$/, "", s); gsub(/'\''\\'\'''\''/, "'\''", s); return s }
+		function flush() { if (inrule) printf "%d|%s|%s|%s|%s|%s|%s|%s\n", n, en, ips, d, j, l, dir, tr }
+		/^config[ \t]+rule/ { flush(); inrule = 1; n++; en = "1"; ips = ""; d = "0"; j = "0"; l = "0"; dir = "both"; tr = "game"; next }
+		/^config/ { flush(); inrule = 0; next }
+		inrule && /^[ \t]*option[ \t]+enabled[ \t]/   { en = val($0); next }
+		inrule && /^[ \t]*option[ \t]+src_ip[ \t]/    { ips = ips " " val($0); next }
+		inrule && /^[ \t]*list[ \t]+src_ip[ \t]/      { ips = ips " " val($0); next }
+		inrule && /^[ \t]*option[ \t]+delay[ \t]/     { d = val($0); next }
+		inrule && /^[ \t]*option[ \t]+jitter[ \t]/    { j = val($0); next }
+		inrule && /^[ \t]*option[ \t]+loss[ \t]/      { l = val($0); next }
+		inrule && /^[ \t]*option[ \t]+direction[ \t]/ { dir = val($0); next }
+		inrule && /^[ \t]*option[ \t]+traffic[ \t]/   { tr = val($0); next }
+		END { flush() }'
+}
+
+global_enabled() {
+	[ "$(uci -q get "$CONFIG.global.enabled")" != "0" ]
+}
+
+# A number from the config, or 0 when it isn't one
+num() { echo "$1" | awk '{ if ($0 ~ /^[0-9]+(\.[0-9]+)?$/) print $0 + 0; else print 0 }'; }
+
+# netem settings for one direction: "delay <ms>ms [<jitter>ms] [loss <p>%] [rate 10gbit]"
+#   share: the part of the added ping this direction carries (1 = all of it, 0.5 = half)
+netem_args() {
+	awk -v d="$1" -v j="$2" -v l="$3" -v share="$4" -v limit="$LIMIT" 'BEGIN {
+		dd = d * share; jj = j * share
+		# loss: in "both" mode each direction loses a part, so that both together come to the asked-for loss
+		if (share < 1 && l > 0) ll = (1 - sqrt(1 - l / 100)) * 100; else ll = l
+		s = sprintf("limit %d delay %.3fms", limit, dd)
+		if (jj > 0) s = s sprintf(" %.3fms", jj)
+		if (ll > 0) s = s sprintf(" loss %.4f%%", ll)
+		# with jitter, netem would let later packets overtake earlier ones; a rate keeps them in order
+		# (10 Gbit/s: far above what a device sends, so it never slows anything down)
+		if (jj > 0) s = s " rate 10gbit"
+		print s
+	}'
+}
+
+# The LAN-side interface a device is reached through (nothing when it is reached through a gateway)
+dev_for() {
+	$IP -4 route get "${1%/*}" 2>/dev/null | awk '/ via / { exit } { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# clsact on the interface (made if missing; another tool's clsact is used as it is)
+CLSACT_FAIL=""
+ensure_clsact() {
+	local dev="$1" q
+	grep -q "^clsact $dev\$" "$STATE" 2>/dev/null && return 0
+	q=$($TC qdisc show dev "$dev" 2>/dev/null)
+	if echo "$q" | grep -q "qdisc clsact"; then
+		return 0
+	fi
+	if echo "$q" | grep -q "qdisc ingress"; then
+		err "$dev already has an ingress queue from another tool; Ping Adjuster cannot use $dev."
+		return 1
+	fi
+	if $TC qdisc add dev "$dev" clsact 2>/dev/null; then
+		echo "clsact $dev" >> "$STATE"
+		return 0
+	fi
+	err "Could not set up traffic filters on $dev (is kmod-sched-core installed?)."
+	return 1
+}
+
+PREF=$PREF_BASE
+# One filter (several u32 entries under one priority): $1 dev, $2 ingress|egress, $3 address, $4 game|all, $5 ifb
+add_filter() {
+	local dev="$1" dir="$2" addr="$3" traffic="$4" ifb="$5" side port m ok=1
+	PREF=$((PREF + 1))
+	if [ "$dir" = ingress ]; then side=src; port=dport; else side=dst; port=sport; fi
+	if [ "$traffic" = all ]; then
+		$TC filter add dev "$dev" "$dir" pref "$PREF" protocol ip u32 match ip "$side" "$addr" \
+			action mirred egress redirect dev "$ifb" 2>/dev/null || ok=0
+	else
+		# game traffic: UDP to or from a server port of 1024 and up (as the Any Game filter), in six port blocks
+		for m in 0x0400/0xfc00 0x0800/0xf800 0x1000/0xf000 0x2000/0xe000 0x4000/0xc000 0x8000/0x8000; do
+			$TC filter add dev "$dev" "$dir" pref "$PREF" protocol ip u32 match ip "$side" "$addr" \
+				match ip protocol 17 0xff match ip "$port" "${m%/*}" "${m#*/}" \
+				action mirred egress redirect dev "$ifb" 2>/dev/null || ok=0
+		done
+	fi
+	echo "filter $dev $dir $PREF" >> "$STATE"
+	[ $ok = 1 ] || err "Could not add a filter for $addr on $dev (is kmod-sched-core installed?)."
+	return 0
+}
+
+make_ifb() {
+	local name="$1" args="$2"
+	$IP link add "$name" type ifb 2>/dev/null || { err "Could not make the device $name (is kmod-ifb installed?)."; return 1; }
+	$IP link set "$name" up 2>/dev/null
+	# shellcheck disable=SC2086
+	if ! $TC qdisc replace dev "$name" root netem $args 2>/dev/null; then
+		err "Could not start netem (is kmod-netem installed?)."
+		$IP link del "$name" 2>/dev/null
+		return 1
+	fi
+	return 0
+}
+
+do_stop() {
+	local kind dev dir pref
+	if [ -f "$STATE" ]; then
+		while read -r kind dev dir pref; do
+			[ "$kind" = filter ] && $TC filter del dev "$dev" "$dir" pref "$pref" 2>/dev/null
+		done < "$STATE"
+		while read -r kind dev dir pref; do
+			[ "$kind" = clsact ] && $TC qdisc del dev "$dev" clsact 2>/dev/null
+		done < "$STATE"
+		rm -f "$STATE"
+	fi
+	for dev in /sys/class/net/"$IFB_PREFIX"[0-9]*; do
+		[ -e "$dev" ] && $IP link del "${dev##*/}" 2>/dev/null
+	done
+}
+
+do_apply() {
+	local line idx en ips d j l dir tr share_up share_dn addr dev got targets t
+	do_stop
+	: > "$ERRORS"
+	: > "$STATE"
+	global_enabled || { log "off"; return 0; }
+	command -v "$TC" >/dev/null 2>&1 || { err "tc is not installed."; return 1; }
+	read_rules > /tmp/ping_adjuster.rules
+	while IFS='|' read -r idx en ips d j l dir tr; do
+		[ "$en" = 0 ] && continue
+		d=$(num "$d"); j=$(num "$j"); l=$(num "$l")
+		[ "$d" = 0 ] && [ "$j" = 0 ] && [ "$l" = 0 ] && continue
+		[ -n "$(echo $ips)" ] || { err "Rule $idx has no device."; continue; }
+		case "$dir" in upload) share_up=1; share_dn=0 ;; download) share_up=0; share_dn=1 ;; *) share_up=0.5; share_dn=0.5 ;; esac
+		[ "$tr" = all ] || tr=game
+		# the rule's devices first: which LAN interface each one is on (nothing is set up for a rule without any)
+		targets=""
+		for addr in $ips; do
+			case "$addr" in *[!0-9./]*|'') err "Rule $idx: $addr is not an IPv4 address."; continue ;; esac
+			dev=$(dev_for "$addr")
+			[ -n "$dev" ] || { err "Rule $idx: $addr is not on a LAN of this router."; continue; }
+			ensure_clsact "$dev" || continue
+			targets="$targets $dev=$addr"
+		done
+		[ -n "$targets" ] || continue
+		got=""
+		if [ "$share_up" != 0 ]; then make_ifb "${IFB_PREFIX}${idx}u" "$(netem_args "$d" "$j" "$l" "$share_up")" && got="$got u"; fi
+		if [ "$share_dn" != 0 ]; then make_ifb "${IFB_PREFIX}${idx}d" "$(netem_args "$d" "$j" "$l" "$share_dn")" && got="$got d"; fi
+		for t in $targets; do
+			dev=${t%%=*}; addr=${t#*=}
+			case "$got" in *u*) add_filter "$dev" ingress "$addr" "$tr" "${IFB_PREFIX}${idx}u" ;; esac
+			case "$got" in *d*) add_filter "$dev" egress "$addr" "$tr" "${IFB_PREFIX}${idx}d" ;; esac
+		done
+	done < /tmp/ping_adjuster.rules
+	rm -f /tmp/ping_adjuster.rules
+	log "applied"
+}
+
+# ---- status (JSON) ----
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+
+ifb_stats() {
+	# "sent <bytes> bytes <pkts> pkt (dropped <n>, ..." -> {"packets":n,"dropped":n}
+	$TC -s qdisc show dev "$1" 2>/dev/null | awk '/Sent/ { p = $4; d = $7; gsub(/,/, "", d); printf "{\"packets\":%d,\"dropped\":%d}", p, d; found = 1; exit } END { if (!found) printf "null" }'
+}
+
+module_ok() {
+	[ -d "/sys/module/$1" ] && return 0
+	ls /lib/modules/*/"$1".ko >/dev/null 2>&1
+}
+
+do_status() {
+	local first=1 idx en ips d j l dir tr up dn n devs
+	printf '{'
+	printf '"enabled":%s,' "$(global_enabled && echo true || echo false)"
+	printf '"tc":%s,' "$(command -v "$TC" >/dev/null 2>&1 && echo true || echo false)"
+	printf '"netem":%s,' "$(module_ok sch_netem && echo true || echo false)"
+	printf '"ifb":%s,' "$( (module_ok ifb || [ -d /sys/class/net/ifb0 ]) && echo true || echo false)"
+	printf '"offload":%s,' "$(json_str "$( [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = 1 ] && echo hardware || { [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = 1 ] && echo software || echo off; })")"
+	printf '"errors":['
+	n=0
+	[ -f "$ERRORS" ] && while IFS= read -r line; do [ $n -gt 0 ] && printf ','; json_str "$line"; n=$((n + 1)); done < "$ERRORS"
+	printf '],"rules":['
+	read_rules | while IFS='|' read -r idx en ips d j l dir tr; do
+		[ $first = 1 ] || printf ','
+		first=0
+		up=$(ifb_stats "${IFB_PREFIX}${idx}u"); dn=$(ifb_stats "${IFB_PREFIX}${idx}d")
+		devs=""
+		for addr in $ips; do devs="$devs $(dev_for "$addr")"; done
+		printf '{"index":%d,"active":%s,"upload":%s,"download":%s,"interfaces":%s}' "$idx" \
+			"$( [ "$up" != null ] || [ "$dn" != null ] && echo true || echo false)" "$up" "$dn" "$(json_str "$(echo $devs)")"
+	done
+	printf ']}\n'
+}
+
+# First use (installed by Geomate's updater, which copies files only): make the settings file, and start the service
+# with the router. Package and installer installs have done both already.
+ensure_config() {
+	[ -f "/etc/config/$CONFIG" ] && return 0
+	printf "\nconfig global 'global'\n\toption enabled '1'\n" > "/etc/config/$CONFIG" || return 1
+	[ -x /etc/init.d/ping_adjuster ] && /etc/init.d/ping_adjuster enable >/dev/null 2>&1
+	:
+}
+ensure_config
+
+case "$1" in
+	apply|start|reload) do_apply ;;
+	stop) do_stop; : > "$ERRORS" ;;
+	status) do_status ;;
+	*) echo "usage: $0 apply|stop|status" >&2; exit 1 ;;
+esac

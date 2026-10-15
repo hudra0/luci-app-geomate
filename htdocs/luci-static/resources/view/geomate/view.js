@@ -52,6 +52,29 @@ var GEO_PRESETS = [
         platforms: 'PlayStation, Xbox, Switch and PC',
         detailText: 'UDP to any game port (1024 and up) from one device',
         note: 'Pick your console or PC as the source. Keep Strict Mode on for the best performance.'
+    },
+    {
+        // Games on phones and tablets. Many phone games talk to their servers over port 443 (the HTTPS port, over TCP) and
+        // high TCP ports, not over game-style UDP ports, so this preset filters TCP to 443 and to ports 1024 and up from
+        // one device. That also covers the phone's websites and apps, hence the warning. It leaves out the ports of
+        // things a phone must keep reaching wherever their servers are: STUN/TURN for FaceTime and WhatsApp (3478-3497),
+        // Wi-Fi calling (4500), Apple and Google push notifications (5223, 5228), Zoom (8801-8810), FaceTime media
+        // (16384-16402) and Google Meet (19302-19309). It also keeps the phone's traffic for these ports on IPv4
+        // (ipv4Only): Geomate's rules only see IPv4, and a phone on a network with IPv6 would otherwise send it past the filter.
+        id: 'mobile',
+        label: 'Mobile Filtering',
+        protocol: 'tcp',
+        src_port: '',
+        dest_port: '443 1024-3477 3498-4499 4501-5222 5224-5227 5229-8800 8811-16383 16403-19301 19310-65535',
+        ip_list: '/etc/geomate.d/mobile_servers.txt',
+        needsSrcIp: true,
+        ipv4Only: true,
+        allPlatforms: false,
+        platforms: 'phones and tablets (iPhone, iPad, Android)',
+        detailText: 'TCP to port 443 and to ports 1024 and up from your phone, calls and notifications left out, kept on IPv4',
+        note: 'Pick your phone as the source. Give it a fixed address: turn off "Rotating" private Wi-Fi address for your home network (or add a static DHCP lease). ' +
+              'For proper filtering, set "Open for server tests" to 0 on the Geo Filters page: a phone talks to many servers at once, which would otherwise keep the filter open.',
+        warning: 'Warning: this filters ALL of the phone\'s internet traffic on these ports, not only games. Websites and apps whose servers are outside your regions are blocked too. Turn the filter off when you are not playing.'
     }
 ];
 
@@ -249,6 +272,25 @@ function setAutoFsMode(mode) {
     try { if (mode === 'always' || mode === 'never') localStorage.setItem(FS_PREF_KEY, mode); else localStorage.removeItem(FS_PREF_KEY); } catch (e) {}
 }
 
+// LuCI keeps the menu in the browser from the moment you logged in, so a tab added by an update (Ping Adjuster)
+// would only appear after logging in again. When the saved menu doesn't have it yet, it is fetched again (once).
+function geomateRefreshMenu() {
+    try {
+        if (!ui.menu || typeof ui.menu.load !== 'function' || typeof ui.menu.flushCache !== 'function') return;
+        ui.menu.load().then(function(tree) {
+            var node = tree;
+            ['admin', 'services', 'geomate'].forEach(function(k) { node = node && node.children && node.children[k]; });
+            if (!node || !node.children || node.children.ping_adjuster) return;
+            try {
+                if (sessionStorage.getItem('geomate-menu-refreshed')) return;
+                sessionStorage.setItem('geomate-menu-refreshed', '1');
+            } catch (e) { return; }
+            ui.menu.flushCache();
+            location.reload();
+        }).catch(function() {});
+    } catch (e) {}
+}
+
 return view.extend({
     geoFilters: {},
     map: null,
@@ -273,6 +315,7 @@ return view.extend({
     // Render the form and map interface
     render: function(data) {
         var self = this;
+        geomateRefreshMenu();
         var m, s, o;
         var geomateConfig = data[0];
 
@@ -969,7 +1012,7 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                 self.sendMessageToMap('setPresets', { data: GEO_PRESETS.map(function(p) {
                     return { id: p.id, label: p.label, allPlatforms: !!p.allPlatforms, platformText: geoPresetText(p),
                              detail: p.detailText || (p.protocol.toUpperCase() + (p.src_port ? ' · source port ' + p.src_port : '') + (p.dest_port ? ' · destination port ' + p.dest_port : '') + (p.ip_list ? ' · IP list ' + p.ip_list : '')),
-                             note: p.note || '' };
+                             note: p.note || '', warning: p.warning || '' };
                 }) });
                 if (!self._autoFsHandled) { self._autoFsHandled = true; self.autoFullscreenOnEntry(); }   // (normally already done when the page appeared)
                 self.loadGeoFilters()
@@ -1125,6 +1168,7 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                                     E('strong', {}, preset.label),
                                     E('div', { 'style': 'margin-top:4px;' }, (preset.allPlatforms ? '\u2714 ' : '') + geoPresetText(preset)),
                                     preset.note ? E('div', { 'style': 'opacity:.75;font-size:90%;margin-top:2px;' }, preset.note) : '',
+                                    preset.warning ? E('div', { 'style': 'color:#e5484d;font-weight:bold;font-size:90%;margin-top:4px;' }, '\u26a0 ' + preset.warning) : '',
                                     preset.ip_list ? E('div', { 'style': 'opacity:.75;font-size:90%;margin-top:2px;' }, _('IP list: ') + preset.ip_list) : ''
                                 ])
                             ]) : '',
@@ -1314,7 +1358,8 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                                 src_port: document.querySelector('input[name="src_port"]').value,
                                 dest_port: document.querySelector('input[name="dest_port"]').value,
                                 allowed_ip: dynlist.getValue(),
-                                ip_list: document.getElementById('geomate-ip-list').value
+                                ip_list: document.getElementById('geomate-ip-list').value,
+                                ipv4_only: (preset && preset.ipv4Only) ? '1' : ''
                             };
     
                             ui.hideModal();
@@ -1449,6 +1494,9 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                         }
                         if (settings.ip_list) {
                             uci.set('geomate', sectionName, 'ip_list', settings.ip_list);
+                        }
+                        if (settings.ipv4_only) {
+                            uci.set('geomate', sectionName, 'ipv4_only', settings.ipv4_only);
                         }
                     }
                 }

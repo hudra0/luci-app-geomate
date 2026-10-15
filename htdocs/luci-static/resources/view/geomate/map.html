@@ -397,6 +397,7 @@
         .name-dialog .nd-info { margin-top:10px; padding:8px 10px; border-radius:6px; background:rgba(59,130,246,.12); border:1px solid rgba(59,130,246,.35); color:#bcd6ff; }
         .name-dialog .nd-info.warn { background:rgba(234,179,8,.12); border-color:rgba(234,179,8,.4); color:#f3dd8a; }
         .name-dialog .nd-info small { display:block; margin-top:3px; color:#9eafb9; }
+        .name-dialog .nd-info .nd-warning { margin-top:6px; color:#ff6b6b; font-weight:600; }
         .name-dialog .nd-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
         .name-dialog button { border:0; border-radius:6px; padding:7px 14px; font-weight:700; cursor:pointer; }
         .name-dialog .nd-ok { background:#3b82f6; color:#fff; }
@@ -2315,6 +2316,7 @@
                         info.textContent = '';
                         var line = document.createElement('div'); line.textContent = (p.allPlatforms ? '✔ ' : '') + p.platformText; info.appendChild(line);
                         var sm = document.createElement('small'); sm.textContent = p.detail + (p.note ? ' — ' + p.note : ''); info.appendChild(sm);
+                        if (p.warning) { var wn = document.createElement('div'); wn.className = 'nd-warning'; wn.textContent = '⚠ ' + p.warning; info.appendChild(wn); }
                         info.style.display = '';
                     } else {
                         if (nameIn.value === autoName) nameIn.value = '';

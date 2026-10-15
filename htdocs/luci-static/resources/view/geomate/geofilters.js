@@ -41,6 +41,25 @@ function formatTime(seconds) {
     return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'min';
 }
 
+// LuCI keeps the menu in the browser from the moment you logged in, so a tab added by an update (Ping Adjuster)
+// would only appear after logging in again. When the saved menu doesn't have it yet, it is fetched again (once).
+function geomateRefreshMenu() {
+    try {
+        if (!ui.menu || typeof ui.menu.load !== 'function' || typeof ui.menu.flushCache !== 'function') return;
+        ui.menu.load().then(function(tree) {
+            var node = tree;
+            ['admin', 'services', 'geomate'].forEach(function(k) { node = node && node.children && node.children[k]; });
+            if (!node || !node.children || node.children.ping_adjuster) return;
+            try {
+                if (sessionStorage.getItem('geomate-menu-refreshed')) return;
+                sessionStorage.setItem('geomate-menu-refreshed', '1');
+            } catch (e) { return; }
+            ui.menu.flushCache();
+            location.reload();
+        }).catch(function() {});
+    } catch (e) {}
+}
+
 return view.extend({
     load: function() {
         return Promise.all([
@@ -56,6 +75,7 @@ return view.extend({
     },
 
     render: function() {
+        geomateRefreshMenu();
         var m, s, o;
 
         // Create main configuration map for Geomate (no header - redundant with page title)
@@ -416,6 +436,15 @@ return view.extend({
             if (!v) return E('em', {}, _('none'));
             return E('span', { 'title': v }, v.replace(/^.*\//, ''));
         };
+
+        // Keep games on IPv4 (router helper luci.geomate): for phones and tablets, whose game traffic would otherwise go over IPv6
+        o = s.option(form.Flag, 'ipv4_only', _('Keep games on IPv4'),
+            _('For phones and tablets. Geomate only filters IPv4, but a phone on a network with IPv6 sends much of its game traffic over IPv6, past the filter. ' +
+              'With this on, the router refuses the device\u2019s IPv6 traffic to the ports and protocol this filter covers (ports 1024 and up when it names none), ' +
+              'so that traffic uses IPv4 and is filtered. Everything else keeps using IPv6. The device is recognised by its MAC address.'));
+        o.default = '0';
+        o.rmempty = true;
+        o.modalonly = true;
 
         // IP expiry days - removes inactive IPs after specified days
         o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
