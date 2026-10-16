@@ -1,0 +1,27 @@
+#!/bin/sh /etc/rc.common
+# Ping Adjuster (Geomate): sets up the delays from /etc/config/ping_adjuster with netem.
+# The settings page saves the config; procd then reloads this service, which applies them.
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PA=/usr/libexec/ping-adjuster
+
+start_service() {
+	"$PA" apply
+}
+
+stop_service() {
+	"$PA" stop
+}
+
+reload_service() {
+	"$PA" apply
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ping_adjuster"
+	# a LAN interface that comes up again (or is rebuilt) has lost the filters: set them up again
+	procd_add_raw_trigger "interface.*.up" 3000 /etc/init.d/ping_adjuster reload
+}

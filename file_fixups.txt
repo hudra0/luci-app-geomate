@@ -2,3 +2,5 @@
 # Format: old_file_path=new_file_path
 # This file is used during updates to handle file path changes
 # Example: /www/luci-static/resources/view/geomate/old_file.js=/www/luci-static/resources/view/geomate/new_file.js
+/root/usr/libexec/ping-adjuster=/usr/libexec/ping-adjuster
+/root/etc/init.d/ping_adjuster=/etc/init.d/ping_adjuster

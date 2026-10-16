@@ -6,6 +6,25 @@ local nixio = require "nixio"
 
 local cache_file = "/tmp/geomate_ip_cache.json"
 local cache = {}
+local geo_index = nil   -- ip -> {lat, lon} from all location files (built once per request when needed)
+
+-- A fingerprint of the location data files (name, size, time). The cache below is only valid for the files it was
+-- built from: before, it was kept until the router rebooted, so the page could go on showing an old location (or no
+-- location at all) after Geomate had looked the address up again.
+local function geodata_signature()
+    local parts = {}
+    local iter = nixio.fs.dir("/etc/geomate.d")
+    if iter then
+        for file in iter do
+            if file:match("_geo_data%.json$") then
+                local st = nixio.fs.stat("/etc/geomate.d/" .. file)
+                if st then parts[#parts + 1] = file .. ":" .. tostring(st.size) .. ":" .. tostring(st.mtime) end
+            end
+        end
+    end
+    table.sort(parts)
+    return table.concat(parts, "|")
+end
 
 -- Load the cache from file
 local function load_cache()
@@ -14,6 +33,11 @@ local function load_cache()
         local content = f:read("*a")
         cache = jsonc.parse(content) or {}
         f:close()
+    end
+    if type(cache) ~= "table" then cache = {} end
+    local sig = geodata_signature()
+    if cache.__sig ~= sig then
+        cache = { __sig = sig }
     end
 end
 
@@ -28,28 +52,37 @@ end
 
 -- Geolocate an IP address
 local function geolocate_ip(ip)
-    if cache[ip] then
+    if ip ~= "__sig" and type(cache[ip]) == "table" then
         return cache[ip]
     end
 
-    -- Use existing geodata from /etc/geomate.d
-    local geodata_dir = "/etc/geomate.d"
-    for file in nixio.fs.dir(geodata_dir) do
-        if file:match("_geo_data%.json$") then
-            local filepath = geodata_dir .. "/" .. file
-            local f = io.open(filepath, "r")
-            if f then
-                for line in f:lines() do
-                    local data = jsonc.parse(line)
-                    if data and data.query == ip and data.lat and data.lon then
-                        cache[ip] = { lat = data.lat, lon = data.lon }
+    -- Use existing geodata from /etc/geomate.d. All files are read once per request into an index (before, every
+    -- address not in the cache meant reading and parsing every line of every file again, which made the page slow)
+    if not geo_index then
+        geo_index = {}
+        local iter = nixio.fs.dir("/etc/geomate.d")
+        if iter then
+            for file in iter do
+                if file:match("_geo_data%.json$") then
+                    local f = io.open("/etc/geomate.d/" .. file, "r")
+                    if f then
+                        for line in f:lines() do
+                            local q = line:match('"query":"([^"]+)"')
+                            if q and not geo_index[q] then
+                                local la = tonumber(line:match('"lat":(%-?[%d.eE+-]+)') or "")
+                                local lo = tonumber(line:match('"lon":(%-?[%d.eE+-]+)') or "")
+                                if la and lo then geo_index[q] = { lat = la, lon = lo } end
+                            end
+                        end
                         f:close()
-                        return cache[ip]
                     end
                 end
-                f:close()
             end
         end
+    end
+    if geo_index[ip] then
+        cache[ip] = geo_index[ip]
+        return cache[ip]
     end
 
     -- Fallback if geodata was not found
@@ -166,6 +199,8 @@ local function get_ui_dynamic_ips()
     -- First pass: Get blocked IPs for each filter
     local filter_blocked_ips = {}
     local filter_allowed_ips = {}
+    local filter_net_allowed = {}
+    local filter_burst = {}
 
     uci:foreach('geomate', 'geo_filter', function(s)
         local name = s.name
@@ -193,6 +228,21 @@ local function get_ui_dynamic_ips()
             for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
                 filter_allowed_ips[name][ip] = true
             end
+
+            -- open for a burst of server tests (see "Open for server tests")
+            handle = io.popen("nft list set inet geomate '" .. set_name .. "_burst' 2>/dev/null")
+            result = handle and handle:read("*a") or ""
+            if handle then handle:close() end
+            filter_burst[name] = result:find("0.0.0.0/0", 1, true) ~= nil
+
+            -- networks the fast helper lets through on the first packet (see "Allowed on the first packet")
+            filter_net_allowed[name] = {}
+            handle = io.popen("nft list set inet geomate '" .. set_name .. "_net_allowed' 2>/dev/null")
+            result = handle and handle:read("*a") or ""
+            if handle then handle:close() end
+            for net in result:gmatch('(%d+%.%d+%.%d+)%.0/24') do
+                filter_net_allowed[name][net] = true
+            end
         end
     end)
 
@@ -209,13 +259,19 @@ local function get_ui_dynamic_ips()
 
             for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
                 if not processed_ips[ip] then
-                    -- Check if this IP is in the blocked or allowed set for this filter
-                    if filter_blocked_ips[name][ip] or filter_allowed_ips[name][ip] then
-                        processed_ips[ip] = true
-                        -- Each dynamic IP gets inserted; in get_all_connections() 
-                        -- we'll finalize whether it's actually blocked or allowed
-                        table.insert(dynamic_ips, { ip = ip, filter = s })
-                    end
+                    -- Every address the filter has seen is reported. Before, only addresses already sorted into the
+                    -- filter's allowed or blocked set were, so a server blocked by Strict Mode before it had been
+                    -- located (in neither set yet) never showed up anywhere, not even in the IP history.
+                    processed_ips[ip] = true
+                    local net = ip:match('^(%d+%.%d+%.%d+)%.')
+                    table.insert(dynamic_ips, {
+                        ip = ip,
+                        filter = s,
+                        in_allowed = filter_allowed_ips[name][ip] or false,
+                        in_blocked = filter_blocked_ips[name][ip] or false,
+                        in_net = (filter_net_allowed[name] and net and filter_net_allowed[name][net]) or false,
+                        in_burst = filter_burst[name] or false
+                    })
                 end
             end
         end
@@ -238,6 +294,877 @@ local function is_ip_allowed(ip, filter, allowed_ips_set)
     return allowed, false  -- allowed, is_allowed_ip = false
 end
 
+-- ===== Fast locating =====================================================================================
+-- Geomate adds the servers a filter sees to its list only every 30 minutes and looks up where they are after that;
+-- until then a new server is "not located yet" (with Strict Mode it is dropped). Games such as Apex Legends test
+-- many servers at once, each only for a moment, so most of them were never sorted in time.
+-- While the Geomate page is open (it calls getGeomateConnections every second), a small background helper runs:
+-- every second it reads the addresses each filter has seen (its 1-hour "_dynamic" set and the 10-second UI set),
+-- looks up the new ones with ip-api.com (the same lookup Geomate uses, at most one request every 4 s), saves the
+-- result in the filter's location data and puts the address straight into the filter's allowed or blocked set.
+-- No restart is needed. The helper stops by itself 15 s after the page was closed.
+local FL_BASE = "/tmp/geomate_fastlocate"
+local FL_LOCK = FL_BASE .. ".lock"          -- directory: created atomically, holds the helper's pid
+local FL_ALIVE = FL_BASE .. ".alive"        -- time of the page's last call
+local FL_TRIED = FL_BASE .. ".tried.json"   -- ip -> time it was looked up
+
+local function fl_read(p)
+    local f = io.open(p, "r")
+    if not f then return nil end
+    local d = f:read("*a")
+    f:close()
+    return d
+end
+
+local function fl_write(p, d)
+    local f = io.open(p, "w")
+    if not f then return false end
+    f:write(d)
+    f:close()
+    return true
+end
+
+local function fl_pid_alive(pid)
+    if not pid then return false end
+    local cmd = fl_read("/proc/" .. pid .. "/cmdline") or ""
+    return cmd:find("fastlocate", 1, true) ~= nil
+end
+
+local function fl_running()
+    return fl_pid_alive(tonumber(fl_read(FL_LOCK .. "/pid") or ""))
+end
+
+local function fl_take_lock()
+    local me = tostring(nixio.getpid())
+    if nixio.fs.mkdir(FL_LOCK) then fl_write(FL_LOCK .. "/pid", me) return true end
+    if fl_running() then return false end
+    nixio.fs.remove(FL_LOCK .. "/pid")
+    nixio.fs.rmdir(FL_LOCK)
+    if nixio.fs.mkdir(FL_LOCK) then fl_write(FL_LOCK .. "/pid", me) return true end
+    return false
+end
+
+local function fl_release_lock()
+    nixio.fs.remove(FL_LOCK .. "/pid")
+    nixio.fs.rmdir(FL_LOCK)
+end
+
+-- Called by getGeomateConnections: keeps the helper alive, starts it when it is not running
+local function fl_kick()
+    fl_write(FL_ALIVE, tostring(os.time()))
+    if not fl_running() then
+        local self_path = (arg and arg[0]) or "/usr/libexec/rpcd/luci.geomate"
+        if self_path:match("^[%w/._%-]+$") then
+            os.execute("'" .. self_path .. "' fastlocate </dev/null >/dev/null 2>&1 &")
+        end
+    end
+end
+
+-- Addresses that are looked up right now (for the "Locating now" note)
+local function fl_tried()
+    local t = jsonc.parse(fl_read(FL_TRIED) or "")
+    return type(t) == "table" and t or {}
+end
+
+local function fl_public(ip)
+    local a, b = ip:match("^(%d+)%.(%d+)%.%d+%.%d+$")
+    a, b = tonumber(a), tonumber(b)
+    if not a then return false end
+    if a == 10 or a == 127 or a == 0 or a >= 224 then return false end
+    if a == 192 and b == 168 then return false end
+    if a == 172 and b >= 16 and b <= 31 then return false end
+    if a == 169 and b == 254 then return false end
+    if a == 100 and b >= 64 and b <= 127 then return false end
+    return true
+end
+
+-- The addresses in an nft set
+local function fl_set_ips(set)
+    local out = {}
+    local h = io.popen("nft list set inet geomate '" .. set .. "' 2>/dev/null")
+    if not h then return out end
+    local r = h:read("*a") or ""
+    h:close()
+    local body = r:match("elements%s*=%s*{(.-)}")
+    if body then
+        for ip in body:gmatch("(%d+%.%d+%.%d+%.%d+)") do out[ip] = true end
+    end
+    return out
+end
+
+-- Several sets in ONE nft call (each nft call starts two programs and may load all of Geomate's sets): name -> {ip -> true}
+local function fl_sets_ips(sets)
+    local out = {}
+    if #sets == 0 then return out end
+    local cmds = {}
+    for _, set in ipairs(sets) do
+        out[set] = {}
+        cmds[#cmds + 1] = "list set inet geomate " .. set
+    end
+    local h = io.popen("nft '" .. table.concat(cmds, "; ") .. "' 2>/dev/null")
+    if not h then return out end
+    local r = h:read("*a") or ""
+    h:close()
+    if r == "" and #sets > 1 then
+        -- one of them is missing (e.g. Geomate is restarting): ask one by one
+        for _, set in ipairs(sets) do out[set] = fl_set_ips(set) end
+        return out
+    end
+    for name, body in r:gmatch("set ([%w_.%-]+) {(.-)\n\t}") do
+        if out[name] then
+            local el = body:match("elements%s*=%s*{(.-)}")
+            if el then for ip in el:gmatch("(%d+%.%d+%.%d+%.%d+)") do out[name][ip] = true end end
+        end
+    end
+    return out
+end
+
+-- The names of all of Geomate's sets, without their contents (one cheap call)
+local function fl_set_names()
+    local names = {}
+    local h = io.popen("nft -t list sets inet geomate 2>/dev/null")
+    if not h then return names end
+    for name in (h:read("*a") or ""):gmatch("set ([%w_.%-]+) {") do names[name] = true end
+    h:close()
+    return names
+end
+
+local function fl_in_set(set, ip)
+    local rc = os.execute("nft get element inet geomate '" .. set .. "' '{ " .. ip .. " }' >/dev/null 2>&1")
+    return rc == 0 or rc == true
+end
+
+-- Point in polygon (lat/lng pairs), as Geomate's polygon support does it
+local function fl_in_polygon(lat, lon, spec)
+    local pts = {}
+    for a, b in spec:gmatch("(%-?[%d.]+),(%-?[%d.]+)") do pts[#pts + 1] = { tonumber(a), tonumber(b) } end
+    local n = #pts
+    if n < 3 then return false end
+    local inside = false
+    local j = n
+    for i = 1, n do
+        local yi, xi = pts[i][1], pts[i][2]
+        local yj, xj = pts[j][1], pts[j][2]
+        if ((yi > lat) ~= (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) then
+            inside = not inside
+        end
+        j = i
+    end
+    return inside
+end
+
+-- Same decision as Geomate makes from the location data (polygons only when this router's Geomate supports them)
+local function fl_allowed(lat, lon, regions, polygons_ok)
+    if is_within_any_allowed_region(lat, lon, regions) then return true end
+    if polygons_ok then
+        for _, r in ipairs(regions) do
+            local spec = r:match("^polygon:(.+)$")
+            if spec and fl_in_polygon(lat, lon, spec) then return true end
+        end
+    end
+    return false
+end
+
+-- Known locations, from every filter's location data. An address that another filter already knows is decided at once;
+-- an address in the same /24 network as a known one (game servers come in blocks from one data centre) is decided at
+-- once from that neighbour and checked with ip-api.com right after, which moves it if the guess was wrong.
+local fl_geo_files = { list = {}, at = -1 }   -- the location data files (refreshed every 5 s)
+local fl_geo_index = {}                         -- path -> { sig, ips = { ip -> {lat, lon} }, nets = { a.b.c -> {lat, lon} } }
+
+local function fl_file_sig(path)
+    local st = nixio.fs.stat(path)
+    return st and (tostring(st.size) .. ":" .. tostring(st.mtime)) or "none"
+end
+
+local function fl_index(path)
+    local sig = fl_file_sig(path)
+    local idx = fl_geo_index[path]
+    if idx and idx.sig == sig then return idx end
+    idx = { sig = sig, ips = {}, nets = {} }
+    local f = io.open(path, "r")
+    if f then
+        for line in f:lines() do
+            local q = line:match('"query":"([^"]+)"')
+            local la = tonumber(line:match('"lat":(%-?[%d.eE+-]+)') or "")
+            local lo = tonumber(line:match('"lon":(%-?[%d.eE+-]+)') or "")
+            if q and la and lo then
+                idx.ips[q] = { la, lo }
+                local net = q:match("^(%d+%.%d+%.%d+)%.")
+                if net and not idx.nets[net] then idx.nets[net] = { la, lo } end
+            end
+        end
+        f:close()
+    end
+    fl_geo_index[path] = idx
+    return idx
+end
+
+local function fl_files(now)
+    if now - fl_geo_files.at >= 5 then
+        local list = {}
+        local iter = nixio.fs.dir("/etc/geomate.d")
+        if iter then
+            for file in iter do
+                if file:match("_geo_data%.json$") then list[#list + 1] = "/etc/geomate.d/" .. file end
+            end
+        end
+        fl_geo_files = { list = list, at = now }
+    end
+    return fl_geo_files.list
+end
+
+-- Where an address is: exact from its own filter, exact from another filter, or guessed from its /24 network
+local function fl_geo_find(name, ip, now)
+    local own = "/etc/geomate.d/" .. name .. "_geo_data.json"
+    local g = fl_index(own).ips[ip]
+    if g then return g, "own" end
+    local files = fl_files(now)
+    for _, p in ipairs(files) do
+        if p ~= own then
+            g = fl_index(p).ips[ip]
+            if g then return g, "other" end
+        end
+    end
+    local net = ip:match("^(%d+%.%d+%.%d+)%.")
+    g = fl_index(own).nets[net]
+    if g then return g, "net" end
+    for _, p in ipairs(files) do
+        if p ~= own then
+            g = fl_index(p).nets[net]
+            if g then return g, "net" end
+        end
+    end
+    return nil
+end
+
+-- Adds a location line to the filter's location data (what Geomate builds its sets from when it starts)
+local function fl_append_geo(name, line, ip, lat, lon)
+    local path = "/etc/geomate.d/" .. name .. "_geo_data.json"
+    local idx = fl_index(path)
+    if idx.ips[ip] then return end
+    local f = io.open(path, "a")
+    if f then f:write(line, "\n") f:close() end
+    idx.ips[ip] = { lat, lon }
+    local net = ip:match("^(%d+%.%d+%.%d+)%.")
+    if net and not idx.nets[net] then idx.nets[net] = { lat, lon } end
+    idx.sig = fl_file_sig(path)
+end
+
+-- Puts the address into the allowed or the blocked set (and takes it out of the other one). Returns the set used.
+local function fl_sort(base, ip, lat, lon, regions, polygons_ok, previous)
+    local target = fl_allowed(lat, lon, regions, polygons_ok) and "_allowed" or "_blocked"
+    if previous and previous ~= target then
+        os.execute("nft delete element inet geomate '" .. base .. previous .. "' '{ " .. ip .. " }' >/dev/null 2>&1")
+    end
+    if previous ~= target then
+        os.execute("nft add element inet geomate '" .. base .. target .. "' '{ " .. ip .. " }' >/dev/null 2>&1")
+    end
+    return target
+end
+
+-- ----- Allowed on the first packet -----
+-- With Strict Mode, a server is dropped until it is sorted, so even a lookup of half a second shows as "blocked"
+-- while a game logs in. Game servers come in blocks (a /24 network of 256 addresses) from one data centre, so the
+-- helper keeps, per filter, a set of the networks whose known servers are ALL inside your regions
+-- (<filter>_net_allowed) and adds a rule for it ahead of Strict Mode. The firewall then lets a server from such a
+-- network through on its very first packet, while the helper looks it up; if it turns out to be outside, it goes into
+-- the filter's blocked set, which is checked first. The rules sit in front of Geomate's own and are put back after
+-- every restart of Geomate (which rebuilds its rules).
+local function fl_base_rule(s)
+    local function str(v) if type(v) == "table" then return table.concat(v, " ") end return v end
+    local src_ip, protocol, src_port, dest_port = str(s.src_ip), str(s.protocol), str(s.src_port), str(s.dest_port)
+    local rule = ""
+    if src_ip and src_ip ~= "" then rule = "ip saddr " .. src_ip end
+    if protocol and protocol ~= "" then rule = rule .. " " .. protocol end
+    local has_sport = false
+    if src_port and src_port ~= "" and src_port ~= "any" then
+        has_sport = true
+        if src_port:find(" ") then rule = rule .. " sport { " .. src_port:gsub(" +", ",") .. " }"
+        else rule = rule .. " sport " .. src_port end
+    end
+    if dest_port and dest_port ~= "" and dest_port ~= "any" then
+        if has_sport and protocol and protocol ~= "" then rule = rule .. " " .. protocol end
+        if dest_port:find(" ") then rule = rule .. " dport { " .. dest_port:gsub(" +", ",") .. " }"
+        else rule = rule .. " dport " .. dest_port end
+    end
+    -- nothing that could end the statement or start a new one
+    if rule:find("[;\n#]") then return nil end
+    return rule
+end
+
+local function fl_nft_file(lines)
+    if #lines == 0 then return true end
+    local path = FL_BASE .. ".nft"
+    if not fl_write(path, table.concat(lines, "\n") .. "\n") then return false end
+    local rc = os.execute("nft -f '" .. path .. "' >/dev/null 2>&1")
+    return rc == 0 or rc == true
+end
+
+local function fl_set_exists(set)
+    local rc = os.execute("nft -t list set inet geomate '" .. set .. "' >/dev/null 2>&1")
+    return rc == 0 or rc == true
+end
+
+-- For one filter: which /24 networks have known servers, and are they all inside the regions?
+local function fl_net_states(flt, polygons_ok, now)
+    local state = {}   -- a.b.c -> true (all inside) / false (some outside)
+    for _, p in ipairs(fl_files(now)) do
+        for ip, g in pairs(fl_index(p).ips) do
+            local net = ip:match("^(%d+%.%d+%.%d+)%.")
+            if net and state[net] ~= false then
+                state[net] = fl_allowed(g[1], g[2], flt.regions, polygons_ok)
+            end
+        end
+    end
+    return state
+end
+
+-- Creates the set and the rules (again, after Geomate restarted) and fills the set
+local function fl_net_setup(flt, polygons_ok, monitor, now)
+    local set = flt.base .. "_net_allowed"
+    local rule = fl_base_rule(flt.cfg)
+    if not rule then return false end
+    local lines = {}
+    if not fl_set_exists(set) then
+        lines[#lines + 1] = "add set inet geomate " .. set .. " { type ipv4_addr; flags interval; }"
+        -- inserted one by one at the top, so they end up in this order:
+        --   exact allowed (allow list) -> exact blocked -> allowed networks -> Geomate's own rules (Strict Mode last)
+        lines[#lines + 1] = "insert rule inet geomate forward " .. rule .. " ip daddr @" .. set .. " counter accept"
+        if not monitor then
+            lines[#lines + 1] = "insert rule inet geomate forward " .. rule .. " ip daddr @" .. flt.base .. "_blocked counter drop"
+        end
+        lines[#lines + 1] = "insert rule inet geomate forward " .. rule .. " ip daddr @" .. flt.base .. "_allowed counter accept"
+    else
+        lines[#lines + 1] = "flush set inet geomate " .. set
+    end
+    flt.nets = {}
+    local batch = {}
+    local function flush_batch()
+        if #batch > 0 then
+            lines[#lines + 1] = "add element inet geomate " .. set .. " { " .. table.concat(batch, ", ") .. " }"
+            batch = {}
+        end
+    end
+    for net, ok in pairs(fl_net_states(flt, polygons_ok, now)) do
+        if ok then
+            flt.nets[net] = true
+            batch[#batch + 1] = net .. ".0/24"
+            if #batch >= 500 then flush_batch() end
+        else
+            flt.nets[net] = false
+        end
+    end
+    flush_batch()
+    return fl_nft_file(lines)
+end
+
+-- After a lookup: keep the network's entry right
+local function fl_net_update(flt, ip, inside)
+    if not flt.nets then return end
+    local net = ip:match("^(%d+%.%d+%.%d+)%.")
+    if not net then return end
+    local set = flt.base .. "_net_allowed"
+    if inside then
+        if flt.nets[net] == nil then
+            flt.nets[net] = true
+            os.execute("nft add element inet geomate '" .. set .. "' '{ " .. net .. ".0/24 }' >/dev/null 2>&1")
+        end
+    elseif flt.nets[net] ~= false then
+        if flt.nets[net] == true then
+            os.execute("nft delete element inet geomate '" .. set .. "' '{ " .. net .. ".0/24 }' >/dev/null 2>&1")
+        end
+        flt.nets[net] = false
+    end
+end
+
+-- ----- Open for server tests -----
+-- Some games test many servers at once (Apex Legends pings every data centre while you log in). When a filter sees
+-- more than <burst_threshold> servers at the same time (default 10, 0 = off), it lets everything through for
+-- <burst_seconds> (default 20), and longer while the burst goes on. The opening is an element "0.0.0.0/0" with a
+-- timeout in the set <filter>_burst, checked by a rule in front of the others: the firewall itself closes it when the
+-- time is up, even if this helper stopped. (A router whose firewall has no timeouts on such sets gets a set without
+-- them, emptied by the helper.)
+local function fl_burst_setup(flt)
+    local set = flt.base .. "_burst"
+    if fl_set_exists(set) then return true end
+    local rule = fl_base_rule(flt.cfg)
+    if not rule then return false end
+    local ok = fl_nft_file({
+        "add set inet geomate " .. set .. " { type ipv4_addr; flags interval, timeout; }",
+        "insert rule inet geomate forward " .. rule .. " ip daddr @" .. set .. " counter accept"
+    })
+    flt.burst_timeout = ok
+    if not ok then
+        ok = fl_nft_file({
+            "add set inet geomate " .. set .. " { type ipv4_addr; flags interval; }",
+            "insert rule inet geomate forward " .. rule .. " ip daddr @" .. set .. " counter accept"
+        })
+    end
+    return ok
+end
+
+local function fl_burst_open(flt, seconds)
+    local set = flt.base .. "_burst"
+    if flt.burst_timeout then
+        -- (re)start the timer: an element that exists already keeps its old timeout, so replace it
+        return fl_nft_file({
+            "flush set inet geomate " .. set,
+            "add element inet geomate " .. set .. " { 0.0.0.0/0 timeout " .. seconds .. "s }"
+        })
+    end
+    return fl_nft_file({ "flush set inet geomate " .. set, "add element inet geomate " .. set .. " { 0.0.0.0/0 }" })
+end
+
+local function fl_burst_close(flt)
+    os.execute("nft flush set inet geomate '" .. flt.base .. "_burst' >/dev/null 2>&1")
+end
+
+-- ----- Blocked by you -----
+-- Addresses you block on the map or in the IP history (list "denied_ip" of the filter). Geomate's own rules let an
+-- address inside your regions (or on the allowed list) through before they look at the blocked set, so a block needs
+-- its own set (<filter>_denied) and a drop rule in a chain that runs before Geomate's. The helper keeps both in place.
+local function fl_denied_setup(flt)
+    local set = flt.base .. "_denied"
+    local rule = fl_base_rule(flt.cfg)
+    if not rule then return false end
+    local lines = {}
+    if not fl_set_exists(set) then
+        -- a chain of its own that runs just before Geomate's (priority -151 < -150): a drop there is final, whatever
+        -- order Geomate's and the helper's other rules are in
+        lines[#lines + 1] = "add chain inet geomate fl_first { type filter hook forward priority -151; policy accept; }"
+        lines[#lines + 1] = "add set inet geomate " .. set .. " { type ipv4_addr; flags interval; }"
+        lines[#lines + 1] = "add rule inet geomate fl_first " .. rule .. " ip daddr @" .. set .. " counter drop"
+    else
+        lines[#lines + 1] = "flush set inet geomate " .. set
+    end
+    local list = {}
+    for ip in pairs(flt.denied) do list[#list + 1] = ip end
+    if #list > 0 then lines[#lines + 1] = "add element inet geomate " .. set .. " { " .. table.concat(list, ", ") .. " }" end
+    local ok = fl_nft_file(lines)
+    if ok then flt.denied_sig = flt.denied_key end
+    return ok
+end
+
+-- ----- Keep games on IPv4 (filter option "ipv4_only", set by the Mobile Filtering preset) -----
+-- Geomate's rules only match IPv4 ("ip saddr ..."). Phones and tablets send much of their game traffic over IPv6 when
+-- the home network has it, and that traffic was then not filtered at all. With this option the device's IPv6 to ports
+-- the filter covers (its protocol and destination ports; ports 1024 and up, UDP and TCP, when it names none) is refused
+-- at once, so that traffic falls back to IPv4, where the filter sees it. Everything else keeps using IPv6. The device
+-- is recognised by its MAC address (its IPv6 addresses keep changing), looked up from its IPv4 address in the DHCP
+-- leases and the neighbour table.
+local function fl_v6_macs(s)
+    local want = {}
+    local src = s.src_ip
+    if type(src) == "table" then src = table.concat(src, " ") end
+    for tok in tostring(src or ""):gmatch("[^%s{},]+") do
+        if tok:match("^%d+%.%d+%.%d+%.%d+$") then want[tok] = true end   -- single addresses only (not networks or "!")
+    end
+    local macs, seen = {}, {}
+    local function add(ip, mac)
+        mac = (mac or ""):lower()
+        if want[ip] and mac:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") and mac ~= "00:00:00:00:00:00" and not seen[mac] then
+            seen[mac] = true
+            macs[#macs + 1] = mac
+        end
+    end
+    for line in (fl_read("/tmp/dhcp.leases") or ""):gmatch("[^\n]+") do
+        local mac, ip = line:match("^%S+%s+(%S+)%s+(%S+)")
+        if ip then add(ip, mac) end
+    end
+    for line in (fl_read("/proc/net/arp") or ""):gmatch("[^\n]+") do
+        local ip, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+%S+%s+%S+%s+(%S+)")
+        if ip then add(ip, mac) end
+    end
+    table.sort(macs)
+    return macs
+end
+
+-- what the IPv6 rule matches: the filter's own protocol and destination ports
+local function fl_v6_match(s)
+    local function str(v) if type(v) == "table" then return table.concat(v, " ") end return v or "" end
+    local proto, ports = str(s.protocol), str(s.dest_port)
+    local l4 = (proto == "tcp" or proto == "udp") and ("meta l4proto " .. proto) or "meta l4proto { tcp, udp }"
+    ports = ports:gsub("^%s+", ""):gsub("%s+$", "")
+    if ports == "" or ports == "any" or not ports:match("^[%d%- ]+$") then ports = "1024-65535" end
+    if ports:find(" ") then ports = "{ " .. ports:gsub(" +", ", ") .. " }" end
+    return l4 .. " th dport " .. ports
+end
+
+-- takes the rule and set away (the option was turned off, the filter is gone, or the rule is made anew)
+local function fl_v6_remove(set)
+    local h = io.popen("nft -a list chain inet geomate fl_first 2>/dev/null")
+    local out = h and h:read("*a") or ""
+    if h then h:close() end
+    local lines = {}
+    for line in out:gmatch("[^\n]+") do
+        if line:find("@" .. set .. " ", 1, true) then
+            local handle = line:match("# handle (%d+)")
+            if handle then lines[#lines + 1] = "delete rule inet geomate fl_first handle " .. handle end
+        end
+    end
+    lines[#lines + 1] = "delete set inet geomate " .. set
+    fl_nft_file(lines)
+end
+
+local function fl_v6_setup(flt, macs, key, match)
+    local set = flt.base .. "_v6games"
+    local lines = {}
+    -- the filter's protocol or ports changed (or the helper started again): the rule is made anew
+    if flt.v6_match ~= match and fl_set_exists(set) then fl_v6_remove(set) end
+    if not fl_set_exists(set) then
+        lines[#lines + 1] = "add chain inet geomate fl_first { type filter hook forward priority -151; policy accept; }"
+        lines[#lines + 1] = "add set inet geomate " .. set .. " { type ether_addr; }"
+        lines[#lines + 1] = "add rule inet geomate fl_first ether saddr @" .. set ..
+            " meta nfproto ipv6 " .. match .. " counter reject with icmpx type admin-prohibited"
+    else
+        lines[#lines + 1] = "flush set inet geomate " .. set
+    end
+    if #macs > 0 then lines[#lines + 1] = "add element inet geomate " .. set .. " { " .. table.concat(macs, ", ") .. " }" end
+    local ok = fl_nft_file(lines)
+    if ok then flt.v6_sig, flt.v6_match = key, match end
+    return ok
+end
+
+
+local function fl_sleep(seconds)
+    local whole = math.floor(seconds)
+    nixio.nanosleep(whole, math.floor((seconds - whole) * 1e9))
+end
+
+local FL_STATUS = FL_BASE .. ".status.json"   -- what the helper knows, read by the page's status request
+
+local function fast_locate_worker()
+    if not fl_take_lock() then return end
+    local polygons_ok = (fl_read("/etc/geomate.sh") or ""):find('region_type[i] = "polygon"', 1, true) ~= nil   -- (the polygon sorting itself, not just the word)
+    local tried = fl_tried()
+    local state = {}      -- base|ip -> { s = "allowed" | "blocked" | "pending", lat, lon, checked = time }
+    local guessed = {}    -- base|ip -> set it was put into from a neighbour's location (still to be checked)
+    local api_times = {}  -- times of the recent ip-api.com requests (free use: 15 a minute)
+    local api_wait_until = 0
+    local filters, filters_at = {}, -1
+    local monitor = false
+    local nets_checked = -1
+    local burst_threshold, burst_seconds = 10, 20
+    local fast_detection = false   -- setting "Fast detection": quicker checks while the Geomate page is open (more CPU)
+    local last_status, status_at = "", -1
+    while true do
+        local now = os.time()
+        local alive = tonumber(fl_read(FL_ALIVE) or "") or 0
+        -- runs while the page is open and for 2 hours after it was last open (so it keeps working while you play)
+        if now - alive > 7200 then break end
+        local page_open = now - alive <= 10
+        local busy = false
+        -- With the page closed the helper only keeps the essentials going (new servers, server tests, your blocks),
+        -- at a slower pace, so it costs the router next to nothing while you play
+        local every_cfg = page_open and 3 or 15
+        local every_sets = page_open and 5 or 15
+        local every_dyn = page_open and 5 or 30
+
+        if now - filters_at >= every_cfg then
+            local old = {}
+            for _, f in ipairs(filters) do old[f.base] = f end
+            filters = {}
+            local cur = require("luci.model.uci").cursor()
+            monitor = (cur:get('geomate', 'global', 'operational_mode') or 'dynamic') == 'monitor'
+            burst_threshold = tonumber(cur:get('geomate', 'global', 'burst_threshold') or '') or 10
+            fast_detection = cur:get('geomate', 'global', 'fast_detection') == '1'
+            burst_seconds = tonumber(cur:get('geomate', 'global', 'burst_seconds') or '') or 20
+            if burst_seconds < 5 then burst_seconds = 5 elseif burst_seconds > 600 then burst_seconds = 600 end
+            cur:foreach('geomate', 'geo_filter', function(s)
+                local base = (s.enabled == '1') and filter_set_name(s.name)
+                if not base then return end
+                local regions = s.allowed_region or {}
+                if type(regions) ~= "table" then regions = { regions } end
+                local sig = table.concat(regions, " ") .. "|" .. (fl_base_rule(s) or "")
+                local denied, dlist = {}, s.denied_ip or {}
+                if type(dlist) ~= "table" then dlist = { dlist } end
+                for _, ip in ipairs(dlist) do if ip:match("^%d+%.%d+%.%d+%.%d+$") then denied[ip] = true end end
+                local dkeys = {}
+                for ip in pairs(denied) do dkeys[#dkeys + 1] = ip end
+                table.sort(dkeys)
+                local f = { name = s.name, base = base, regions = regions, cfg = s, sig = sig, dyn = {}, dyn_at = -1,
+                            denied = denied, denied_key = table.concat(dkeys, ",") }
+                if old[base] then f.denied_sig = old[base].denied_sig end
+                f.v6 = (s.ipv4_only == '1')
+                if old[base] and old[base].v6 then f.v6_sig, f.v6_match = old[base].v6_sig, old[base].v6_match end
+                if old[base] and old[base].sig == sig then
+                    f.nets, f.dyn, f.dyn_at = old[base].nets, old[base].dyn, old[base].dyn_at
+                    f.burst_until, f.burst_refresh, f.burst_timeout = old[base].burst_until, old[base].burst_refresh, old[base].burst_timeout
+                elseif old[base] then
+                    -- regions changed: what was decided before no longer holds
+                    for k in pairs(state) do if k:sub(1, #base + 1) == base .. "|" then state[k] = nil end end
+                end
+                filters[#filters + 1] = f
+            end)
+            filters_at = now
+        end
+        -- which sets exist (one cheap call): after a restart of Geomate the helper's own sets are gone and are made again
+        local names = nil
+        local function have(set)
+            if not names then names = fl_set_names() end
+            return names[set] == true
+        end
+        local check_sets = now - nets_checked >= every_sets
+        -- your blocks: put in place when the list changed or Geomate restarted
+        for _, flt in ipairs(filters) do
+            if flt.denied_sig ~= flt.denied_key and flt.denied_key == "" and not have(flt.base .. "_denied") then
+                flt.denied_sig = ""   -- no blocks and no set: nothing to do
+            elseif flt.denied_sig ~= flt.denied_key or (check_sets and flt.denied_key ~= "" and not have(flt.base .. "_denied")) then
+                if have(flt.base .. "_allowed") then fl_denied_setup(flt) end
+            end
+        end
+        -- keep games on IPv4: the device's MAC addresses (they change with a new private Wi-Fi address), checked now and then
+        for _, flt in ipairs(filters) do
+            if flt.v6 and (check_sets or flt.v6_sig == nil) and have(flt.base .. "_allowed") then
+                local macs = fl_v6_macs(flt.cfg)
+                local match = fl_v6_match(flt.cfg)
+                local key = match .. "|" .. table.concat(macs, ",")
+                if flt.v6_sig ~= key or not have(flt.base .. "_v6games") then fl_v6_setup(flt, macs, key, match) end
+            end
+        end
+        if check_sets then
+            -- and away again for filters that no longer use it
+            local keep = {}
+            for _, flt in ipairs(filters) do if flt.v6 then keep[flt.base .. "_v6games"] = true end end
+            if not names then names = fl_set_names() end
+            for set in pairs(names) do
+                if set:match("_v6games$") and not keep[set] then fl_v6_remove(set) end
+            end
+        end
+        -- the network sets and rules: made when missing (first run, or Geomate restarted) or the regions changed
+        if check_sets then
+            nets_checked = now
+            for _, flt in ipairs(filters) do
+                if not flt.nets or not have(flt.base .. "_net_allowed") then
+                    if have(flt.base .. "_allowed") then
+                        fl_net_setup(flt, polygons_ok, monitor, now)
+                        -- Geomate restarted (its sets were rebuilt): check the addresses again
+                        for k in pairs(state) do if k:sub(1, #flt.base + 1) == flt.base .. "|" then state[k] = nil end end
+                    end
+                end
+            end
+        end
+
+        local queue, qips, qn = {}, {}, 0
+        local status = {}
+        -- every filter's recent traffic (and, now and then, the last hour's) in one call
+        local want = {}
+        for _, flt in ipairs(filters) do
+            want[#want + 1] = flt.base .. "_ui_dynamic"
+            if now - flt.dyn_at >= every_dyn then want[#want + 1] = flt.base .. "_dynamic" end
+        end
+        local listed = fl_sets_ips(want)
+        for _, flt in ipairs(filters) do
+            local base = flt.base
+            local active = listed[base .. "_ui_dynamic"] or {}   -- traffic in the last 10 s (small)
+            -- many servers at the same time: open the filter for a short while
+            local n_active = 0
+            for ip in pairs(active) do if fl_public(ip) then n_active = n_active + 1 end end
+            if burst_threshold > 0 then
+                if n_active > burst_threshold then
+                    if not flt.burst_refresh or now >= flt.burst_refresh then
+                        if fl_burst_setup(flt) and fl_burst_open(flt, burst_seconds) then
+                            flt.burst_until = now + burst_seconds
+                            flt.burst_refresh = now + 5
+                        end
+                    end
+                elseif flt.burst_until and now >= flt.burst_until then
+                    if not flt.burst_timeout then fl_burst_close(flt) end
+                    flt.burst_until, flt.burst_refresh = nil, nil
+                end
+            end
+            -- the last hour's addresses (can be long): every 5 s
+            if listed[base .. "_dynamic"] then
+                flt.dyn = listed[base .. "_dynamic"]
+                flt.dyn_at = now
+            end
+            local seen = {}
+            for ip in pairs(active) do seen[ip] = true end
+            for ip in pairs(flt.dyn) do seen[ip] = true end
+
+            for ip in pairs(seen) do
+                if fl_public(ip) then
+                    local key = base .. "|" .. ip
+                    local st = state[key]
+                    if not st then
+                        -- first time: is it sorted already?
+                        st = { checked = now }
+                        state[key] = st
+                        local g = fl_geo_find(flt.name, ip, now)
+                        if g then st.lat, st.lon = g[1], g[2] end
+                        if fl_in_set(base .. "_allowed", ip) then st.s = "allowed"
+                        elseif fl_in_set(base .. "_blocked", ip) then st.s = "blocked"
+                        else
+                            st.s = "pending"
+                            busy = true
+                            local g2, kind = fl_geo_find(flt.name, ip, now)
+                            if g2 and kind ~= "net" then
+                                st.s = fl_sort(base, ip, g2[1], g2[2], flt.regions, polygons_ok) == "_allowed" and "allowed" or "blocked"
+                                if kind == "other" then
+                                    fl_append_geo(flt.name, '{"status":"success","query":"' .. ip .. '","lat":' .. g2[1] .. ',"lon":' .. g2[2] .. '}', ip, g2[1], g2[2])
+                                end
+                                fl_net_update(flt, ip, st.s == "allowed")
+                            elseif g2 then
+                                guessed[key] = fl_sort(base, ip, g2[1], g2[2], flt.regions, polygons_ok)
+                                st.s = guessed[key] == "_allowed" and "allowed" or "blocked"
+                                st.guess = true
+                            end
+                        end
+                    elseif st.s == "pending" and now - st.checked >= ((active[ip] and 60 or 600) * (page_open and 1 or 2)) then
+                        -- still unsorted: Geomate may have sorted it meanwhile (checked now and then only)
+                        st.checked = now
+                        if fl_in_set(base .. "_allowed", ip) then st.s = "allowed"
+                        elseif fl_in_set(base .. "_blocked", ip) then st.s = "blocked" end
+                    end
+                    if (st.s == "pending" or st.guess) and (not tried[ip] or now - tried[ip] > 600) then
+                        queue[#queue + 1] = { ip = ip, f = flt }
+                        if not qips[ip] then qips[ip] = true qn = qn + 1 end
+                    end
+                end
+            end
+
+            -- what the page shows: the addresses active in the last 10 s
+            if page_open then
+                local fs = {}
+                local burst = flt.burst_until and now < flt.burst_until
+                for ip in pairs(active) do
+                    if fl_public(ip) then
+                        local st = state[base .. "|" .. ip] or { s = "pending" }
+                        local e = { s = st.s, lat = st.lat, lon = st.lon }
+                        if burst then e.burst = true end
+                        if flt.denied[ip] then e.denied = true end
+                        if st.s == "pending" then
+                            local net = ip:match("^(%d+%.%d+%.%d+)%.")
+                            if flt.nets and net and flt.nets[net] == true then e.net = true end
+                            if tried[ip] and now - tried[ip] < 30 or qips[ip] then e.locating = true end
+                        end
+                        fs[ip] = e
+                    end
+                end
+                status[flt.name] = fs
+            end
+        end
+
+        -- ip-api.com allows 15 requests a minute: use them as they are needed (a burst goes out at once)
+        local recent = {}
+        for _, t in ipairs(api_times) do if now - t < 60 then recent[#recent + 1] = t end end
+        api_times = recent
+        if qn > 0 and #api_times < 14 and now >= api_wait_until then
+            local list = {}
+            for ip in pairs(qips) do if #list < 100 then list[#list + 1] = ip end end
+            api_times[#api_times + 1] = now
+            local h = io.popen("curl -s -m 4 -X POST -H 'Content-Type: application/json' -d '[\"" ..
+                table.concat(list, '","') .. "\"]' 'http://ip-api.com/batch' 2>/dev/null")
+            local r = h and h:read("*a") or ""
+            if h then h:close() end
+            if not r:match("^%s*%[") then
+                api_wait_until = os.time() + 3   -- no usable answer (busy or offline): try again shortly
+            else
+                r = r:gsub("^%s*%[", ""):gsub("%]%s*$", "")
+                local found, answered = {}, {}
+                for obj in (r .. "\n"):gsub("},{", "}\n{"):gmatch("[^\n]+") do
+                    local q = obj:match('"query":"([^"]+)"')
+                    if q then
+                        answered[q] = true
+                        if obj:find('"status":"success"', 1, true) then
+                            local la = tonumber(obj:match('"lat":(%-?[%d.eE+-]+)') or "")
+                            local lo = tonumber(obj:match('"lon":(%-?[%d.eE+-]+)') or "")
+                            if la and lo then found[q] = { obj, la, lo } end
+                        end
+                    end
+                end
+                -- a usable answer: every address asked for waits 10 minutes before it is asked for again
+                -- (also the ones the answer left out or could not place)
+                for _, ip in ipairs(list) do tried[ip] = now end
+                for ip, t in pairs(tried) do if now - t > 3600 then tried[ip] = nil end end
+                fl_write(FL_TRIED, jsonc.stringify(tried))
+                for _, e in ipairs(queue) do
+                    local f = found[e.ip]
+                    if f then
+                        local key = e.f.base .. "|" .. e.ip
+                        fl_append_geo(e.f.name, f[1], e.ip, f[2], f[3])
+                        local target = fl_sort(e.f.base, e.ip, f[2], f[3], e.f.regions, polygons_ok, guessed[key])
+                        fl_net_update(e.f, e.ip, target == "_allowed")
+                        guessed[key] = nil
+                        state[key] = { s = target == "_allowed" and "allowed" or "blocked", lat = f[2], lon = f[3], checked = now }
+                    end
+                end
+            end
+        end
+
+        -- the page's status request reads this instead of listing the firewall's sets itself
+        if page_open then
+            local js = jsonc.stringify(status)
+            if js ~= last_status or now - status_at >= 2 then
+                fl_write(FL_STATUS .. ".tmp", '{"t":' .. now .. ',"filters":' .. js .. '}')
+                os.rename(FL_STATUS .. ".tmp", FL_STATUS)
+                last_status, status_at = js, now
+            end
+        end
+
+        -- quick while new servers appear, slower when nothing happens or the page is closed
+        local can_ask = qn > 0 and #api_times < 14 and os.time() >= api_wait_until
+        -- ("Fast detection" on: every 0.25 s while the Geomate page is open, instead of 0.5 s; no change when it is closed)
+        if busy or can_ask or (page_open and fast_detection) then fl_sleep(0.25) elseif page_open then fl_sleep(0.5) else fl_sleep(2) end
+    end
+    for _, flt in ipairs(filters) do
+        if flt.burst_until and not flt.burst_timeout then fl_burst_close(flt) end
+    end
+    os.remove(FL_STATUS)
+    fl_release_lock()
+end
+
+-- The connections as the helper sees them (no firewall listing, no file reading): nil when it isn't running
+local function connections_from_helper()
+    local d = jsonc.parse(fl_read(FL_STATUS) or "")
+    if type(d) ~= "table" or type(d.filters) ~= "table" or not tonumber(d.t) or os.time() - tonumber(d.t) > 5 then return nil end
+    if not fl_running() then return nil end
+    uci:load('geomate')
+    local strict = uci:get('geomate', 'global', 'strict_mode') == '1'
+    local monitor = (uci:get('geomate', 'global', 'operational_mode') or 'dynamic') == 'monitor'
+    local allowed_ips_set = get_allowed_ips_set()
+    local out, done = {}, {}
+    for name, ips in pairs(d.filters) do
+        if type(ips) == "table" then
+            for ip, e in pairs(ips) do
+                if not done[ip] and type(e) == "table" then
+                    done[ip] = true
+                    local allowed, is_allowed_ip, pending, reason = false, false, false, nil
+                    if e.denied then
+                        allowed = false
+                        reason = "Blocked by you"
+                    elseif allowed_ips_set[ip] then
+                        allowed, is_allowed_ip = true, true
+                    elseif e.burst then
+                        allowed = true
+                        reason = "Allowed for now: many servers at once (server test, e.g. while logging in)"
+                    elseif e.s == "allowed" then
+                        allowed = true
+                    elseif e.s == "blocked" then
+                        allowed = false
+                    elseif e.net then
+                        allowed = true
+                        reason = "Allowed at once: its network is inside your region (being confirmed)"
+                    else
+                        pending = true
+                        allowed = not (strict and not monitor)
+                        reason = allowed and "Not located yet (passes until it is)" or "Not located yet (blocked by Strict Mode)"
+                        if e.locating then reason = reason .. " - locating now" end
+                    end
+                    out[#out + 1] = {
+                        src = "unknown", dst = ip, protocol = "unknown", sport = "unknown", dport = "unknown",
+                        allowed = allowed,
+                        geo = (tonumber(e.lat) and tonumber(e.lon)) and { lat = tonumber(e.lat), lon = tonumber(e.lon) } or {},
+                        filter_name = name, is_dynamic = true, is_allowed_ip = is_allowed_ip,
+                        pending = pending, reason = reason, denied = e.denied or false
+                    }
+                end
+            end
+        end
+    end
+    return out
+end
+
 -- Main function to retrieve all connections, only those from dynamic ui sets (previously also loaded from conntrack)
 local function get_all_connections()
     load_cache()
@@ -251,6 +1178,14 @@ local function get_all_connections()
         processed_ips[conn.dst] = true
     end
 
+    -- What the firewall really does with an address the filter has not sorted yet: Strict Mode drops it
+    -- (unless Geomate only monitors), otherwise it passes
+    uci:load('geomate')
+    local strict = uci:get('geomate', 'global', 'strict_mode') == '1'
+    local monitor = (uci:get('geomate', 'global', 'operational_mode') or 'dynamic') == 'monitor'
+
+    local tried_now = fl_tried()
+
     -- Add IPs from dynamic sets
     for _, entry in ipairs(dynamic_ips) do
         local ip = entry.ip
@@ -258,8 +1193,41 @@ local function get_all_connections()
         local filter_name = filter.name
 
         if not processed_ips[ip] then
-            local allowed, is_allowed_ip = is_ip_allowed(ip, filter, allowed_ips_set)
             local geo = geolocate_ip(ip)
+            -- The status comes from the firewall's own sets (what is actually allowed or dropped), so it is right for
+            -- every region shape the backend supports
+            local allowed, is_allowed_ip, pending, reason
+            local dl = filter.denied_ip or {}
+            if type(dl) ~= "table" then dl = { dl } end
+            local denied = false
+            for _, d in ipairs(dl) do if d == ip then denied = true end end
+            if denied then
+                allowed, is_allowed_ip = false, false
+                reason = "Blocked by you"
+            elseif entry.in_burst and not allowed_ips_set[ip] then
+                allowed, is_allowed_ip = true, false
+                reason = "Allowed for now: many servers at once (server test, e.g. while logging in)"
+            elseif allowed_ips_set[ip] then
+                allowed, is_allowed_ip = true, true
+            elseif entry.in_allowed then
+                allowed, is_allowed_ip = true, false
+            elseif entry.in_blocked then
+                allowed, is_allowed_ip = false, false   -- (in Monitor mode it isn't dropped, but this is what would be)
+            elseif entry.in_net then
+                allowed, is_allowed_ip = true, false
+                reason = "Allowed at once: its network is inside your region (being confirmed)"
+            else
+                pending = true
+                is_allowed_ip = false
+                allowed = not (strict and not monitor)
+                if allowed then
+                    reason = "Not located yet (passes until it is)"
+                else
+                    reason = "Not located yet (blocked by Strict Mode)"
+                end
+                local t = tried_now[ip]
+                if t and os.time() - t < 30 then reason = reason .. " - locating now" end
+            end
 
             local conn = {
                 src = "unknown",
@@ -271,7 +1239,10 @@ local function get_all_connections()
                 geo = geo,
                 filter_name = filter_name,
                 is_dynamic = true,        -- Indicates the connection is from a dynamic set
-                is_allowed_ip = is_allowed_ip  -- Indicates if the IP is on the allowlist
+                is_allowed_ip = is_allowed_ip,  -- Indicates if the IP is on the allowlist
+                pending = pending or false,     -- not sorted into the filter's allowed/blocked set yet
+                reason = reason,
+                denied = denied
             }
 
             table.insert(connections, conn)
@@ -570,8 +1541,11 @@ end
 local methods = {
     getGeomateConnections = {
         call = function()
-            local connections = get_all_connections()
-            return { connections = connections }
+            -- the helper already knows everything (cheap); otherwise ask the firewall (and start the helper)
+            local ok, fast = pcall(connections_from_helper)
+            local connections = (ok and fast) or get_all_connections()
+            pcall(fl_kick)
+            return { connections = connections, fast_locate = true }
         end
     },
     getAllowedIPs = {
@@ -668,7 +1642,9 @@ local methods = {
 }
 
 -- Handle RPC calls
-if arg[1] == "list" then
+if arg[1] == "fastlocate" then
+    fast_locate_worker()
+elseif arg[1] == "list" then
     local rv = {}
     for k, v in pairs(methods) do
         rv[k] = v.args or {}
