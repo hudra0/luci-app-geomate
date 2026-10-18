@@ -16,7 +16,7 @@
                 "/etc/geomate.d/*": [ "read" ],
                 "/etc/geomate.d/runtime/*": [ "read" ],
                 "/tmp/geomate_nft_errors.log": [ "read" ],
-                "/usr/libexec/ping-adjuster": [ "exec" ]
+                "/usr/libexec/ping-adjuster status": [ "exec" ]
             }
         },
         "write": {
@@ -27,7 +27,8 @@
             },
             "uci": [ "geomate", "ping_adjuster" ],
             "file": {
-                "/etc/geomate.d/*": [ "write" ]
+                "/etc/geomate.d/*": [ "write" ],
+                "/usr/libexec/ping-adjuster *": [ "exec" ]
             }
         }
     }

@@ -12,8 +12,38 @@
 // script (/usr/libexec/ping-adjuster) sets everything up.
 
 var PA_SCRIPT = '/usr/libexec/ping-adjuster';
-var INSTALL_CMD = 'opkg update && opkg install tc-tiny kmod-sched-core kmod-ifb kmod-netem && /etc/init.d/ping_adjuster restart';
-var INSTALL_CMD_APK = 'apk update && apk add tc-tiny kmod-sched-core kmod-ifb kmod-netem && /etc/init.d/ping_adjuster restart';
+
+// The packages the router still needs (tc-tiny, kmod-sched-core, kmod-ifb, kmod-netem), as the script reports them
+function missingPackages(st) {
+    if (Array.isArray(st.missing)) return st.missing;
+    var m = [];   // (an older script only reports these three)
+    if (!st.tc) m.push('tc-tiny');
+    if (!st.ifb) m.push('kmod-ifb');
+    if (!st.netem) m.push('kmod-netem');
+    return m;
+}
+
+// The same install as the Install button, as one command for SSH
+function sshCommand(pm, pkgs) {
+    return (pm === 'apk' ? 'apk update && apk add %s' : 'opkg update && opkg install %s').format(pkgs.join(' ')) +
+        ' && /etc/init.d/ping_adjuster restart';
+}
+
+// Why an install didn't work, in plain words
+function installProblem(inst) {
+    switch (inst && inst.error) {
+    case 'lists':
+        return _('The router couldn’t download the package lists. Check that it’s connected to the internet, then try again.');
+    case 'space':
+        return _('The router ran out of storage space while installing.');
+    case 'nopm':
+        return _('This router has no package manager (opkg or apk), so the packages can’t be installed from here.');
+    case 'stopped':
+        return _('The install stopped before it finished. Try again.');
+    default:
+        return _('These could not be installed: %s. The details say why. (On a development “snapshot” firmware, kernel packages often don’t fit the running kernel.)').format((inst && inst.failed) || '');
+    }
+}
 
 var callDHCPLeases = rpc.declare({
     object: 'luci-rpc',
@@ -51,25 +81,73 @@ return view.extend({
         });
     },
 
-    // The box at the top: what is missing, problems of the last apply, and a warning about flow offloading
+    // The Install button: the router installs the missing packages in the background; the regular status updates show
+    // how far it got
+    handleInstall: function(ev) {
+        var self = this;
+        self.installing = true;
+        self.installError = null;
+        return fs.exec_direct(PA_SCRIPT, ['install'], 'json').then(function(res) {
+            if (res && res.started === false && res.error === 'nopm')
+                self.installError = installProblem({ error: 'nopm' });
+        }).catch(function(err) {
+            self.installError = (err && err.name === 'PermissionError')
+                ? _('Your login is not allowed to install packages. Log in as root and try again.')
+                : _('The install could not be started: %s').format((err && err.message) || String(err));
+        }).then(function() {
+            return getStatus().then(function(st) { self.renderNotes(st); self.renderLive(st); });
+        });
+    },
+
+    // The box at the top: what is missing (with the Install button), problems of the last apply, and a warning about
+    // flow offloading
     renderNotes: function(st) {
-        var box = document.getElementById('pa-notes');
+        var self = this, box = self.notesBox;   // (kept, so the first status shows before the page is on screen)
         if (!box) return;
+        var inst = st && st.install, missing = st ? missingPackages(st) : [];
+        // (rebuilt only when something in it changed: a rebuild at every status update would close "Details" and undo a
+        // text selection in the SSH command)
+        var key = JSON.stringify([st ? [missing, st.pm, inst, st.offload, st.errors, st.enabled] : null,
+            !!self.installing, self.installError || null]);
+        if (key === self.notesKey) return;
+        self.notesKey = key;
         var items = [];
         if (!st) {
             items.push(E('div', { 'class': 'pa-note pa-bad' }, _('The Ping Adjuster script is missing. Run the Geomate installer again.')));
         } else {
-            var missing = [];
-            if (!st.tc) missing.push('tc');
-            if (!st.ifb) missing.push('kmod-ifb');
-            if (!st.netem) missing.push('kmod-netem');
-            if (missing.length) {
-                items.push(E('div', { 'class': 'pa-note pa-bad' }, [
-                    E('strong', {}, _('Missing on this router: %s.').format(missing.join(', '))),
-                    E('div', {}, _('Install them over SSH (the command also restarts Ping Adjuster):')),
-                    E('code', {}, INSTALL_CMD),
-                    E('div', { 'class': 'pa-small' }, _('On OpenWrt 25 and later (apk):')),
-                    E('code', {}, INSTALL_CMD_APK)
+            if (inst && inst.state === 'running') {
+                items.push(E('div', { 'class': 'pa-note pa-busy' }, [
+                    E('strong', { 'class': 'pa-spin' }, _('Installing the Ping Adjuster’s packages…')),
+                    E('div', {}, (!inst.step || inst.step === 'lists') ? _('Getting the package lists…') : _('Installing %s…').format(inst.step)),
+                    E('div', { 'class': 'pa-small' }, _('This can take a minute or two. It keeps going if you leave this page.'))
+                ]));
+            } else if (missing.length) {
+                var failed = self.installing && inst && inst.state === 'failed';
+                var parts = [E('strong', {}, _('The Ping Adjuster needs a few packages this router doesn’t have yet: %s.').format(missing.join(', ')))];
+                if (failed) {
+                    parts.push(E('div', { 'class': 'pa-problem' }, installProblem(inst)));
+                    if (inst.log && inst.log.length)
+                        parts.push(E('details', {}, [E('summary', {}, _('Details')), E('pre', {}, inst.log.join('\n'))]));
+                }
+                if (self.installError)
+                    parts.push(E('div', { 'class': 'pa-problem' }, self.installError));
+                if (st.pm) {
+                    parts.push(E('div', { 'class': 'pa-actions' }, [
+                        E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(self, 'handleInstall') },
+                            failed ? _('Try again') : _('Install them')),
+                        E('span', { 'class': 'pa-small' }, _('The router downloads and installs them, then starts the Ping Adjuster.'))
+                    ]));
+                    parts.push(E('details', {}, [
+                        E('summary', {}, _('Or install them over SSH')),
+                        E('code', {}, sshCommand(st.pm, missing))
+                    ]));
+                } else {
+                    parts.push(E('div', {}, installProblem({ error: 'nopm' })));
+                }
+                items.push(E('div', { 'class': 'pa-note pa-bad' }, parts));
+            } else if (self.installing && inst && inst.state === 'done') {
+                items.push(E('div', { 'class': 'pa-note pa-good' }, [
+                    E('strong', {}, _('Installed.')), ' ', _('The Ping Adjuster has everything it needs.')
                 ]));
             }
             if (st.offload && st.offload !== 'off') {
@@ -92,9 +170,10 @@ return view.extend({
 
     // Live numbers in the rules table
     renderLive: function(st) {
-        var rules = (st && st.rules) || [];
+        var self = this, rules = (st && st.rules) || [];
         uci.sections('ping_adjuster', 'rule').forEach(function(s, i) {
-            var cell = document.getElementById('pa-live-' + s['.name']);
+            var id = 'pa-live-' + s['.name'];
+            var cell = document.getElementById(id) || (self.root && self.root.querySelector('[id="' + id + '"]'));
             if (!cell) return;
             var r = rules.filter(function(x) { return x.index === i + 1; })[0];
             cell.innerHTML = '';
@@ -212,12 +291,24 @@ return view.extend({
 .pa-note{border:1px solid #30414d;border-left:4px solid #9eafb9;background:#17232d;color:#eaf1f5;border-radius:8px;padding:10px 12px;margin:0 0 8px;line-height:1.5}
 .pa-note.pa-bad{border-left-color:#ef4444}
 .pa-note.pa-warn{border-left-color:#fbbf24}
+.pa-note.pa-good{border-left-color:#4ade80}
+.pa-note.pa-busy{border-left-color:#38bdf8}
+.pa-note .pa-problem{margin:6px 0;color:#fca5a5}
+.pa-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:8px 0 4px}
+.pa-note details{margin-top:6px}
+.pa-note summary{cursor:pointer;color:#9eafb9}
+.pa-spin::before{content:'';display:inline-block;width:11px;height:11px;margin-right:8px;vertical-align:-1px;border:2px solid #38bdf8;border-right-color:transparent;border-radius:50%;animation:pa-spin .8s linear infinite}
+@keyframes pa-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.pa-spin::before{animation:none;border-right-color:#38bdf8}}
+.pa-note pre{margin:6px 0 0;padding:6px 8px;background:#0f1921;border:1px solid #30414d;border-radius:6px;color:#cfe0ea;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto}
 .pa-note code{display:block;margin:6px 0;padding:6px 8px;background:#0f1921;border:1px solid #30414d;border-radius:6px;color:#cfe0ea;white-space:pre-wrap;word-break:break-all;user-select:all}
 .pa-small{font-size:12px;color:#9eafb9}
 .pa-on{color:#4ade80;font-weight:600;white-space:nowrap}
 .pa-off{color:#9eafb9;white-space:nowrap}
 `));
-            rendered.insertBefore(E('div', { 'id': 'pa-notes', 'style': 'display:none' }), rendered.firstChild);
+            self.root = rendered;
+            self.notesBox = E('div', { 'id': 'pa-notes', 'style': 'display:none' });
+            rendered.insertBefore(self.notesBox, rendered.firstChild);
             self.renderNotes(data[2]);
             self.renderLive(data[2]);
             poll.add(function() {

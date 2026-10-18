@@ -2,9 +2,12 @@
 # Ping Adjuster for Geomate: adds delay (and, if wanted, jitter and packet loss) to the traffic of chosen devices,
 # using the kernel's netem queue.
 #
-#   ping-adjuster apply    set everything up from /etc/config/ping_adjuster (takes away the old setup first)
-#   ping-adjuster stop     take everything away
-#   ping-adjuster status   what is set up, as JSON (for the Ping Adjuster page)
+#   ping-adjuster apply        set everything up from /etc/config/ping_adjuster (takes away the old setup first)
+#   ping-adjuster stop         take everything away
+#   ping-adjuster status       what is set up, as JSON (for the Ping Adjuster page)
+#   ping-adjuster missing      the packages it needs that the router doesn't have (nothing when it has them all)
+#   ping-adjuster install      installs those in the background (the page's Install button); "status" shows how it goes
+#   ping-adjuster install-now  the same, waiting until it's done
 #
 # How: on the LAN side of the router, a device's packets are picked out with u32 filters on the interface it is
 # reached through (clsact ingress = from the device, upload; clsact egress = to the device, download) and redirected
@@ -16,6 +19,9 @@
 CONFIG=ping_adjuster
 STATE=/tmp/ping_adjuster.state       # what was set up: "filter <dev> <ingress|egress> <pref>", "clsact <dev>"
 ERRORS=/tmp/ping_adjuster.errors     # problems of the last apply, for the page
+INSTALL_STATE=/tmp/ping_adjuster.install       # the last package install: "key=value" lines (state, packages, step...)
+INSTALL_LOG=/tmp/ping_adjuster.install.log     # what the package manager said
+INSTALL_LOCK=/tmp/ping_adjuster.install.lock   # while an install runs: a link to the number of its process
 PREF_BASE=49152                       # filter priorities of this tool (kept apart from other tools' filters)
 IFB_PREFIX=pingadj                    # ifb devices: pingadj<rule>u (upload), pingadj<rule>d (download)
 LIMIT=10000                           # packets netem may hold (a long delay on a busy device needs room)
@@ -197,13 +203,135 @@ module_ok() {
 	ls /lib/modules/*/"$1".ko >/dev/null 2>&1
 }
 
+# ---- the packages it needs ----
+# One per line, the ones the router doesn't have. Each is checked by what it provides (so tc-full instead of tc-tiny
+# counts as well): tc, the clsact queue with u32 filters and mirred redirects, ifb devices and netem.
+missing_pkgs() {
+	command -v "$TC" >/dev/null 2>&1 || echo tc-tiny
+	{ module_ok sch_ingress && module_ok cls_u32 && module_ok act_mirred; } || echo kmod-sched-core
+	{ module_ok ifb || [ -d /sys/class/net/ifb0 ]; } || echo kmod-ifb
+	module_ok sch_netem || echo kmod-netem
+}
+missing_list() { missing_pkgs | tr '\n' ' ' | sed 's/ *$//'; }
+
+# The router's package manager: apk (OpenWrt 25 and later) or opkg
+pkg_manager() {
+	if command -v apk >/dev/null 2>&1; then echo apk
+	elif command -v opkg >/dev/null 2>&1; then echo opkg; fi
+}
+
+install_running() {
+	local pid
+	pid=$(readlink "$INSTALL_LOCK" 2>/dev/null) && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# Rewrites the install's state file: $1 = state (running, done or failed), then "key=value" lines
+INSTALL_STARTED=0
+set_install_state() {
+	local f="$INSTALL_STATE.$$" kv
+	{
+		echo "state=$1"
+		echo "started=$INSTALL_STARTED"
+		shift
+		for kv in "$@"; do echo "$kv"; done
+	} > "$f" && mv -f "$f" "$INSTALL_STATE"
+}
+
+# The Install button: starts the install in the background and answers at once (it can take a minute or two)
+do_install_start() {
+	local pkgs pm
+	if install_running; then echo '{"started":true}'; return 0; fi
+	pkgs=$(missing_list); pm=$(pkg_manager)
+	[ -n "$pkgs" ] || { echo '{"started":false,"error":"nothing"}'; return 0; }
+	[ -n "$pm" ] || { echo '{"started":false,"error":"nopm"}'; return 0; }
+	INSTALL_STARTED=$(date +%s)
+	set_install_state running "packages=$pkgs" "step=lists"
+	( sh "$0" install-now </dev/null >/dev/null 2>&1 & )
+	echo '{"started":true}'
+}
+
+# The install itself: the package lists first, then each package that is missing, then the rules are set up again
+do_install_now() {
+	local pkgs pm p err=''
+	if ! ln -s "$$" "$INSTALL_LOCK" 2>/dev/null; then
+		install_running && { echo "An install is running already."; return 0; }
+		rm -f "$INSTALL_LOCK"                          # (left behind by an install that was killed)
+		ln -s "$$" "$INSTALL_LOCK" 2>/dev/null || return 1
+	fi
+	trap 'rm -f "$INSTALL_LOCK"' EXIT
+	trap 'exit 1' INT TERM
+	pkgs=$(missing_list); pm=$(pkg_manager)
+	INSTALL_STARTED=$(date +%s)
+	: > "$INSTALL_LOG"
+	if [ -z "$pkgs" ]; then set_install_state done; echo "Nothing to install."; return 0; fi
+	if [ -z "$pm" ]; then
+		set_install_state failed "packages=$pkgs" "failed=$pkgs" "error=nopm"
+		echo "This router has no package manager (opkg or apk)."
+		return 1
+	fi
+	set_install_state running "packages=$pkgs" "step=lists"
+	echo "Getting the package lists..."
+	echo "== $pm update" >> "$INSTALL_LOG"
+	$pm update >> "$INSTALL_LOG" 2>&1 || err=lists
+	for p in $pkgs; do
+		set_install_state running "packages=$pkgs" "step=$p"
+		echo "Installing $p..."
+		if [ "$pm" = apk ]; then echo "== apk add $p"; else echo "== opkg install $p"; fi >> "$INSTALL_LOG"
+		if [ "$pm" = apk ]; then apk add "$p"; else opkg install "$p"; fi >> "$INSTALL_LOG" 2>&1
+	done
+	# what the router has now decides (not what the package manager answered)
+	p=$(missing_list)
+	[ -x /etc/init.d/ping_adjuster ] && /etc/init.d/ping_adjuster restart >> "$INSTALL_LOG" 2>&1
+	if [ -z "$p" ]; then
+		set_install_state done "packages=$pkgs"
+		echo "Done: the Ping Adjuster has everything it needs."
+		return 0
+	fi
+	grep -qi 'no space left' "$INSTALL_LOG" && err=space
+	set_install_state failed "packages=$pkgs" "failed=$p" "error=${err:-install}"
+	echo "Could not install: $p (details in $INSTALL_LOG)."
+	return 1
+}
+
+# The last install, as JSON (null when there was none)
+install_json() {
+	local k v state='' started=0 packages='' step='' failed='' error='' n=0 line
+	[ -f "$INSTALL_STATE" ] || { printf 'null'; return 0; }
+	while IFS='=' read -r k v; do
+		case "$k" in
+			state) state=$v ;; started) started=$v ;; packages) packages=$v ;;
+			step) step=$v ;; failed) failed=$v ;; error) error=$v ;;
+		esac
+	done < "$INSTALL_STATE"
+	# "running", but its process is gone: it was stopped halfway (or never got going)
+	case "$started" in ''|*[!0-9]*) started=0 ;; esac
+	if [ "$state" = running ] && ! install_running && [ $(( $(date +%s) - started )) -gt 15 ]; then
+		state=failed error=stopped failed=$packages
+	fi
+	printf '{"state":%s,"packages":%s,"step":%s,"failed":%s,"error":%s,"log":[' "$(json_str "$state")" \
+		"$(json_str "$packages")" "$(json_str "$step")" "$(json_str "$failed")" "$(json_str "$error")"
+	# when it failed: the last lines the package manager wrote (printable characters only)
+	if [ "$state" = failed ] && [ -s "$INSTALL_LOG" ]; then
+		tail -n 8 "$INSTALL_LOG" | tr '\t\r' '  ' | tr -d '\000-\010\013-\037\177' | while IFS= read -r line; do
+			[ $n -gt 0 ] && printf ','
+			json_str "$line"
+			n=$((n + 1))
+		done
+	fi
+	printf ']}'
+}
+
 do_status() {
-	local first=1 idx en ips d j l dir tr up dn n devs
+	local first=1 idx en ips d j l dir tr up dn n devs p
 	printf '{'
 	printf '"enabled":%s,' "$(global_enabled && echo true || echo false)"
 	printf '"tc":%s,' "$(command -v "$TC" >/dev/null 2>&1 && echo true || echo false)"
 	printf '"netem":%s,' "$(module_ok sch_netem && echo true || echo false)"
 	printf '"ifb":%s,' "$( (module_ok ifb || [ -d /sys/class/net/ifb0 ]) && echo true || echo false)"
+	printf '"pm":%s,"missing":[' "$(json_str "$(pkg_manager)")"
+	n=0
+	for p in $(missing_list); do [ $n -gt 0 ] && printf ','; json_str "$p"; n=$((n + 1)); done
+	printf '],"install":%s,' "$(install_json)"
 	printf '"offload":%s,' "$(json_str "$( [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = 1 ] && echo hardware || { [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = 1 ] && echo software || echo off; })")"
 	printf '"errors":['
 	n=0
@@ -232,17 +360,20 @@ ensure_config() {
 	[ -x /etc/init.d/ping_adjuster ] && /etc/init.d/ping_adjuster enable >/dev/null 2>&1
 	:
 }
-ensure_config
 
 case "$1" in
-	apply|start|reload) do_apply ;;
+	apply|start|reload) ensure_config; do_apply ;;
 	stop) do_stop; : > "$ERRORS" ;;
 	status)
+		ensure_config
 		do_status
 		# (asked by the page: start the service in the background, so this answer isn't held up)
 		if [ "$FIRST_USE" = 1 ] && [ -x /etc/init.d/ping_adjuster ]; then
 			( /etc/init.d/ping_adjuster start </dev/null >/dev/null 2>&1 & )
 		fi
 		;;
-	*) echo "usage: $0 apply|stop|status" >&2; exit 1 ;;
+	missing) echo "$(missing_list)" ;;
+	install) do_install_start ;;
+	install-now) do_install_now ;;
+	*) echo "usage: $0 apply|stop|status|missing|install|install-now" >&2; exit 1 ;;
 esac
