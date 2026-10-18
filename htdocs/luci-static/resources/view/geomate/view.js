@@ -72,8 +72,9 @@ var GEO_PRESETS = [
         allPlatforms: false,
         platforms: 'phones and tablets (iPhone, iPad, Android)',
         detailText: 'TCP to port 443 and to ports 1024 and up from your phone, calls and notifications left out, kept on IPv4',
-        note: 'Pick your phone as the source. Give it a fixed address: turn off "Rotating" private Wi-Fi address for your home network (or add a static DHCP lease). ' +
-              'For proper filtering, set "Open for server tests" to 0 on the Geo Filters page: a phone talks to many servers at once, which would otherwise keep the filter open.',
+        device: 'phone or tablet',
+        note: 'Pick your phone as the source. Give it a fixed address: turn off "Rotating" private Wi-Fi address for your home network (or add a static DHCP lease).',
+        required: 'For proper filtering, set "Open for server tests" to 0 (Geo Filters page \u2192 Global Settings).',   // (shown on a line of its own, in bold)
         warning: 'Warning: this filters ALL of the phone\'s internet traffic on these ports, not only games. Websites and apps whose servers are outside your regions are blocked too. Turn the filter off when you are not playing.'
     }
 ];
@@ -187,6 +188,12 @@ function bindOnce(key, target, type, fn, opts) {
     target.addEventListener(type, fn, opts);
     geomateBound[key] = { target: target, type: type, fn: fn, opts: opts };
 }
+// Messages from the map: only our own map iframe may send them. Without this check, another web page that opened or framed
+// this LuCI page could post the same messages and delete regions or add allowed addresses (which apply at once).
+function fromGeomateMap(event) {
+    var f = document.querySelector('#geomate-map-container iframe');
+    return !!(f && event.source === f.contentWindow && event.data && typeof event.data === 'object');
+}
 var geomateDisposers = {};
 function keepOne(key, dispose) {
     if (geomateDisposers[key]) { try { geomateDisposers[key](); } catch (e) {} }
@@ -271,6 +278,60 @@ function getAutoFsMode() {
 function setAutoFsMode(mode) {
     try { if (mode === 'always' || mode === 'never') localStorage.setItem(FS_PREF_KEY, mode); else localStorage.removeItem(FS_PREF_KEY); } catch (e) {}
 }
+
+// ---- Welcome card -----------------------------------------------------------------------------------------------------
+// What Geomate does and doesn't do, in plain words. Shown the first time Geomate is opened in this browser (before the
+// fullscreen question), and again from the map's ? button.
+var WELCOME_KEY = 'geomateWelcomeSeen';
+function welcomeSeen() { try { return localStorage.getItem(WELCOME_KEY) === '1'; } catch (e) { return true; } }
+function setWelcomeSeen() { try { localStorage.setItem(WELCOME_KEY, '1'); } catch (e) {} }
+var WELCOME_CSS =
+    '#geomate-welcome{position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483600;display:flex;align-items:center;justify-content:center;padding:14px;box-sizing:border-box;background:rgba(5,10,14,.62);overflow:auto}' +
+    '#geomate-welcome .gw-card{width:min(560px,100%);max-height:100%;overflow-y:auto;box-sizing:border-box;background:#17232d;color:#eaf1f5;border:1px solid #30414d;border-radius:12px;padding:18px 20px 14px;box-shadow:0 18px 50px rgba(0,0,0,.5);font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:left}' +
+    '#geomate-welcome h2{margin:0 0 6px;padding:0;border:0;font-size:20px;font-weight:700;line-height:1.25;color:#fff;background:none}' +
+    '#geomate-welcome h3{margin:14px 0 7px;padding:0;border:0;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#7db3ff;background:none}' +
+    '#geomate-welcome h3.gw-not{color:#ff8f8f}' +
+    '#geomate-welcome p{margin:0}' +
+    '#geomate-welcome .gw-lead{color:#c9d6de}' +
+    '#geomate-welcome ol,#geomate-welcome ul{margin:0;padding:0;list-style:none}' +
+    '#geomate-welcome .gw-steps li{display:flex;gap:10px;align-items:flex-start;margin:0 0 8px;padding:0}' +
+    '#geomate-welcome .gw-ic{flex:0 0 28px;height:28px;border-radius:8px;background:#0f1921;border:1px solid #30414d;display:flex;align-items:center;justify-content:center;font-size:15px;line-height:1}' +
+    '#geomate-welcome .gw-steps b{color:#fff}' +
+    '#geomate-welcome .gw-nots li{position:relative;margin:0 0 6px;padding:0 0 0 22px;color:#dfe7ec}' +
+    '#geomate-welcome .gw-nots li:before{content:"\u2715";position:absolute;left:3px;top:0;color:#ff6b6b;font-weight:700}' +
+    '#geomate-welcome .gw-tip{margin-top:12px;font-size:12.5px;color:#9eafb9}' +
+    '#geomate-welcome .gw-foot{position:sticky;bottom:-14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;padding:12px 0 6px;border-top:1px solid #263944;background:#17232d}' +
+    '#geomate-welcome .gw-credits{font-size:12px;color:#9eafb9}' +
+    '#geomate-welcome .gw-credits b{color:#dfe7ec;font-weight:600}' +
+    '#geomate-welcome .gw-credits a{color:#7db3ff;text-decoration:none}' +
+    '#geomate-welcome .gw-ok{margin-left:auto;padding:8px 24px;border-radius:7px;border:1px solid #3b82f6;background:#3b82f6;color:#fff;font-weight:700;font-size:14px;cursor:pointer}' +
+    '#geomate-welcome .gw-ok:hover{background:#2f6fd8}' +
+    '#geomate-welcome .gw-ok:focus-visible{outline:2px solid #bcd6ff;outline-offset:2px}' +
+    '@media (max-width:520px),(max-height:520px){#geomate-welcome{padding:8px}#geomate-welcome .gw-card{padding:14px 14px 12px;font-size:13px}#geomate-welcome h2{font-size:18px}#geomate-welcome .gw-foot{bottom:-12px}}';
+var WELCOME_HTML =
+    '<div class="gw-card">' +
+      '<h2 id="geomate-welcome-title">Welcome to Geomate</h2>' +
+      '<p class="gw-lead">Geomate keeps your games on servers close to you. You mark an area on the map, and your router blocks game servers outside it.</p>' +
+      '<h3>How it works</h3>' +
+      '<ol class="gw-steps">' +
+        '<li><span class="gw-ic" aria-hidden="true">\ud83d\uddfa\ufe0f</span><div><b>Draw your area.</b> Use the circle or shape button on the left of the map, and draw around the places you want to play on.</div></li>' +
+        '<li><span class="gw-ic" aria-hidden="true">\ud83c\udfae</span><div><b>Pick your device.</b> Name the filter, choose a preset (Call of Duty, Any Game or Mobile) and pick your console, PC or phone.</div></li>' +
+        '<li><span class="gw-ic" aria-hidden="true">\ud83d\udcbe</span><div><b>Press Save &amp; Apply.</b> Nothing changes until you do.</div></li>' +
+        '<li><span class="gw-ic" aria-hidden="true">\u2705</span><div><b>Play.</b> Servers inside your area get through and servers outside it are blocked, so the game has to use one inside. On the map, green ticks are allowed servers and red triangles are blocked ones.</div></li>' +
+      '</ol>' +
+      '<h3 class="gw-not">What it does not do</h3>' +
+      '<ul class="gw-nots">' +
+        '<li>It doesn\u2019t speed up your internet or lower your ping to a server. It only keeps the game off servers that are far away.</li>' +
+        '<li>It can\u2019t choose your lobby, your teammates or your skill matching. It only decides which servers the game may use.</li>' +
+        '<li>It only works for devices connected to this router. Mobile data, other Wi-Fi networks and VPNs go around it.</li>' +
+        '<li>If your area has no servers for a game, that game may not find a match. Make the area bigger.</li>' +
+      '</ul>' +
+      '<p class="gw-tip">Tip: start with a big area and make it smaller step by step. The <b>?</b> button on the map opens this again.</p>' +
+      '<div class="gw-foot">' +
+        '<div class="gw-credits">Geomate by <a href="https://github.com/hudra0/geomate" target="_blank" rel="noopener"><b>hudra0</b></a> \u00b7 map, presets and Ping Adjuster by <b>Darkness</b></div>' +
+        '<button type="button" class="gw-ok">Got it</button>' +
+      '</div>' +
+    '</div>';
 
 // LuCI keeps the menu in the browser from the moment you logged in, so a tab added by an update (Ping Adjuster)
 // would only appear after logging in again. When the saved menu doesn't have it yet, it is fetched again (once).
@@ -398,7 +459,7 @@ return view.extend({
         s.render = function() {
             return E('div', { id: 'geomate-map-container', style: 'position: relative; isolation: isolate;' }, [
                 E('iframe', {
-                    src: L.resource('view/geomate/map.html') + '?v=gl60&t=' + Date.now(), // version tag: makes the browser fetch a fresh map.html after an update
+                    src: L.resource('view/geomate/map.html') + '?v=gl61&t=' + Date.now(), // version tag: makes the browser fetch a fresh map.html after an update
                     style: 'width: 100%; height: 65vh; border: none;' // height is fitted to the window by fitMapToWindow()
                 })
             ]);
@@ -668,7 +729,8 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
 
             // Send initial connections and Allowed IPs to the map after the map is ready
             bindOnce('messageRender', window, 'message', function(event) {
-                if (event.data && event.data.type === 'mapReady') {
+                if (!fromGeomateMap(event)) return;
+                if (event.data.type === 'mapReady') {
                     console.log('Map is ready, loading data');
                     self.loadGeoFilters()
                         .then(() => {
@@ -866,9 +928,50 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
         if (self._autoFsHandled) return;
         (function wait() {
             if (self._autoFsHandled) return;
-            if (document.getElementById('geomate-map-container')) { self._autoFsHandled = true; self.autoFullscreenOnEntry(); return; }
+            if (document.getElementById('geomate-map-container')) { self._autoFsHandled = true; self.onEntry(); return; }
             if (++tries < 60) setTimeout(wait, 50);
         })();
+    },
+
+    // First thing when the page appears: the welcome card on the very first visit, then the fullscreen question. The
+    // card's button is a fresh click, so with "always fullscreen" the page can go straight to fullscreen after it.
+    onEntry: function() {
+        var self = this;
+        if (welcomeSeen()) { self.autoFullscreenOnEntry(); return; }
+        self.showWelcome(function() { self.autoFullscreenOnEntry(); });
+    },
+
+    // The welcome card over the whole window, also in fullscreen (see WELCOME_HTML). onClose runs when it is closed
+    // (Got it, Esc or a click beside it).
+    showWelcome: function(onClose) {
+        if (!document.getElementById('geomate-welcome-style')) {
+            var st = document.createElement('style');
+            st.id = 'geomate-welcome-style';
+            st.textContent = WELCOME_CSS;
+            document.head.appendChild(st);
+        }
+        if (document.getElementById('geomate-welcome')) return;     // already open
+        var back = document.createElement('div');
+        back.id = 'geomate-welcome';
+        back.setAttribute('role', 'dialog');
+        back.setAttribute('aria-modal', 'true');
+        back.setAttribute('aria-labelledby', 'geomate-welcome-title');
+        back.innerHTML = WELCOME_HTML;
+        document.body.appendChild(back);
+        var ok = back.querySelector('.gw-ok'), closed = false;
+        function onKey(ev) { if (ev.key === 'Escape' || ev.key === 'Esc') { ev.preventDefault(); close(); } }
+        function close() {
+            if (closed) return;
+            closed = true;
+            setWelcomeSeen();
+            document.removeEventListener('keydown', onKey, true);
+            if (back.parentNode) back.parentNode.removeChild(back);
+            if (onClose) onClose();
+        }
+        ok.addEventListener('click', function(ev) { ev.preventDefault(); ev.stopPropagation(); close(); });
+        back.addEventListener('click', function(ev) { if (ev.target === back) close(); });
+        document.addEventListener('keydown', onKey, true);
+        try { ok.focus({ preventScroll: true }); } catch (e) { try { ok.focus(); } catch (e2) {} }
     },
 
     autoFullscreenOnEntry: function() {
@@ -1005,16 +1108,16 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
     setupMessageHandlers: function() {
         var self = this;
         bindOnce('messageMain', window, 'message', function(event) {
-            if (!event.data || typeof event.data !== 'object') return;
+            if (!fromGeomateMap(event)) return;
             console.log('Received message from iframe:', event.data);
             if (event.data.type === 'mapReady') {
                 console.log('Map is ready, loading geo filters');
                 self.sendMessageToMap('setPresets', { data: GEO_PRESETS.map(function(p) {
                     return { id: p.id, label: p.label, allPlatforms: !!p.allPlatforms, platformText: geoPresetText(p),
                              detail: p.detailText || (p.protocol.toUpperCase() + (p.src_port ? ' · source port ' + p.src_port : '') + (p.dest_port ? ' · destination port ' + p.dest_port : '') + (p.ip_list ? ' · IP list ' + p.ip_list : '')),
-                             note: p.note || '', warning: p.warning || '' };
+                             note: p.note || '', required: p.required || '', warning: p.warning || '' };
                 }) });
-                if (!self._autoFsHandled) { self._autoFsHandled = true; self.autoFullscreenOnEntry(); }   // (normally already done when the page appeared)
+                if (!self._autoFsHandled) { self._autoFsHandled = true; self.onEntry(); }   // (normally already done when the page appeared)
                 self.loadGeoFilters()
                     .then(() => {
                         self.sendConnectionsToMap(self.currentConnectionsData || []);
@@ -1025,6 +1128,8 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                             .then(function() { return self.reapplyGeoOverrides(); })
                             .then(function() { return self.seedEmptyAnyGameFilters(); });
                     });
+            } else if (event.data.type === 'showWelcome') {
+                self.showWelcome();
             } else if (event.data.type === 'userGesture') {
                 if (self._fsArmed) self.enterFullscreen();
             } else if (event.data.type === 'regionCreated') {
@@ -1168,6 +1273,7 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                                     E('strong', {}, preset.label),
                                     E('div', { 'style': 'margin-top:4px;' }, (preset.allPlatforms ? '\u2714 ' : '') + geoPresetText(preset)),
                                     preset.note ? E('div', { 'style': 'opacity:.75;font-size:90%;margin-top:2px;' }, preset.note) : '',
+                                    preset.required ? E('div', { 'style': 'font-weight:bold;margin-top:4px;' }, '\ud83d\udc49 ' + preset.required) : '',
                                     preset.warning ? E('div', { 'style': 'color:#e5484d;font-weight:bold;font-size:90%;margin-top:4px;' }, '\u26a0 ' + preset.warning) : '',
                                     preset.ip_list ? E('div', { 'style': 'opacity:.75;font-size:90%;margin-top:2px;' }, _('IP list: ') + preset.ip_list) : ''
                                 ])
@@ -1224,7 +1330,7 @@ html.geomate-immersive #geomate-map-container iframe{position:absolute!important
                                     (preset && preset.needsSrcIp) ? E('div', {
                                         'id': 'geomate-src-hint',
                                         'style': 'font-size:90%;opacity:.8;margin-top:4px;'
-                                    }, _('Needed for this preset: the address of the console or PC you play on. Otherwise every device in the house would be filtered (video calls, VPNs, ...).')) : '',
+                                    }, _('Needed for this preset: the address of the %s you play on. Otherwise every device in the house would be filtered (video calls, VPNs, ...).').format(_(preset.device || 'console or PC'))) : '',
                                     E('div', {
                                         'id': 'geomate-src-warn',
                                         'style': 'display:none;color:#ef4444;font-weight:600;margin-top:4px;'

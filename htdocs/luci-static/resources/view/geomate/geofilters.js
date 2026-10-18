@@ -169,7 +169,8 @@ return view.extend({
         o = s.option(form.Value, 'burst_threshold', _('Open for server tests'),
             _('When a filter sees more than this many servers at the same time (for example Apex Legends testing every data centre while you log in), ' +
               'it lets all of them through for a short while, so logging in and server tests are never held up. ' +
-              'Your regions apply again as soon as it is over. 0 turns this off. Works while the Geomate page is open and for 2 hours after.'));
+              'Your regions apply again as soon as it is over. 0 turns this off. Works while the Geomate page is open and for 2 hours after. ' +
+              'When you use Mobile Filtering, set this to 0 for proper filtering.'));
         o.datatype = 'uinteger';
         o.placeholder = '10';
 

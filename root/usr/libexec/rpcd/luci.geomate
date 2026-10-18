@@ -684,6 +684,32 @@ end
 -- timeout in the set <filter>_burst, checked by a rule in front of the others: the firewall itself closes it when the
 -- time is up, even if this helper stopped. (A router whose firewall has no timeouts on such sets gets a set without
 -- them, emptied by the helper.)
+-- A filter that covers port 443 (web pages and apps, as Mobile Filtering does) never opens: a phone talks to many
+-- servers at once all the time, so the filter would stay open for good.
+local function fl_covers_port(spec, port)
+    if type(spec) == "table" then spec = table.concat(spec, " ") end
+    spec = tostring(spec or "")
+    if spec:match("^%s*$") or spec:match("^%s*any%s*$") then return true end   -- no ports given: every port
+    for tok in spec:gmatch("[^%s,{}]+") do
+        local a, b = tok:match("^(%d+)%-(%d+)$")
+        if a then
+            if port >= tonumber(a) and port <= tonumber(b) then return true end
+        elseif tonumber(tok) == port then
+            return true
+        end
+    end
+    return false
+end
+-- Web traffic: the filter's destination ports include 443, and it doesn't pick a game's own source port (Call of Duty's
+-- filter has no destination ports but only covers source port 3074, which is never a browser's)
+local function fl_is_web(s)
+    local sp = s.src_port
+    if type(sp) == "table" then sp = table.concat(sp, " ") end
+    sp = tostring(sp or "")
+    if not (sp:match("^%s*$") or sp:match("^%s*any%s*$")) then return false end
+    return fl_covers_port(s.dest_port, 443)
+end
+
 local function fl_burst_setup(flt)
     local set = flt.base .. "_burst"
     if fl_set_exists(set) then return true end
@@ -841,17 +867,23 @@ local function fast_locate_worker()
     local guessed = {}    -- base|ip -> set it was put into from a neighbour's location (still to be checked)
     local api_times = {}  -- times of the recent ip-api.com requests (free use: 15 a minute)
     local api_wait_until = 0
+    local api_fail = 0      -- requests in a row without a usable answer (the wait grows: 3, 6, 12 ... 60 s)
     local filters, filters_at = {}, -1
     local monitor = false
     local nets_checked = -1
     local burst_threshold, burst_seconds = 10, 20
     local fast_detection = false   -- setting "Fast detection": quicker checks while the Geomate page is open (more CPU)
+    local keep_on = false          -- a filter covers web traffic (Mobile Filtering): keep going, page open or not (see below)
+    local pruned_at = os.time()
     local last_status, status_at = "", -1
     while true do
         local now = os.time()
         local alive = tonumber(fl_read(FL_ALIVE) or "") or 0
-        -- runs while the page is open and for 2 hours after it was last open (so it keeps working while you play)
-        if now - alive > 7200 then break end
+        -- runs while the page is open and for 2 hours after it was last open (so it keeps working while you play). A filter
+        -- that covers web traffic (port 443, as Mobile Filtering does) keeps it going for as long as it is on: a phone's
+        -- apps reach new servers all the time, and with Strict Mode each one would stay blocked until Geomate's own
+        -- lookup round (up to 30 minutes) without the helper.
+        if now - alive > 7200 and not keep_on and filters_at >= 0 then break end   -- (the filters are read first)
         local page_open = now - alive <= 10
         local busy = false
         -- With the page closed the helper only keeps the essentials going (new servers, server tests, your blocks),
@@ -886,6 +918,7 @@ local function fast_locate_worker()
                             denied = denied, denied_key = table.concat(dkeys, ",") }
                 if old[base] then f.denied_sig = old[base].denied_sig end
                 f.v6 = (s.ipv4_only == '1')
+                f.web = fl_is_web(s)   -- (never opened for server tests, see above)
                 if old[base] and old[base].v6 then f.v6_sig, f.v6_match = old[base].v6_sig, old[base].v6_match end
                 if old[base] and old[base].sig == sig then
                     f.nets, f.dyn, f.dyn_at = old[base].nets, old[base].dyn, old[base].dyn_at
@@ -896,6 +929,10 @@ local function fast_locate_worker()
                 end
                 filters[#filters + 1] = f
             end)
+            keep_on = false
+            if cur:get('geomate', 'global', 'enabled') ~= '0' then
+                for _, f in ipairs(filters) do if f.web then keep_on = true end end
+            end
             filters_at = now
         end
         -- which sets exist (one cheap call): after a restart of Geomate the helper's own sets are gone and are made again
@@ -960,7 +997,7 @@ local function fast_locate_worker()
             -- many servers at the same time: open the filter for a short while
             local n_active = 0
             for ip in pairs(active) do if fl_public(ip) then n_active = n_active + 1 end end
-            if burst_threshold > 0 then
+            if burst_threshold > 0 and not flt.web then
                 if n_active > burst_threshold then
                     if not flt.burst_refresh or now >= flt.burst_refresh then
                         if fl_burst_setup(flt) and fl_burst_open(flt, burst_seconds) then
@@ -972,6 +1009,10 @@ local function fast_locate_worker()
                     if not flt.burst_timeout then fl_burst_close(flt) end
                     flt.burst_until, flt.burst_refresh = nil, nil
                 end
+            elseif flt.burst_until then
+                -- turned off (set to 0) while open: close it now, not only when its time is up
+                fl_burst_close(flt)
+                flt.burst_until, flt.burst_refresh = nil, nil
             end
             -- the last hour's addresses (can be long): every 5 s
             if listed[base .. "_dynamic"] then
@@ -986,9 +1027,10 @@ local function fast_locate_worker()
                 if fl_public(ip) then
                     local key = base .. "|" .. ip
                     local st = state[key]
+                    if st then st.seen = now end
                     if not st then
                         -- first time: is it sorted already?
-                        st = { checked = now }
+                        st = { checked = now, seen = now }
                         state[key] = st
                         local g = fl_geo_find(flt.name, ip, now)
                         if g then st.lat, st.lon = g[1], g[2] end
@@ -1053,13 +1095,32 @@ local function fast_locate_worker()
             local list = {}
             for ip in pairs(qips) do if #list < 100 then list[#list + 1] = ip end end
             api_times[#api_times + 1] = now
-            local h = io.popen("curl -s -m 4 -X POST -H 'Content-Type: application/json' -d '[\"" ..
+            local h = io.popen("curl -s -i -m 4 -X POST -H 'Content-Type: application/json' -d '[\"" ..
                 table.concat(list, '","') .. "\"]' 'http://ip-api.com/batch' 2>/dev/null")
             local r = h and h:read("*a") or ""
             if h then h:close() end
+            -- ip-api.com says in its headers how many requests are left in this minute (X-Rl) and when the minute starts
+            -- again (X-Ttl). Geomate's own lookups share the same 15 a minute, and asking on while refused (HTTP 429) gets
+            -- the router's address blocked for an hour, so when nothing is left, wait for the new minute.
+            local code, rl, ttl
+            while r:match("^HTTP/") do
+                local head, rest = r:match("^(.-)\r?\n\r?\n(.*)$")
+                if not head then r = "" break end
+                code = tonumber(head:match("^HTTP/%S+%s+(%d+)")) or code
+                rl = tonumber(head:match("\n[Xx]%-[Rr][Ll]:%s*(%d+)")) or rl
+                ttl = tonumber(head:match("\n[Xx]%-[Tt][Tt][Ll]:%s*(%d+)")) or ttl
+                r = rest
+            end
+            if code == 429 or rl == 0 then
+                api_wait_until = os.time() + math.min(ttl or 60, 65) + 1
+            end
             if not r:match("^%s*%[") then
-                api_wait_until = os.time() + 3   -- no usable answer (busy or offline): try again shortly
+                if code ~= 429 then   -- no usable answer (busy or offline): try again shortly, then less and less often
+                    api_fail = api_fail + 1
+                    api_wait_until = math.max(api_wait_until, os.time() + math.min(60, 3 * 2 ^ (api_fail - 1)))
+                end
             else
+                api_fail = 0
                 r = r:gsub("^%s*%[", ""):gsub("%]%s*$", "")
                 local found, answered = {}, {}
                 for obj in (r .. "\n"):gsub("},{", "}\n{"):gmatch("[^\n]+") do
@@ -1086,7 +1147,7 @@ local function fast_locate_worker()
                         local target = fl_sort(e.f.base, e.ip, f[2], f[3], e.f.regions, polygons_ok, guessed[key])
                         fl_net_update(e.f, e.ip, target == "_allowed")
                         guessed[key] = nil
-                        state[key] = { s = target == "_allowed" and "allowed" or "blocked", lat = f[2], lon = f[3], checked = now }
+                        state[key] = { s = target == "_allowed" and "allowed" or "blocked", lat = f[2], lon = f[3], checked = now, seen = now }
                     end
                 end
             end
@@ -1099,6 +1160,14 @@ local function fast_locate_worker()
                 fl_write(FL_STATUS .. ".tmp", '{"t":' .. now .. ',"filters":' .. js .. '}')
                 os.rename(FL_STATUS .. ".tmp", FL_STATUS)
                 last_status, status_at = js, now
+            end
+        end
+
+        -- forget addresses not seen for 2 hours (the firewall's own lists keep them; this is only the helper's memory)
+        if now - pruned_at >= 600 then
+            pruned_at = now
+            for k, st in pairs(state) do
+                if (st.seen or st.checked or 0) < now - 7200 then state[k] = nil; guessed[k] = nil end
             end
         end
 
@@ -1650,6 +1719,19 @@ elseif arg[1] == "list" then
         rv[k] = v.args or {}
     end
     print((jsonc.stringify(rv):gsub(":%[%]", ":{}")))
+    io.stdout:flush()
+    -- rpcd asks every plugin for this list when it starts, so also at boot: a filter on web traffic (Mobile Filtering)
+    -- needs the background helper running right away, not only once someone opens the Geomate page
+    pcall(function()
+        local cur = require("luci.model.uci").cursor()
+        if cur:get('geomate', 'global', 'enabled') == '0' or fl_running() then return end
+        local need = false
+        cur:foreach('geomate', 'geo_filter', function(s) if s.enabled == '1' and fl_is_web(s) then need = true end end)
+        local self_path = (arg and arg[0]) or "/usr/libexec/rpcd/luci.geomate"
+        if need and self_path:match("^[%w/._%-]+$") then
+            os.execute("'" .. self_path .. "' fastlocate </dev/null >/dev/null 2>&1 &")
+        end
+    end)
 elseif arg[1] == "call" then
     local args = jsonc.parse(io.stdin:read("*a"))
     local method = methods[arg[2]]

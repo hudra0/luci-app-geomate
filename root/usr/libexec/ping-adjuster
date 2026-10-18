@@ -221,11 +221,14 @@ do_status() {
 	printf ']}\n'
 }
 
-# First use (installed by Geomate's updater, which copies files only): make the settings file, and start the service
-# with the router. Package and installer installs have done both already.
+# First use (installed by Geomate's updater, which copies files only): make the settings file and turn the service on,
+# so rules saved on the page apply at once and again after a restart. Package and installer installs have done both.
+FIRST_USE=0
 ensure_config() {
 	[ -f "/etc/config/$CONFIG" ] && return 0
-	printf "\nconfig global 'global'\n\toption enabled '1'\n" > "/etc/config/$CONFIG" || return 1
+	[ -d /etc/config ] || return 0
+	printf "\nconfig global 'global'\n\toption enabled '1'\n" > "/etc/config/$CONFIG" 2>/dev/null || return 0
+	FIRST_USE=1
 	[ -x /etc/init.d/ping_adjuster ] && /etc/init.d/ping_adjuster enable >/dev/null 2>&1
 	:
 }
@@ -234,6 +237,12 @@ ensure_config
 case "$1" in
 	apply|start|reload) do_apply ;;
 	stop) do_stop; : > "$ERRORS" ;;
-	status) do_status ;;
+	status)
+		do_status
+		# (asked by the page: start the service in the background, so this answer isn't held up)
+		if [ "$FIRST_USE" = 1 ] && [ -x /etc/init.d/ping_adjuster ]; then
+			( /etc/init.d/ping_adjuster start </dev/null >/dev/null 2>&1 & )
+		fi
+		;;
 	*) echo "usage: $0 apply|stop|status" >&2; exit 1 ;;
 esac

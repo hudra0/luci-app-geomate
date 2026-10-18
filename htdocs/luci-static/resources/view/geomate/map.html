@@ -385,12 +385,14 @@
         .ih-act:hover { border-color:#3b82f6; color:#7db3ff; }
         .ih-act.remove:hover { border-color:#ef4444; color:#ff8f8f; }
         .home-buttons-container .ip-history-toggle-button { border-radius:0; border-right:1px solid #30414d; }
+        .home-buttons-container .help-button { border-radius:0; border-right:1px solid #30414d; font-family: Georgia, 'Times New Roman', serif; }
         .ip-history-toggle-button.ih-off { opacity:.45; }
 
         /* Name / preset dialog */
         .name-dialog-backdrop { position:fixed; inset:0; z-index:3000; background:rgba(8,14,19,.55); display:flex; align-items:center; justify-content:center; }
         .name-dialog { width:min(420px, calc(100vw - 32px)); background:#17232d; color:#eaf1f5; border:1px solid #30414d; border-radius:10px;
-            box-shadow:0 18px 48px rgba(0,0,0,.5); padding:16px 18px; font:13px/1.4 sans-serif; }
+            box-shadow:0 18px 48px rgba(0,0,0,.5); padding:16px 18px; font:13px/1.4 sans-serif;
+            max-height:calc(100% - 16px); overflow-y:auto; box-sizing:border-box; -webkit-overflow-scrolling:touch; }   /* (short screens: it scrolls) */
         .name-dialog h3 { margin:0 0 12px; font-size:15px; }
         .name-dialog label { display:block; margin:10px 0 4px; color:#9eafb9; font-size:12px; }
         .name-dialog input, .name-dialog select { width:100%; box-sizing:border-box; padding:7px 9px; border-radius:6px; border:1px solid #3a4d59; background:#0f1921; color:#eaf1f5; font-size:13px; }
@@ -399,7 +401,9 @@
         .name-dialog .nd-info.warn { background:rgba(234,179,8,.12); border-color:rgba(234,179,8,.4); color:#f3dd8a; }
         .name-dialog .nd-info small { display:block; margin-top:3px; color:#9eafb9; }
         .name-dialog .nd-info .nd-warning { margin-top:6px; color:#ff6b6b; font-weight:600; }
-        .name-dialog .nd-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
+        .name-dialog .nd-info .nd-required { margin-top:6px; color:#fff; font-weight:700; }
+        .name-dialog .nd-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px;
+            position:sticky; bottom:-16px; background:#17232d; padding:8px 0 4px; }   /* (Create stays in view while the dialog scrolls) */
         .name-dialog button { border:0; border-radius:6px; padding:7px 14px; font-weight:700; cursor:pointer; }
         .name-dialog .nd-ok { background:#3b82f6; color:#fff; }
         .name-dialog .nd-cancel { background:#263944; color:#eaf1f5; border:1px solid #3a4d59; }
@@ -816,6 +820,114 @@
             }
         }
 
+        // ---- Tinting in the background, and a memory of tinted tiles -------------------------------------------------
+        // Recolouring a tile pixel by pixel takes a moment, and zooming asks for dozens of tiles at once; done on the page
+        // itself, that froze the map while zooming. Background workers now fetch and recolour the tiles, so the page stays
+        // smooth, and the last tiles shown are kept, so zooming back in or out shows them at once. Browsers without
+        // background canvases use the old way (recolouring on the page).
+        var tintCache = (function() {
+            var mem = navigator.deviceMemory || 4;
+            var LIMIT = mem >= 8 ? 256 : mem >= 4 ? 128 : 64;   // tiles kept (about 0.25 MB each)
+            var m = new Map();
+            function drop(b) { try { if (b && b.close) b.close(); } catch (e) {} }
+            return {
+                get: function(k) { var b = m.get(k); if (b) { m.delete(k); m.set(k, b); } return b || null; },
+                put: function(k, b) {
+                    if (m.has(k)) { var old = m.get(k); m.delete(k); if (old !== b) drop(old); }
+                    m.set(k, b);
+                    while (m.size > LIMIT) { var first = m.keys().next().value; drop(m.get(first)); m.delete(first); }
+                }
+            };
+        })();
+        var tintPool = (function() {
+            var off = !(typeof Worker === 'function' && typeof OffscreenCanvas === 'function' &&
+                        typeof createImageBitmap === 'function' && typeof fetch === 'function' && typeof Blob === 'function');
+            var workers = null, nextW = 0, seq = 0, jobs = {};
+            function source() {
+                var fns = [tintPixels];
+                if (typeof TINT_TEXTURE_FNS !== 'undefined') fns = fns.concat(TINT_TEXTURE_FNS);   // (helpers tintPixels uses for textured themes)
+                return fns.map(function(f) { return f.toString(); }).join('\n') + '\n' +
+                    'var LUTS = {}, CTRL = {};\n' +
+                    'self.onmessage = function(e) {\n' +
+                    '  var m = e.data;\n' +
+                    '  if (m.abort) { if (CTRL[m.abort]) CTRL[m.abort].abort(); return; }\n' +
+                    '  if (m.lut) LUTS[m.tint] = m.lut;\n' +
+                    '  var ctrl = typeof AbortController === "function" ? new AbortController() : null;\n' +
+                    '  if (ctrl) CTRL[m.id] = ctrl;\n' +
+                    '  var stage = "net";\n' +
+                    '  fetch(m.url, { mode: "cors", credentials: "omit", signal: ctrl ? ctrl.signal : undefined })\n' +
+                    '    .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.blob(); })\n' +
+                    '    .then(function(b) { stage = "decode"; return createImageBitmap(b); })\n' +
+                    '    .then(function(bmp) {\n' +
+                    '      stage = "canvas";\n' +
+                    '      var c = new OffscreenCanvas(m.w, m.h), x = c.getContext("2d", { willReadFrequently: true });\n' +
+                    '      if (!x) throw new Error("no 2d canvas in workers");\n' +
+                    '      x.drawImage(bmp, 0, 0, m.w, m.h); if (bmp.close) bmp.close();\n' +
+                    '      var px = x.getImageData(0, 0, m.w, m.h);\n' +
+                    '      tintPixels(px.data, LUTS[m.tint], { texture: m.texture }, m.w, m.ox, m.oy);\n' +
+                    '      x.putImageData(px, 0, 0);\n' +
+                    '      var out = c.transferToImageBitmap();\n' +
+                    '      delete CTRL[m.id];\n' +
+                    '      self.postMessage({ id: m.id, bitmap: out }, [out]);\n' +
+                    '    })\n' +
+                    '    .catch(function(err) {\n' +
+                    '      delete CTRL[m.id];\n' +
+                    '      self.postMessage({ id: m.id, error: String((err && err.message) || err), aborted: !!(err && err.name === "AbortError"), stage: stage });\n' +
+                    '    });\n' +
+                    '};\n';
+            }
+            function failAll(why) {
+                var ids = Object.keys(jobs);
+                ids.forEach(function(id) { var j = jobs[id]; delete jobs[id]; j.cb(new Error(why)); });
+            }
+            function onMessage(e) {
+                var d = e.data, j = jobs[d.id];
+                if (!j) { if (d.bitmap && d.bitmap.close) d.bitmap.close(); return; }   // (the tile was dropped meanwhile)
+                delete jobs[d.id];
+                if (d.error) {
+                    if (d.aborted) return;
+                    if (d.stage === 'canvas') { off = true; console.warn('[geomate] background tinting unavailable (' + d.error + '): tinting on the page'); }
+                    j.cb(new Error(d.error));
+                    return;
+                }
+                j.cb(null, d.bitmap);
+            }
+            function start() {
+                workers = [];
+                try {
+                    var url = URL.createObjectURL(new Blob([source()], { type: 'text/javascript' }));
+                    var n = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+                    for (var i = 0; i < n; i++) {
+                        var w = new Worker(url);
+                        w.sent = {};
+                        w.onmessage = onMessage;
+                        w.onerror = function() { off = true; failAll('worker failed'); };
+                        workers.push(w);
+                    }
+                } catch (err) { off = true; workers = []; console.warn('[geomate] background tinting unavailable:', err); }
+            }
+            return {
+                run: function(url, tint, def, w, h, ox, oy, cb) {
+                    if (off) return null;
+                    if (!workers) start();
+                    if (off || !workers.length) return null;
+                    var id = String(++seq), wk = workers[nextW++ % workers.length];
+                    var msg = { id: id, url: url, tint: tint, texture: def.texture || null, w: w, h: h, ox: ox, oy: oy };
+                    if (!wk.sent[tint]) { msg.lut = tintLut(def); wk.sent[tint] = true; }
+                    jobs[id] = { cb: cb, w: wk };
+                    wk.postMessage(msg);
+                    return id;
+                },
+                cancel: function(id) {
+                    var j = jobs[id];
+                    if (!j) return;
+                    delete jobs[id];
+                    j.w.postMessage({ abort: id });
+                }
+            };
+        })();
+
+        var TINT_TEXTURE_FNS = [];   // helpers tintPixels needs for textured themes (none here)
         /** A tile layer that recolours the grey Esri tiles with one of the TINTS above before showing them. */
         L.TintTileLayer = L.TileLayer.extend({
             createTile: function(coords, done) {
@@ -839,31 +951,54 @@
                     plain.onerror = function() { finish(new Error('tile failed')); };
                     plain.src = url;
                 }
-                var img = new Image();
-                tile._img = img;
-                img.crossOrigin = 'anonymous';
-                img.onload = function() {
+                function viaPage() {    // the old way: load the tile and recolour it on the page
+                    var img = new Image();
+                    tile._img = img;
+                    img.crossOrigin = 'anonymous';
+                    img.onload = function() {
+                        try {
+                            var ctx = tile.getContext('2d', { willReadFrequently: true });
+                            ctx.drawImage(img, 0, 0, size.x, size.y);
+                            var pixels = ctx.getImageData(0, 0, size.x, size.y);
+                            tintPixels(pixels.data, tintLut(def));
+                            ctx.putImageData(pixels, 0, 0);
+                            if (typeof createImageBitmap === 'function') createImageBitmap(tile).then(function(b) { tintCache.put(cacheKey, b); }).catch(function() {});
+                            finish();
+                        } catch (e) { viaCssFilter(); }
+                    };
+                    img.onerror = function() { viaCssFilter(); };
+                    img.src = url;
+                }
+                var cacheKey = url + '|' + this.options.tint;
+                var cached = tintCache.get(cacheKey);
+                if (cached) {           // shown a moment ago: at once, no download or recolouring
                     try {
-                        var ctx = tile.getContext('2d', { willReadFrequently: true });
-                        ctx.drawImage(img, 0, 0, size.x, size.y);
-                        var pixels = ctx.getImageData(0, 0, size.x, size.y);
-                        tintPixels(pixels.data, tintLut(def));
-                        ctx.putImageData(pixels, 0, 0);
-                        finish();
-                    } catch (e) { viaCssFilter(); }
-                };
-                img.onerror = function() { viaCssFilter(); };
-                img.src = url;
+                        tile.getContext('2d').drawImage(cached, 0, 0, size.x, size.y);
+                        Promise.resolve().then(function() { finish(); });   // (Leaflet expects to hear back later, not right away)
+                        return tile;
+                    } catch (e) {}
+                }
+                var job = tintPool.run(url, this.options.tint, def, size.x, size.y, coords.x * size.x, coords.y * size.y, function(err, bitmap) {
+                    tile._job = null;
+                    if (err) { viaPage(); return; }
+                    try { tile.getContext('2d').drawImage(bitmap, 0, 0, size.x, size.y); } catch (e) { viaPage(); return; }
+                    tintCache.put(cacheKey, bitmap);
+                    finish();
+                });
+                if (job) tile._job = job; else viaPage();
                 return tile;
             },
             _removeTile: function(key) {
                 var t = this._tiles[key];
+                if (t && t.el && t.el._job) { tintPool.cancel(t.el._job); t.el._job = null; }
                 if (t && t.el && t.el._img) { t.el._img.onload = t.el._img.onerror = null; t.el._img.src = L.Util.emptyImageUrl; }
                 return L.TileLayer.prototype._removeTile.call(this, key);
             }
         });
 
-        var MAP_VERSION = 'v55';
+        // a finger rather than a mouse (phones, tablets): some hints say tap instead of click
+        var COARSE_POINTER = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+        var MAP_VERSION = 'v56';
         console.log('[geomate] map.html v21 (steadier fullscreen, tactical green theme, fullscreen on entry, lighter pre-tinted themes, dark grey / light grey / futuristic themes, presets, IP export, names hidden at the zoom-out limit, delete key, drag to move, IP history, normal tile blending, blue regions)');
 
         // Google Map Tiles API key. Nothing is built in: you enter your own key in the 🎨 panel, it is checked with Google
@@ -1209,6 +1344,12 @@
         var bakedPair = null;          // base maps with the names painted in: { withNames, withoutNames } tile layers to swap
         var antarcticaLabel = null;
         var diagEl = null;   // small status line in the colour panel: map version and whether names are shown
+        function setTextIfChanged(el, t) { if (el.textContent !== t) el.textContent = t; }
+        var labelRaf = 0;
+        function scheduleLabelVisibility() {   // (zooming fires many events per frame: check once per frame)
+            if (labelRaf) return;
+            labelRaf = L.Util.requestAnimFrame(function() { labelRaf = 0; updateLabelVisibility(); });
+        }
         function updateLabelVisibility() {
             if (!map) return;
             var z = map.getZoom();
@@ -1235,8 +1376,8 @@
             // The ANTARCTICA label: in "Fill the window" it stays when zoomed out (Antarctica is cropped off the bottom there, so the
             // label shows where it is when you drag down); in the whole-world modes it hides with the other names.
             if (antarcticaLabel) antarcticaLabel.setOpacity((show || getZoomFitMode() === 'fill') && z <= 6 ? 1 : 0);
-            if (diagEl) diagEl.textContent = 'map ' + MAP_VERSION + ' \u00b7 names ' + (show ? 'shown' : 'hidden') + ' \u00b7 zoom ' + z.toFixed(2) + ' (names from ' + floor.toFixed(2) + ')' +
-                ' \u00b7 tiles: ' + (!GOOGLE_MAPS_KEY ? 'Esri (no Google key)' : currentTheme === 'satellite' ? 'Esri (satellite photos)' : googleFailed ? 'Esri (Google refused the key)' : (bakedPair ? 'Google' + (GOOGLE_MODE === 'js' ? ' (Maps JavaScript API)' : ' (Map Tiles API)') + (bakedPair.withoutNames ? '' : ', no name-free copy') : 'loading'));
+            if (diagEl) setTextIfChanged(diagEl, 'map ' + MAP_VERSION + ' \u00b7 names ' + (show ? 'shown' : 'hidden') + ' \u00b7 zoom ' + z.toFixed(2) + ' (names from ' + floor.toFixed(2) + ')' +
+                ' \u00b7 tiles: ' + (!GOOGLE_MAPS_KEY ? 'Esri (no Google key)' : currentTheme === 'satellite' ? 'Esri (satellite photos)' : googleFailed ? 'Esri (Google refused the key)' : (bakedPair ? 'Google' + (GOOGLE_MODE === 'js' ? ' (Maps JavaScript API)' : ' (Map Tiles API)') + (bakedPair.withoutNames ? '' : ', no name-free copy') : 'loading')));
             if (typeof refreshGoogleKeyUI === 'function') refreshGoogleKeyUI();
             if (labelState !== show) {
                 labelState = show;
@@ -1279,6 +1420,7 @@
             map.getContainer().classList.toggle('fx-tactical', themeKey === 'tactical');
             var repeatWorld = getZoomFitMode() === 'repeat';
             var tileOpts = repeatWorld ? { maxZoom: 22, seamless: true } : { maxZoom: 22, noWrap: true, bounds: [[-90, -180], [90, 180]], seamless: true };
+            tileOpts.updateWhenZooming = false; tileOpts.keepBuffer = 4;
             tileOpts.attribution = googleTilesCredit();   // (in Maps JavaScript API mode Google shows its own logo and credits)
 
             baseLayers.forEach(function(l) { map.removeLayer(l); });
@@ -1292,6 +1434,7 @@
                 setMapBackground(themeKey, 'esri');
                 theme.esri.forEach(function(entry, idx) {
                     var layerOpts = {
+                        updateWhenZooming: false, keepBuffer: 4,   // (no tiles for the in-between zoom levels while zooming)
                         maxZoom: 20, maxNativeZoom: entry[1], noWrap: !repeatWorld, bounds: repeatWorld ? undefined : [[-90, -180], [90, 180]],
                         seamless: idx === 0, // only the opaque base map is overlapped; the labels layer on top is transparent
                         className: idx > 0 ? 'geomate-labels' : '',
@@ -1410,9 +1553,9 @@
             var st = googleKeyUI.status;
             if (note !== undefined) { st.textContent = note; st.className = 'gk-status ' + (kind || ''); googleKeyUI.manual = true; }
             else if (!googleKeyUI.manual) {
-                if (!GOOGLE_MAPS_KEY) { st.textContent = 'No key saved: using Esri map tiles.'; st.className = 'gk-status'; }
-                else if (googleFailed) { st.textContent = 'Saved key stopped working. ' + googleError; st.className = 'gk-status bad'; }
-                else { st.textContent = '\u2714 Using Google maps via the ' + (GOOGLE_MODE === 'js' ? 'Maps JavaScript API' : 'Map Tiles API') + ' (key ending \u2026' + GOOGLE_MAPS_KEY.slice(-4) + ').'; st.className = 'gk-status good'; }
+                if (!GOOGLE_MAPS_KEY) { setTextIfChanged(st, 'No key saved: using Esri map tiles.'); st.className = 'gk-status'; }
+                else if (googleFailed) { setTextIfChanged(st, 'Saved key stopped working. ' + googleError); st.className = 'gk-status bad'; }
+                else { setTextIfChanged(st, '\u2714 Using Google maps via the ' + (GOOGLE_MODE === 'js' ? 'Maps JavaScript API' : 'Map Tiles API') + ' (key ending \u2026' + GOOGLE_MAPS_KEY.slice(-4) + ').'); st.className = 'gk-status good'; }
             }
             googleKeyUI.remove.style.display = GOOGLE_MAPS_KEY ? '' : 'none';
         }
@@ -1520,6 +1663,7 @@
 
             // Keep the world filling the whole view: no empty bands at the sides when zoomed out
             map.on('resize', updateMinZoom);
+            map.on('resize', function() { if (themePanel) fitPanelToMap(themePanel.getContainer()); if (homeZipPanel) fitPanelToMap(homeZipPanel.getContainer()); });
             updateMinZoom();
             if (window.ResizeObserver) {
                 new ResizeObserver(function() {
@@ -1530,7 +1674,7 @@
             window.addEventListener('load', function() { map.invalidateSize(); updateMinZoom(); });
             setTimeout(function() { map.invalidateSize(); updateMinZoom(); }, 500);
 
-            map.on('zoom zoomend zoomlevelschange resize moveend', updateLabelVisibility);
+            map.on('zoom zoomend zoomlevelschange resize moveend', scheduleLabelVisibility);
             window.addEventListener('resize', updateLabelVisibility);
             if (window.ResizeObserver) { try { new ResizeObserver(function() { updateLabelVisibility(); }).observe(map.getContainer()); } catch (e) {} }
 
@@ -1590,6 +1734,12 @@
                     themeButton.href = '#';
                     themeButton.title = 'Map colours';
 
+                    var helpButton = L.DomUtil.create('a', 'home-button help-button', container);
+                    helpButton.innerHTML = '?';
+                    helpButton.href = '#';
+                    helpButton.title = 'How Geomate works';
+                    helpButton.setAttribute('aria-label', 'How Geomate works');
+
                     var fullscreenButton = L.DomUtil.create('a', 'home-button fullscreen-button', container);
                     fullscreenButton.innerHTML = '⛶';
                     fullscreenButton.href = '#';
@@ -1601,6 +1751,13 @@
                         L.DomEvent.stop(e);
                         var el = themePanel.getContainer();
                         el.style.display = el.style.display === 'block' ? 'none' : 'block';
+                        fitPanelToMap(el);
+                    });
+
+                    L.DomEvent.on(helpButton, 'click', function(e) {
+                        L.DomEvent.stop(e);
+                        // the LuCI page shows the welcome card again (what Geomate does and doesn't do)
+                        window.parent.postMessage({ type: 'showWelcome' }, '*');
                     });
 
                     L.DomEvent.on(fullscreenButton, 'click', function(e) {
@@ -1770,6 +1927,13 @@
             map.addLayer(drawnItems);
 
             // Initialize drawing controls
+            // Touch screens: Leaflet.draw's own hints say "Click ..."; there it is a tap
+            if (COARSE_POINTER && L.drawLocal) (function tapWords(o) {
+                Object.keys(o).forEach(function(k) {
+                    if (typeof o[k] === 'string') o[k] = o[k].replace(/\bClick\b/g, 'Tap').replace(/\bclick\b/g, 'tap');
+                    else if (o[k] && typeof o[k] === 'object') tapWords(o[k]);
+                });
+            })(L.drawLocal);
             var drawControl = new L.Control.Draw({
                 edit: { featureGroup: drawnItems },
                 draw: {
@@ -1943,12 +2107,27 @@
         }
 
         /**
+         * Keeps a panel opened from the toolbar (colours, home location) inside the map: on a short screen it scrolls
+         * instead of running off the bottom edge, where its last buttons could not be reached.
+         */
+        function fitPanelToMap(el) {
+            if (!el || el.style.display !== 'block' || !map) return;
+            el.style.maxHeight = '';
+            var c = map.getContainer().getBoundingClientRect(), r = el.getBoundingClientRect();
+            if (r.bottom <= c.bottom - 8) return;
+            var cs = getComputedStyle(el);
+            var extra = (el.offsetHeight - el.clientHeight) + parseFloat(cs.paddingTop || 0) + parseFloat(cs.paddingBottom || 0);
+            el.style.maxHeight = Math.max(120, Math.floor(c.bottom - r.top - 8 - extra)) + 'px';
+            el.style.overflowY = 'auto';
+        }
+        /**
          * Shows/hides the ZIP code panel.
          */
         function showHomeZipPanel(show) {
             if (!homeZipPanel) return;
             var el = homeZipPanel.getContainer();
             el.style.display = show ? 'block' : 'none';
+            fitPanelToMap(el);
             if (show) {
                 clearPendingHome();
                 el.querySelector('.hz-status').textContent = '';
@@ -2317,6 +2496,7 @@
                         info.textContent = '';
                         var line = document.createElement('div'); line.textContent = (p.allPlatforms ? '✔ ' : '') + p.platformText; info.appendChild(line);
                         var sm = document.createElement('small'); sm.textContent = p.detail + (p.note ? ' — ' + p.note : ''); info.appendChild(sm);
+                        if (p.required) { var rq = document.createElement('div'); rq.className = 'nd-required'; rq.textContent = '👉 ' + p.required; info.appendChild(rq); }   // a setting it needs
                         if (p.warning) { var wn = document.createElement('div'); wn.className = 'nd-warning'; wn.textContent = '⚠ ' + p.warning; info.appendChild(wn); }
                         info.style.display = '';
                     } else {
@@ -2625,7 +2805,7 @@
             regionEditBar = document.createElement('div');
             regionEditBar.className = 'poly-adjust-bar';
             var label = document.createElement('span');
-            label.textContent = 'Editing "' + name + '": drag the blue dots to reshape. (Delete key removes it, Esc cancels)';
+            label.textContent = 'Editing "' + name + '": drag the blue dots to reshape.' + (COARSE_POINTER ? '' : ' (Delete key removes it, Esc cancels)');
             regionEditBar.appendChild(label);
             if (!isCircle) {
                 var alignBtn = document.createElement('button');
@@ -2738,7 +2918,7 @@
 
             polyAdjustBar = document.createElement('div');
             polyAdjustBar.className = 'poly-adjust-bar';
-            polyAdjustBar.innerHTML = '<span>Click the map to add points, or drag the blue dot to move the last point.</span>' +
+            polyAdjustBar.innerHTML = '<span>' + (COARSE_POINTER ? 'Tap' : 'Click') + ' the map to add points, or drag the blue dot to move the last point.</span>' +
                 '<button type="button" class="pa-align pa-cancel" title="Straighten nearly horizontal / vertical edges">Align</button>' +
                 '<button type="button" class="pa-undo pa-cancel">Undo last point</button>' +
                 '<button type="button" class="pa-ok">Confirm</button>' +
@@ -2934,8 +3114,10 @@
             }
         }
 
-        // Listener for messages from the parent frame
+        // Listener for messages from the parent frame (the Geomate page). Anything else is ignored: another window could
+        // otherwise draw or clear regions here, or send something that isn't a message at all.
         window.addEventListener('message', function(event) {
+            if (event.source !== window.parent || !event.data || typeof event.data !== 'object') return;
             if (event.data.type === 'addRegion') {
                 addRegion(event.data.name, event.data.data);
             } else if (event.data.type === 'setPresets') {
@@ -3039,8 +3221,7 @@
             selectionBar = document.createElement('div');
             selectionBar.className = 'poly-adjust-bar';
             var label = document.createElement('span');
-            var coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
-            label.textContent = coarse ? '"' + name + '" selected: drag it with one finger to move it, or tap Edit to reshape it.'
+            label.textContent = COARSE_POINTER ? '"' + name + '" selected: drag it with one finger to move it, or tap Edit to reshape it.'
                                        : '"' + name + '" selected: press Delete to remove it, drag it to move it, double-click to edit.';
             var edit = document.createElement('button');
             edit.type = 'button'; edit.className = 'pa-ok'; edit.textContent = 'Edit';
