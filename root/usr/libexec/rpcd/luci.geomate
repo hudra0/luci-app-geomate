@@ -96,14 +96,16 @@ local function is_within_any_allowed_region(lat, lon, allowed_regions)
     if not lat or not lon or not allowed_regions then
         return false
     end
+    -- A hand-written 'option allowed_region' arrives as a string
+    if type(allowed_regions) == "string" then
+        allowed_regions = { allowed_regions }
+    end
 
     for _, allowed_region in ipairs(allowed_regions) do
         local region_type, center_lat, center_lon, radius = allowed_region:match("([^:]+):([^:]+):([^:]+):([^:]+)")
-        if region_type == "circle" then
-            center_lat = tonumber(center_lat)
-            center_lon = tonumber(center_lon)
-            radius = tonumber(radius)
-
+        center_lat, center_lon, radius = tonumber(center_lat), tonumber(center_lon), tonumber(radius)
+        -- A region whose numbers do not parse is skipped instead of failing the whole call
+        if region_type == "circle" and center_lat and center_lon and radius then
             -- Haversine formula to calculate distance
             local rad_lat1 = math.rad(lat)
             local rad_lon1 = math.rad(lon)
