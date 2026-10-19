@@ -96,9 +96,10 @@ local function is_within_any_allowed_region(lat, lon, allowed_regions)
     if not lat or not lon or not allowed_regions then
         return false
     end
-    -- A hand-written 'option allowed_region' arrives as a string
-    if type(allowed_regions) == "string" then
-        allowed_regions = { allowed_regions }
+    -- A hand-written 'option allowed_region' arrives as a string. The backend ignores it
+    -- (config_list_foreach reads list entries only), so the map verdict does the same
+    if type(allowed_regions) ~= "table" then
+        return false
     end
 
     for _, allowed_region in ipairs(allowed_regions) do

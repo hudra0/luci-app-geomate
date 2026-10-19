@@ -29,6 +29,12 @@ function formatVersionDisplay(version) {
 // Region strings as the map writes them: circle:<lat>:<lon>:<radius in meters>
 var REGION_RE = /^circle:-?\d{1,2}(\.\d+)?:-?\d{1,3}(\.\d+)?:[1-9]\d*$/;
 
+// Same bounds as parseRegion in map.html, so the map can load every region the view stages
+function validRegion(region) {
+    var p = String(region || '').split(':');
+    return REGION_RE.test(region || '') && Math.abs(p[1]) <= 90 && Math.abs(p[2]) <= 180;
+}
+
 // Filter names the backend supports in nft set and file names (filter_set_name in luci.geomate)
 var FILTER_NAME_RE = /^[\w .-]+$/;
 
@@ -536,6 +542,9 @@ return view.extend({
             var reason = _('Failed to stage the change: %s. Reload the page.').format((err && err.message) || err);
             ui.addNotification(null, E('p', {}, [ reason ]), 'error');
             self.sendMessageToMap('regionRejected', { token: token, reason: reason });
+            // A failed uci.save() keeps its changes in memory; drop them so a later save does not stage them
+            uci.unload('geomate');
+            return L.resolveDefault(uci.load('geomate'));
         });
         return this.busy;
     },
@@ -595,8 +604,8 @@ return view.extend({
         this.sendMessageToMap('regionSaved', Object.assign(this.filterInfo(sid), { token: token, region: region }));
     },
 
-    rejectRegion: function(token, sid) {
-        var reason = _('Region of filter %s not found in the configuration. Reload the page.').format(this.filterName(sid));
+    rejectRegion: function(token, sid, reason) {
+        reason = reason || _('Region of filter %s not found in the configuration. Reload the page.').format(this.filterName(sid));
         ui.addNotification(null, E('p', {}, [ reason ]), 'warning');
         this.sendMessageToMap('regionRejected', { token: token, reason: reason });
     },
@@ -606,7 +615,9 @@ return view.extend({
         var list = this.regionList(sid),
             index = list.indexOf(oldRegion);
 
-        if (index < 0 || !REGION_RE.test(region || ''))
+        if (!validRegion(region))
+            return this.rejectRegion(token, sid, _('Region %s is not a valid circle (radius at least 1 m).').format(region));
+        if (index < 0)
             return this.rejectRegion(token, sid);
 
         list[index] = region;
@@ -642,7 +653,8 @@ return view.extend({
     // Resolves with 'disable', 'keep' or null (cancelled)
     confirmLastRegion: function(sid) {
         var name = this.filterName(sid),
-            enabled = uci.get('geomate', sid, 'enabled') === '1';
+            enabled = uci.get('geomate', sid, 'enabled') === '1',
+            strict = uci.get('geomate', 'global', 'strict_mode') === '1';
 
         return new Promise(function(resolve) {
             var button = function(cls, label, choice) {
@@ -653,9 +665,11 @@ return view.extend({
                 : button('cbi-button-negative', _('Delete region'), 'keep');
 
             ui.showModal(_('Delete the last region of %h?').format(name), [
-                E('p', {}, [ enabled
-                    ? _('Without a region, filter %s allows no geolocated IPs; with strict mode it blocks everything except its allowed IPs.').format(name)
-                    : _('Filter %s is disabled and keeps no region.').format(name) ]),
+                E('p', {}, [ !enabled
+                    ? _('Filter %s is disabled and keeps no region.').format(name)
+                    : strict
+                        ? _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set. Strict mode is on, so the filter blocks all its traffic except its allowed IPs.').format(name)
+                        : _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set, so it blocks no game server (strict mode is off).').format(name) ]),
                 E('div', { 'class': 'right' }, [
                     button('', _('Cancel'), null), ' ',
                     enabled ? button('cbi-button-action', _('Delete, keep filter enabled'), 'keep') : null, ' ',
@@ -675,7 +689,7 @@ return view.extend({
             initial = {},
             sid = null;
 
-        if (!REGION_RE.test(region || ''))
+        if (!validRegion(region))
             return Promise.reject(new Error(_('Invalid region %s').format(region)));
 
         sections.forEach(function(s) {
@@ -797,6 +811,10 @@ return view.extend({
             if (!/^\/etc\/geomate\.d\/[^\/]+$/.test(path) || path == '/etc/geomate.d/..')
                 return dom.content(status, [ _('Choose a filter name or a list file in /etc/geomate.d/ first.') ]);
 
+            // Geo data files and the updater's md5 registries live there too
+            if (/\.(json|md5)$/i.test(path))
+                return dom.content(status, [ _('%s is not an IP list file.').format(path) ]);
+
             fs.stat(path).then(function() {
                 dom.content(status, [
                     _('%s already exists. Replace its content with %s?').format(path, file.name), ' ',
@@ -827,7 +845,21 @@ return view.extend({
         };
 
         var nameNode = nameW.render();
-        nameNode.addEventListener('cbi-dropdown-change', update);
+
+        // LuCI keeps text typed without Enter in the create input when the user then picks a list
+        // entry; clear it on every change so Save never takes it over the chosen filter
+        var clearTyped = function() {
+            var typed = nameNode.querySelector('.create-item-input');
+            if (typed) {
+                typed.value = '';
+                typed.classList.remove('cbi-input-invalid');
+            }
+        };
+
+        nameNode.addEventListener('cbi-dropdown-change', function() {
+            clearTyped();
+            update();
+        });
 
         var body = E('div', { 'class': 'cbi-section-node' }, [ row(_('Filter'), nameNode, [ hint ]) ]);
         Object.keys(fields).forEach(function(k) {
@@ -854,11 +886,16 @@ return view.extend({
             };
 
             var save = function() {
-                // A typed name counts even without Enter
-                var typed = nameNode.querySelector('.create-item-input');
-                if (typed && typed.value.trim()) {
-                    nameW.setValue(typed.value.trim());
-                    typed.value = '';
+                // A typed name counts even without Enter. If it points to another filter, update()
+                // has just shown that filter's settings: keep the dialog open so the user sees them
+                var typed = nameNode.querySelector('.create-item-input'),
+                    text = typed ? typed.value.trim() : '',
+                    target = sid;
+                if (text) {
+                    nameW.setValue(text);
+                    clearTyped();
+                    if (sid !== target)
+                        return;
                 }
 
                 nameW.triggerValidation();

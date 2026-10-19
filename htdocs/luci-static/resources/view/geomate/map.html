@@ -165,10 +165,14 @@
         /*
          * Region identity lives in layer.gm, never in layer.options: Leaflet.draw saves and
          * restores layer.options around every edit session.
-         * gm = { token, sid, name, color, enabled, region, staged, pending, prevRegion }
-         * region is the string stored in UCI; the parent matches regions on it alone.
+         * gm = { token, sid, name, color, enabled, region, stored, inflight, staged, pending }
+         * stored is the string the parent last confirmed for UCI; region is the newest string the
+         * map reported, which the next action names. The parent matches regions on the string
+         * alone and answers the actions in the order they were sent; inflight counts the open ones.
          */
         var circles = {}; // token -> layer, kept until the parent has answered for it
+        // Tokens differ between iframe loads, so a late answer never hits a circle of a new map
+        var tokenPrefix = Math.random().toString(36).slice(2, 10) + '-';
         var toastTimer = null;
 
         // Define specialized icons for different marker types
@@ -189,20 +193,6 @@
             iconSize: [25, 25],
             className: 'custom-div-icon'
         });
-
-        /**
-         * Generates a color based on the provided name.
-         * @param {string} name - The name to generate a color for.
-         * @returns {string} - A hex color code.
-         */
-        function getColorForName(name) {
-            var colors = ['#FF5733', '#33FF57', '#3357FF', '#FF33F1', '#33FFF1', '#F1FF33', '#FF8C33', '#8C33FF', '#33FFAF', '#FF3367'];
-            var hash = 0;
-            for (var i = 0; i < name.length; i++) {
-                hash = name.charCodeAt(i) + ((hash << 5) - hash);
-            }
-            return colors[Math.abs(hash) % colors.length];
-        }
 
         var connectionMarkers = {};
         var activeConnectionIPs = {}; // Set of active connection IPs
@@ -530,8 +520,18 @@
          * @returns {string} - circle:<lat>:<lon>:<radius in meters>
          */
         function regionString(layer) {
-            var center = layer.getLatLng();
+            var center = layer.getLatLng().wrap();
             return 'circle:' + center.lat.toFixed(8) + ':' + center.lng.toFixed(8) + ':' + Math.round(layer.getRadius());
+        }
+
+        /**
+         * Moves a circle drawn or dragged past the antimeridian back into -180..180,
+         * where its region string puts it on the next load.
+         * @param {Object} layer - The circle layer.
+         */
+        function wrapCenter(layer) {
+            var center = layer.getLatLng(), wrapped = center.wrap();
+            if (wrapped.lng !== center.lng) layer.setLatLng(wrapped);
         }
 
         /**
@@ -555,7 +555,7 @@
          * @param {Object} layer - The circle layer.
          */
         function applyLook(layer) {
-            var gm = layer.gm, color = gm.color || getColorForName(gm.name || ''), tags = [];
+            var gm = layer.gm, color = gm.color, tags = [];
             var label = document.createElement('span');
 
             if (gm.pending) {
@@ -596,12 +596,14 @@
 
             var layer = L.circle([c.lat, c.lng], { radius: c.radius });
             layer.gm = {
-                token: L.stamp(layer),
+                token: tokenPrefix + L.stamp(layer),
                 sid: filter.sid,
                 name: filter.name,
                 color: filter.color,
                 enabled: !!filter.enabled,
                 region: region,
+                stored: region,
+                inflight: 0,
                 staged: staged
             };
             circles[layer.gm.token] = layer;
@@ -654,7 +656,8 @@
          */
         function onDrawCreated(event) {
             var layer = event.layer;
-            layer.gm = { token: L.stamp(layer), sid: null, name: '', region: regionString(layer), pending: true };
+            wrapCenter(layer);
+            layer.gm = { token: tokenPrefix + L.stamp(layer), sid: null, name: '', region: regionString(layer), pending: true };
             circles[layer.gm.token] = layer;
             applyLook(layer);
             drawnItems.addLayer(layer);
@@ -662,35 +665,42 @@
         }
 
         /**
-         * Reports moved or resized circles with the string they were stored with.
-         * @param {Object} event - The edit event object.
+         * Reports a moved or resized circle with the string the parent knows it by.
+         * Optimistic: a second edit before the answer names the new string.
+         * @param {Object} layer - The circle layer.
          */
-        function onDrawEdited(event) {
-            event.layers.eachLayer(function(layer) {
-                var gm = layer.gm, region;
-                // A pending circle belongs to the open filter dialog
-                if (!gm || gm.pending) return;
+        function reportEdit(layer) {
+            var gm = layer.gm, oldRegion = gm.region, region;
+            wrapCenter(layer);
+            region = regionString(layer);
+            if (region === oldRegion) return;
 
-                region = regionString(layer);
-                if (region === gm.region) return;
-
-                // Optimistic: a second edit before the answer must name the new string
-                gm.prevRegion = gm.region;
-                gm.region = region;
-                post('regionEdited', { token: gm.token, sid: gm.sid, oldRegion: gm.prevRegion, region: region });
-            });
+            gm.region = region;
+            gm.inflight++;
+            post('regionEdited', { token: gm.token, sid: gm.sid, oldRegion: oldRegion, region: region });
         }
 
         /**
-         * Reports deleted circles. Leaflet.draw has already removed them from drawnItems;
-         * circles keeps them so a rejected delete can put them back.
-         * @param {Object} event - The delete event object.
+         * Reports a deleted circle. Leaflet.draw has already removed it from drawnItems;
+         * circles keeps it so a rejected delete can put it back.
+         * @param {Object} layer - The circle layer.
          */
+        function reportDelete(layer) {
+            var gm = layer.gm;
+            gm.inflight++;
+            post('regionDeleted', { token: gm.token, sid: gm.sid, oldRegion: gm.region });
+        }
+
+        // A pending circle belongs to the open filter dialog; regionSaved reports its changes
+        function onDrawEdited(event) {
+            event.layers.eachLayer(function(layer) {
+                if (layer.gm && !layer.gm.pending) reportEdit(layer);
+            });
+        }
+
         function onDrawDeleted(event) {
             event.layers.eachLayer(function(layer) {
-                var gm = layer.gm;
-                if (!gm || gm.pending) return;
-                post('regionDeleted', { token: gm.token, sid: gm.sid, oldRegion: gm.region });
+                if (layer.gm && !layer.gm.pending) reportDelete(layer);
             });
         }
 
@@ -700,32 +710,44 @@
          * @param {Object} d - The message data, always with a token.
          */
         function onRegionAnswer(type, d) {
-            var layer = circles[d.token], c;
-            if (!layer) return;
+            var layer = circles[d.token], gm = layer && layer.gm, c;
+            if (!gm) return;
 
-            if (type === 'regionSaved') {
-                layer.gm.sid = d.sid;
-                layer.gm.region = d.region;
-                layer.gm.pending = false;
-                delete layer.gm.prevRegion;
-                updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled, staged: true });
-            } else if (type === 'regionRemoved') {
-                forget(d.token);
-                updateFilter(layer.gm.sid, { staged: true });
-            } else if (type === 'regionDiscarded' || layer.gm.pending) {
-                forget(d.token);
+            if (gm.pending) {
+                if (type !== 'regionSaved') {
+                    forget(d.token);
+                } else {
+                    L.extend(gm, { sid: d.sid, region: d.region, stored: d.region, inflight: 0, pending: false });
+                    updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled, staged: true });
+                    // Moved or deleted while the parent was staging it
+                    if (drawnItems.hasLayer(layer)) {
+                        reportEdit(layer);
+                    } else {
+                        reportDelete(layer);
+                    }
+                }
             } else {
-                // regionRejected: back to the stored geometry, and back on the map after a delete
-                if (layer.gm.prevRegion) {
-                    layer.gm.region = layer.gm.prevRegion;
-                    delete layer.gm.prevRegion;
+                gm.inflight--;
+                if (type === 'regionRemoved') {
+                    forget(d.token);
+                    updateFilter(gm.sid, { staged: true });
+                } else if (type === 'regionSaved') {
+                    gm.stored = d.region;
+                    updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled, staged: true });
+                } else if (!drawnItems.hasLayer(layer)) {
+                    // regionRejected after a delete: back on the map
+                    drawnItems.addLayer(layer);
                 }
-                c = parseRegion(layer.gm.region);
-                if (c) {
-                    layer.setLatLng([c.lat, c.lng]);
-                    layer.setRadius(c.radius);
+
+                // With every answer in, the circle shows what UCI holds
+                if (!gm.inflight && circles[d.token] && gm.region !== gm.stored) {
+                    gm.region = gm.stored;
+                    c = parseRegion(gm.stored);
+                    if (c) {
+                        layer.setLatLng([c.lat, c.lng]);
+                        layer.setRadius(c.radius);
+                    }
                 }
-                if (!drawnItems.hasLayer(layer)) drawnItems.addLayer(layer);
             }
 
             if (type === 'regionRejected' && d.reason) showToast(d.reason);
