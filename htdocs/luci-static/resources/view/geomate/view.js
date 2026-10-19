@@ -63,16 +63,18 @@ function errorText(err) {
     return String((err && err.message) || err).split('\n')[0];
 }
 
-// Declare RPC methods to interact with the Geomate backend. Whitelisted IPs reach the map through
-// getGeomateConnections (is_allowed_ip): the map shows only IPs with an active connection
+// Declare RPC methods to interact with the Geomate backend. reject: a ubus error (script crash or
+// timeout, missing method, no permission) rejects instead of resolving to the expect default, so
+// L.resolveDefault() gives null: the connection list stays as it was, the status shows "unknown".
+// Whitelisted IPs reach the map through getGeomateConnections (is_allowed_ip): the map shows only
+// IPs with an active connection
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
     method: 'getGeomateConnections',
-    expect: { connections: [] }
+    expect: { connections: [] },
+    reject: true
 });
 
-// reject: a ubus error (script crash, missing method, no permission) rejects instead of resolving
-// to the expect default {}, so L.resolveDefault() gives null and the page shows "Status unknown"
 var callGetStatus = rpc.declare({
     object: 'luci.geomate',
     method: 'getStatus',
@@ -111,21 +113,23 @@ return view.extend({
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
     status: null,       // last getStatus result, null when it failed
+    statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
     nodes: null,        // nodes that the polls update in place
     pollFns: null,      // bound poll functions; poll.add() and poll.remove() match them by identity
     connectionsBusy: null,  // running getGeomateConnections request
+    statusBusy: null,       // running status request
     versionBusy: null,      // running check_version request
 
-    // Each call may fail on its own; the page then renders with what it got
+    // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
+    // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
+    // the status. Each call may fail on its own; the page then renders with what it got
     load: function() {
         this.reported = {};
         return Promise.all([
             L.resolveDefault(uci.load('geomate'), null),
-            L.resolveDefault(callGetStatus(), null),
-            L.resolveDefault(callGetHealthCheck(), null),
             L.resolveDefault(callUciChanges(), {})
         ]);
     },
@@ -134,9 +138,7 @@ return view.extend({
     render: function(data) {
         var configLoaded = data[0] != null;
 
-        this.status = data[1];
-        this.health = data[2];
-        this.pending = data[3] || {};
+        this.pending = data[1] || {};
         // hasViewPermission() is what the footer uses without a form.Map to disable its buttons
         this.readonly = !L.hasViewPermission() || !configLoaded;
         this.nodes = {};
@@ -313,7 +315,8 @@ return view.extend({
             return;
 
         n.indicator.style.backgroundColor = st ? (running ? 'green' : 'red') : 'gray';
-        n.state.textContent = st ? (running ? _('Running') : _('Not Running')) : _('Status unknown');
+        n.state.textContent = st ? (running ? _('Running') : _('Not Running'))
+            : (this.statusLoaded ? _('Status unknown') : _('Loading status...'));
         n.loading.style.display = (st ? st.loading : (this.health && this.health.loading)) ? 'inline' : 'none';
 
         // Compact health check display; messages stay text, never markup
@@ -362,7 +365,8 @@ return view.extend({
 
     // Polls are added once, after the first render, as bound functions: poll.add() skips only a
     // function it already has. poll runs a function when its global tick is a multiple of the
-    // interval, so the first connections and version requests are sent here; load() brought the status
+    // interval, so the first requests of all three are sent here (the busy guards let a poll that
+    // starts at tick 0 share them)
     startPolls: function() {
         if (this.pollFns)
             return;
@@ -379,6 +383,7 @@ return view.extend({
         poll.add(this.pollFns.version, VERSION_INTERVAL);
 
         this.pollConnections();
+        this.pollStatus();
         this.checkForUpdates();
 
         document.addEventListener('visibilitychange', L.bind(this.handleVisibilityChange, this));
@@ -396,19 +401,27 @@ return view.extend({
         }
     },
 
+    // One request at a time, like pollConnections()
     pollStatus: function() {
         var self = this;
-        return Promise.all([
-            L.resolveDefault(callGetStatus(), null),
-            L.resolveDefault(callGetHealthCheck(), null),
-            L.resolveDefault(callUciChanges(), null)
-        ]).then(function(r) {
-            self.status = r[0];
-            self.health = r[1];
-            if (r[2])
-                self.pending = r[2];
-            self.updateStatus();
-        });
+
+        if (!this.statusBusy)
+            this.statusBusy = Promise.all([
+                L.resolveDefault(callGetStatus(), null),
+                L.resolveDefault(callGetHealthCheck(), null),
+                L.resolveDefault(callUciChanges(), null)
+            ]).then(function(r) {
+                self.status = r[0];
+                self.health = r[1];
+                self.statusLoaded = true;
+                if (r[2])
+                    self.pending = r[2];
+                self.updateStatus();
+            }).finally(function() {
+                self.statusBusy = null;
+            });
+
+        return this.statusBusy;
     },
 
     // One request at a time: a direct call while the poll's request runs shares it
