@@ -71,16 +71,30 @@ var callGeomateConnections = rpc.declare({
     expect: { connections: [] }
 });
 
+// reject: a ubus error (script crash, missing method, no permission) rejects instead of resolving
+// to the expect default {}, so L.resolveDefault() gives null and the page shows "Status unknown"
 var callGetStatus = rpc.declare({
     object: 'luci.geomate',
     method: 'getStatus',
-    expect: { status: {} }
+    expect: { status: {} },
+    reject: true,
+    filter: function(st) { return (typeof st.running == 'boolean') ? st : null; }
 });
 
 var callGetHealthCheck = rpc.declare({
     object: 'luci.geomate',
     method: 'getHealthCheck',
-    expect: { health: {} }
+    expect: { health: {} },
+    reject: true
+});
+
+// Staged changes of this session. Unlike uci.changes(), a ubus error rejects instead of
+// resolving to {}, which would look like "nothing staged"
+var callUciChanges = rpc.declare({
+    object: 'uci',
+    method: 'changes',
+    expect: { changes: {} },
+    reject: true
 });
 
 // Poll intervals in seconds
@@ -92,7 +106,7 @@ return view.extend({
     // Every region action stages at once: there is nothing left for a Save button to do
     handleSave: null,
 
-    pending: {},        // last uci.changes() result
+    pending: {},        // last staged changes (callUciChanges)
     busy: null,         // promise chain that serializes region actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
@@ -112,7 +126,7 @@ return view.extend({
             L.resolveDefault(uci.load('geomate'), null),
             L.resolveDefault(callGetStatus(), null),
             L.resolveDefault(callGetHealthCheck(), null),
-            L.resolveDefault(uci.changes(), {})
+            L.resolveDefault(callUciChanges(), {})
         ]);
     },
 
@@ -387,7 +401,7 @@ return view.extend({
         return Promise.all([
             L.resolveDefault(callGetStatus(), null),
             L.resolveDefault(callGetHealthCheck(), null),
-            L.resolveDefault(uci.changes(), null)
+            L.resolveDefault(callUciChanges(), null)
         ]).then(function(r) {
             self.status = r[0];
             self.health = r[1];
@@ -536,9 +550,10 @@ return view.extend({
     stage: function() {
         var self = this;
         return uci.save().then(function() {
-            return L.resolveDefault(uci.changes(), {});
+            return L.resolveDefault(callUciChanges(), null);
         }).then(function(changes) {
-            self.pending = changes || {};
+            if (changes)
+                self.pending = changes;
             self.updateStatus();
         });
     },
@@ -985,7 +1000,7 @@ return view.extend({
     handleReset: function(ev) {
         var self = this;
 
-        return L.resolveDefault(uci.changes(), null).then(function(changes) {
+        return L.resolveDefault(callUciChanges(), null).then(function(changes) {
             if (changes) {
                 self.pending = changes;
                 self.updateStatus();
