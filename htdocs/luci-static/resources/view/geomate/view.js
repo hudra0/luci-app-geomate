@@ -586,7 +586,7 @@ return view.extend({
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
                 if (typeof s.allowed_region == 'string')
-                    self.warnOnce(s['.name'] + ' option', _('Filter %s has a region written as "option allowed_region" (%s) instead of "list allowed_region". geomate ignores it at service start and applies it only to IPs collected until the next restart; the map does not show it. Redraw it on the map or fix it on the Geo Filters page; a region drawn for this filter replaces it.')
+                    self.warnOnce(s['.name'] + ' option', _('Filter %s has a region written as "option allowed_region" (%s) instead of "list allowed_region". geomate ignores it at service start; only the periodic harvest applies it (to all geolocated IPs of the filter, after new IPs arrive) until the next restart, and the map does not show it. Redraw it on the map or fix it on the Geo Filters page; a region drawn for this filter replaces it.')
                         .format(s.name || s['.name'], s.allowed_region));
                 return Object.assign(self.filterInfo(s['.name']), { regions: self.regionList(s['.name']) });
             }),
@@ -682,14 +682,15 @@ return view.extend({
             var preferred = enabled
                 ? button('cbi-button-negative', _('Delete and disable filter'), 'disable')
                 : button('cbi-button-negative', _('Delete region'), 'keep');
+            // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
+            var buttons = [ button('', _('Cancel'), null), ' ' ];
+            if (enabled)
+                buttons.push(button('cbi-button-action', _('Delete, keep filter enabled'), 'keep'), ' ');
+            buttons.push(preferred);
 
             ui.showModal(_('Delete the last region of %h?').format(name), [
                 E('p', {}, [ effect.format(name) ]),
-                E('div', { 'class': 'right' }, [
-                    button('', _('Cancel'), null), ' ',
-                    enabled ? button('cbi-button-action', _('Delete, keep filter enabled'), 'keep') : null, ' ',
-                    preferred
-                ])
+                E('div', { 'class': 'right' }, buttons)
             ]);
             preferred.focus();
         });
@@ -836,14 +837,15 @@ return view.extend({
             }
 
             fields.ip_list.node.querySelector('input').placeholder = suggestedList();
-            dom.content(hint, (!name || (!sec && !FILTER_NAME_RE.test(name))) ? null : [ !sec
+            // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
+            var hintText = [ !sec
                 ? _('A new filter %s will be created.').format(name)
                 : (sec.enabled === '1')
                     ? _('The region will be added to filter %s.').format(sec.name)
-                    : _('The region will be added to filter %s, which is disabled.').format(sec.name),
-                (sec && typeof sec.allowed_region == 'string')
-                    ? ' ' + _('It replaces the hand-written "option allowed_region" (%s).').format(sec.allowed_region)
-                    : null ]);
+                    : _('The region will be added to filter %s, which is disabled.').format(sec.name) ];
+            if (sec && typeof sec.allowed_region == 'string')
+                hintText.push(' ' + _('It replaces the hand-written "option allowed_region" (%s).').format(sec.allowed_region));
+            dom.content(hint, (!name || (!sec && !FILTER_NAME_RE.test(name))) ? null : hintText);
 
             var owner = name ? listOwner() : null;
             dom.content(listHint, owner ? [ _('%s is already the IP list of filter %s; both filters would share it.')
