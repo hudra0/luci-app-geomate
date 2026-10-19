@@ -96,8 +96,9 @@ local function is_within_any_allowed_region(lat, lon, allowed_regions)
     if not lat or not lon or not allowed_regions then
         return false
     end
-    -- A hand-written 'option allowed_region' arrives as a string. The backend ignores it
-    -- (config_list_foreach reads list entries only), so the map verdict does the same
+    -- A hand-written 'option allowed_region' arrives as a string. The service start ignores it
+    -- (config_list_foreach reads list entries only), so the map verdict does the same; only the
+    -- harvest between restarts applies it (config_get in process_dynamic_set)
     if type(allowed_regions) ~= "table" then
         return false
     end

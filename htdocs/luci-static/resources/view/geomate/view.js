@@ -59,16 +59,6 @@ function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
 }
 
-// Notification banner that disappears on its own (addTimeLimitedNotification is missing in LuCI 23.05)
-function notify(text, cls) {
-    var node;
-    if (typeof ui.addTimeLimitedNotification == 'function')
-        return ui.addTimeLimitedNotification(null, E('p', {}, [ text ]), 8000, cls || 'info');
-    node = ui.addNotification(null, E('p', {}, [ text ]), cls || 'info');
-    window.setTimeout(function() { node.classList.add('fade-out'); }, 8000);
-    return node;
-}
-
 // Declare RPC methods to interact with the Geomate backend
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
@@ -569,16 +559,17 @@ return view.extend({
         };
     },
 
-    // Show a warning about a filter's regions once per page load
+    // Show a warning about a filter's regions once per page load. It stays until dismissed:
+    // the user may act on it only later, when drawing a region for that filter
     warnOnce: function(key, text) {
         if (this.reported[key])
             return;
         this.reported[key] = true;
-        notify(text, 'warning');
+        ui.addNotification(null, E('p', {}, [ text ]), 'warning');
     },
 
-    // Copy of a filter's region list. The backend and luci.geomate read only 'list allowed_region',
-    // so a hand-written 'option allowed_region' (a string) counts as no region
+    // Copy of a filter's region list. A hand-written 'option allowed_region' (a string) counts as
+    // no region: the service start and luci.geomate read only 'list allowed_region'
     regionList: function(sid) {
         var v = sid ? uci.get('geomate', sid, 'allowed_region') : null;
         return Array.isArray(v) ? v.slice() : [];
@@ -595,7 +586,7 @@ return view.extend({
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
                 if (typeof s.allowed_region == 'string')
-                    self.warnOnce(s['.name'] + ' option', _('Filter %s has a region written as "option allowed_region" (%s), which geomate ignores, so it is not shown on the map. Redraw it on the map or fix it on the Geo Filters page; a region drawn for this filter replaces it.')
+                    self.warnOnce(s['.name'] + ' option', _('Filter %s has a region written as "option allowed_region" (%s) instead of "list allowed_region". geomate ignores it at service start and applies it only to IPs collected until the next restart; the map does not show it. Redraw it on the map or fix it on the Geo Filters page; a region drawn for this filter replaces it.')
                         .format(s.name || s['.name'], s.allowed_region));
                 return Object.assign(self.filterInfo(s['.name']), { regions: self.regionList(s['.name']) });
             }),
@@ -817,8 +808,17 @@ return view.extend({
             });
         };
 
+        // Another filter that already uses the list this filter would get (names can share a slug)
+        var listOwner = function() {
+            var path = value('ip_list') || suggestedList(), sec = target();
+            return !path ? null : uci.sections('geomate', 'geo_filter').find(function(s) {
+                return (!sec || s['.name'] !== sec['.name']) && s.ip_list === path;
+            }) || null;
+        };
+
         var hint = E('div', { 'class': 'cbi-value-description' }),
-            status = E('div', { 'class': 'cbi-value-description' });
+            status = E('div', { 'class': 'cbi-value-description' }),
+            listHint = E('div', { 'class': 'cbi-value-description' });
 
         var nameNode = E('div', { 'style': 'margin-top: 8px' }, [ nameW.render() ]);
 
@@ -840,7 +840,14 @@ return view.extend({
                 ? _('A new filter %s will be created.').format(name)
                 : (sec.enabled === '1')
                     ? _('The region will be added to filter %s.').format(sec.name)
-                    : _('The region will be added to filter %s, which is disabled.').format(sec.name) ]);
+                    : _('The region will be added to filter %s, which is disabled.').format(sec.name),
+                (sec && typeof sec.allowed_region == 'string')
+                    ? ' ' + _('It replaces the hand-written "option allowed_region" (%s).').format(sec.allowed_region)
+                    : null ]);
+
+            var owner = name ? listOwner() : null;
+            dom.content(listHint, owner ? [ _('%s is already the IP list of filter %s; both filters would share it.')
+                .format(value('ip_list') || suggestedList(), owner.name || owner['.name']) ] : null);
         };
 
         var writeList = function(path, file) {
@@ -850,6 +857,7 @@ return view.extend({
             }).then(function() {
                 fields.ip_list.setValue(path);
                 dom.content(status, [ _('Uploaded %s to %s.').format(file.name, path) ]);
+                update();
             }).catch(function(err) {
                 dom.content(status, [ _('Failed to upload file: %s').format(err.message) ]);
             });
@@ -909,13 +917,16 @@ return view.extend({
                             return dom.content(status, [ _('Please specify a filter name first.') ]);
                         fields.ip_list.setValue(suggestedList());
                         dom.content(status, [ _('The service creates the list file at its next start if it does not exist.') ]);
+                        update();
                     } }, [ _('Create Empty List') ]), ' ',
                     E('button', { 'class': 'btn cbi-button-action', 'click': function() { fileInput.click(); } }, [ _('Upload IP List') ]),
                     fileInput
                 ]),
-                status
+                status,
+                listHint
             ]));
         });
+        fields.ip_list.node.querySelector('input').addEventListener('input', update);
 
         return new Promise(function(resolve) {
             var cancel = function() {
