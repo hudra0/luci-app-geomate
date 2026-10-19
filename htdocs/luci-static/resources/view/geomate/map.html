@@ -656,6 +656,11 @@
          */
         function onDrawCreated(event) {
             var layer = event.layer;
+            // A click without a drag gives a circle that UCI cannot store (radius 0 m)
+            if (Math.round(layer.getRadius()) < 1) {
+                showToast('Drag to set a radius. No region was added.');
+                return;
+            }
             wrapCenter(layer);
             layer.gm = { token: tokenPrefix + L.stamp(layer), sid: null, name: '', region: regionString(layer), pending: true };
             circles[layer.gm.token] = layer;
@@ -764,6 +769,8 @@
                 updateConnections(data || []);
             } else if (type === 'updateAllowedIPs') {
                 updateAllowedIPsUI(data || []);
+            } else if (type === 'toast' && data && data.text) {
+                showToast(String(data.text));
             } else if (/^region(Saved|Removed|Discarded|Rejected)$/.test(type) && data) {
                 onRegionAnswer(type, data);
             }

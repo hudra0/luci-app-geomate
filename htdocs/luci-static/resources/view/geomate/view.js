@@ -119,9 +119,11 @@ return view.extend({
     allowedIPsData: [],
     pending: {},        // last uci.changes() result
     busy: null,         // promise chain that serializes region actions
+    reported: {},       // region problems already shown, so a new map iframe does not repeat them
 
     // Load initial data required for the view
     load: function() {
+        this.reported = {};
         return Promise.all([
             uci.load('geomate'),
             callGeomateConnections(),
@@ -527,8 +529,8 @@ return view.extend({
                 self.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
                 break;
             case 'regionInvalid':
-                notify(_('Filter %s has an invalid region "%s". It is not shown on the map.')
-                    .format(self.filterName(d.sid), d.region), 'warning');
+                self.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid region "%s". It is not shown on the map.')
+                    .format(self.filterName(d.sid), d.region));
                 break;
             }
         }, false);
@@ -567,9 +569,19 @@ return view.extend({
         };
     },
 
-    // Copy of a filter's region list; an 'option allowed_region' becomes a one-element list
+    // Show a warning about a filter's regions once per page load
+    warnOnce: function(key, text) {
+        if (this.reported[key])
+            return;
+        this.reported[key] = true;
+        notify(text, 'warning');
+    },
+
+    // Copy of a filter's region list. The backend and luci.geomate read only 'list allowed_region',
+    // so a hand-written 'option allowed_region' (a string) counts as no region
     regionList: function(sid) {
-        return sid ? L.toArray(uci.get('geomate', sid, 'allowed_region')).slice() : [];
+        var v = sid ? uci.get('geomate', sid, 'allowed_region') : null;
+        return Array.isArray(v) ? v.slice() : [];
     },
 
     // Send every filter to the map, also disabled ones; done once per mapReady
@@ -582,21 +594,26 @@ return view.extend({
 
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
-                return Object.assign(self.filterInfo(s['.name']), { regions: L.toArray(s.allowed_region) });
+                if (typeof s.allowed_region == 'string')
+                    self.warnOnce(s['.name'] + ' option', _('Filter %s has a region written as "option allowed_region" (%s), which geomate ignores, so it is not shown on the map. Redraw it on the map or fix it on the Geo Filters page; a region drawn for this filter replaces it.')
+                        .format(s.name || s['.name'], s.allowed_region));
+                return Object.assign(self.filterInfo(s['.name']), { regions: self.regionList(s['.name']) });
             }),
             stagedSids: Object.keys(staged)
         });
     },
 
-    // Stage the in-memory changes in the LuCI session and say what that means
+    // Stage the in-memory changes in the LuCI session and say what that means. The note is a
+    // toast inside the map: a LuCI notification would push the page and the map toolbar down
     stage: function() {
         var self = this;
         return uci.save().then(function() {
             return L.resolveDefault(uci.changes(), {});
         }).then(function(changes) {
             self.pending = changes || {};
-            if (!self.stagedNote || !self.stagedNote.parentNode)
-                self.stagedNote = notify(_('Change staged. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.'));
+            self.sendMessageToMap('toast', {
+                text: _('Change staged. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.')
+            });
         });
     },
 
@@ -654,7 +671,18 @@ return view.extend({
     confirmLastRegion: function(sid) {
         var name = this.filterName(sid),
             enabled = uci.get('geomate', sid, 'enabled') === '1',
-            strict = uci.get('geomate', 'global', 'strict_mode') === '1';
+            monitor = (uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor',
+            strict = uci.get('geomate', 'global', 'strict_mode') === '1',
+            effect;
+
+        if (!enabled)
+            effect = _('Filter %s is disabled and keeps no region.');
+        else if (monitor)
+            effect = _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set. Geomate runs in monitor mode and blocks no traffic.');
+        else if (strict)
+            effect = _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set. Strict mode is on, so the filter blocks all its traffic except its allowed IPs.');
+        else
+            effect = _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set, so it blocks no game server (strict mode is off).');
 
         return new Promise(function(resolve) {
             var button = function(cls, label, choice) {
@@ -665,11 +693,7 @@ return view.extend({
                 : button('cbi-button-negative', _('Delete region'), 'keep');
 
             ui.showModal(_('Delete the last region of %h?').format(name), [
-                E('p', {}, [ !enabled
-                    ? _('Filter %s is disabled and keeps no region.').format(name)
-                    : strict
-                        ? _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set. Strict mode is on, so the filter blocks all its traffic except its allowed IPs.').format(name)
-                        : _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set, so it blocks no game server (strict mode is off).').format(name) ]),
+                E('p', {}, [ effect.format(name) ]),
                 E('div', { 'class': 'right' }, [
                     button('', _('Cancel'), null), ' ',
                     enabled ? button('cbi-button-action', _('Delete, keep filter enabled'), 'keep') : null, ' ',
@@ -684,8 +708,9 @@ return view.extend({
     // until this modal ends with regionSaved, regionDiscarded or regionRejected
     openFilterModal: function(token, region) {
         var self = this,
-            sections = uci.sections('geomate', 'geo_filter'),
-            choices = {},
+            sections = uci.sections('geomate', 'geo_filter').filter(function(s) { return s.name; }),
+            NEW = '+new',   // no UCI section id contains '+'
+            choices = { '': _('-- Please choose --') },
             initial = {},
             sid = null;
 
@@ -693,21 +718,29 @@ return view.extend({
             return Promise.reject(new Error(_('Invalid region %s').format(region)));
 
         sections.forEach(function(s) {
-            if (s.name)
-                choices[s.name] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
+            choices[s['.name']] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
         });
+        choices[NEW] = _('New filter…');
 
         // Existing filter names match without regard to case
         var findFilter = function(name) {
             name = name.toLowerCase();
-            return sections.find(function(s) { return (s.name || '').toLowerCase() === name; }) || null;
+            return sections.find(function(s) { return s.name.toLowerCase() === name; }) || null;
         };
 
-        var nameW = new ui.Combobox('', choices, {
-            custom_placeholder: _('New filter name'),
+        // Every filter in config order, then 'New filter…'; without filters the name field shows at once
+        var filterW = new ui.Select(sections.length ? '' : NEW, choices, {
+            sort: [ '' ].concat(sections.map(function(s) { return s['.name']; }), [ NEW ])
+        });
+
+        var nameW = new ui.Textfield('', {
+            optional: false,
+            placeholder: _('New filter name'),
             validate: function(v) {
                 v = (v || '').trim();
-                return v === '' || FILTER_NAME_RE.test(v) || _('Use only letters, digits, spaces, "_", "." and "-"');
+                if (v === '')
+                    return _('Expecting: %s').format(_('non-empty value'));
+                return FILTER_NAME_RE.test(v) || _('Use only letters, digits, spaces, "_", "." and "-"');
             }
         });
 
@@ -743,13 +776,26 @@ return view.extend({
             return Array.isArray(v) ? v.filter(function(x) { return x.trim() !== ''; }) : String(v == null ? '' : v).trim();
         };
 
+        var isNew = function() {
+            return filterW.getValue() === NEW;
+        };
+
+        // The filter the region goes to: the picked one, or an existing one the typed name matches
+        var target = function() {
+            var picked = filterW.getValue(), typed = (nameW.getValue() || '').trim();
+            if (picked === NEW)
+                return typed ? findFilter(typed) : null;
+            return sections.find(function(s) { return s['.name'] === picked; }) || null;
+        };
+
         var currentName = function() {
-            return (nameW.getValue() || '').trim();
+            var sec = target();
+            return sec ? sec.name : isNew() ? (nameW.getValue() || '').trim() : '';
         };
 
         var suggestedList = function() {
-            var name = currentName(), sec = name ? findFilter(name) : null;
-            return name ? ipListPath(sec ? sec.name : name) : '';
+            var name = currentName();
+            return name ? ipListPath(name) : '';
         };
 
         // Show the settings of the chosen filter, or the defaults for a new one
@@ -774,10 +820,15 @@ return view.extend({
         var hint = E('div', { 'class': 'cbi-value-description' }),
             status = E('div', { 'class': 'cbi-value-description' });
 
+        var nameNode = E('div', { 'style': 'margin-top: 8px' }, [ nameW.render() ]);
+
+        // Show the name field for a new filter, and the settings of the filter the region goes to
         var update = function() {
             var name = currentName(),
-                sec = name ? findFilter(name) : null,
+                sec = target(),
                 secId = sec ? sec['.name'] : null;
+
+            nameNode.style.display = isNew() ? '' : 'none';
 
             if (secId !== sid) {
                 sid = secId;
@@ -785,7 +836,7 @@ return view.extend({
             }
 
             fields.ip_list.node.querySelector('input').placeholder = suggestedList();
-            dom.content(hint, !name ? null : [ !sec
+            dom.content(hint, (!name || (!sec && !FILTER_NAME_RE.test(name))) ? null : [ !sec
                 ? _('A new filter %s will be created.').format(name)
                 : (sec.enabled === '1')
                     ? _('The region will be added to filter %s.').format(sec.name)
@@ -844,24 +895,12 @@ return view.extend({
             ]);
         };
 
-        var nameNode = nameW.render();
+        var filterNode = filterW.render();
+        filterNode.addEventListener('widget-change', update);
+        // 'input' also covers paste and autofill, which fire no keyup
+        nameNode.querySelector('input').addEventListener('input', update);
 
-        // LuCI keeps text typed without Enter in the create input when the user then picks a list
-        // entry; clear it on every change so Save never takes it over the chosen filter
-        var clearTyped = function() {
-            var typed = nameNode.querySelector('.create-item-input');
-            if (typed) {
-                typed.value = '';
-                typed.classList.remove('cbi-input-invalid');
-            }
-        };
-
-        nameNode.addEventListener('cbi-dropdown-change', function() {
-            clearTyped();
-            update();
-        });
-
-        var body = E('div', { 'class': 'cbi-section-node' }, [ row(_('Filter'), nameNode, [ hint ]) ]);
+        var body = E('div', { 'class': 'cbi-section-node' }, [ row(_('Filter'), filterNode, [ nameNode, hint ]) ]);
         Object.keys(fields).forEach(function(k) {
             body.appendChild(row(labels[k], fields[k].render(), (k != 'ip_list') ? null : [
                 E('div', { 'style': 'margin-top: 8px' }, [
@@ -886,27 +925,21 @@ return view.extend({
             };
 
             var save = function() {
-                // A typed name counts even without Enter. If it points to another filter, update()
-                // has just shown that filter's settings: keep the dialog open so the user sees them
-                var typed = nameNode.querySelector('.create-item-input'),
-                    text = typed ? typed.value.trim() : '',
-                    target = sid;
-                if (text) {
-                    nameW.setValue(text);
-                    clearTyped();
-                    if (sid !== target)
-                        return;
-                }
+                // The fields already show the target filter: update() runs on every pick and keystroke
+                var picked = filterW.getValue(), sec = target(), name = currentName();
 
-                nameW.triggerValidation();
                 Object.keys(fields).forEach(function(k) { fields[k].triggerValidation(); });
+                if (isNew())
+                    nameW.triggerValidation();
 
-                var name = currentName();
-                if (!name)
-                    dom.content(hint, [ _('Choose a filter or enter a new name.') ]);
+                if (!picked)
+                    dom.content(hint, [ _('Choose a filter or "New filter…".') ]);
 
-                if (!name || !nameW.isValid() || body.querySelector('.cbi-input-invalid') ||
-                    Object.keys(fields).some(function(k) { return !fields[k].isValid(); }))
+                // The hidden name field of an earlier 'New filter…' pick does not count
+                if (!picked || (isNew() && !nameW.isValid()) || !name ||
+                    Object.keys(fields).some(function(k) {
+                        return !fields[k].isValid() || fields[k].node.querySelector('.cbi-input-invalid');
+                    }))
                     return;
 
                 var values = {};
@@ -915,7 +948,7 @@ return view.extend({
 
                 ui.hideModal();
                 resolve(Promise.resolve().then(function() {
-                    return self.saveRegion(token, region, name, findFilter(name), values, initial);
+                    return self.saveRegion(token, region, name, sec, values, initial);
                 }));
             };
 
@@ -932,6 +965,7 @@ return view.extend({
             ]);
 
             update();
+            (isNew() ? nameNode.querySelector('input') : filterNode.querySelector('select')).focus();
         });
     },
 
