@@ -130,24 +130,46 @@
             border-radius: 50%;
             margin-right: 8px;
         }
+
+        /* Short messages from the parent, e.g. why a change was not staged */
+        #gm-toast {
+            display: none;
+            position: fixed;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1001;
+            max-width: 80%;
+            padding: 6px 12px;
+            background: white;
+            color: #333;
+            border-radius: 4px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+            font: 13px/1.4 sans-serif;
+        }
     </style>
 </head>
 <body>
     <div id="map"></div>
+    <div id="gm-toast" role="status"></div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-    <!-- Optional: OverlappingMarkerSpiderfier -->
-    <!-- <script src="https://unpkg.com/overlapping-marker-spiderfier-leaflet@1.0.3/oms.min.js"></script> -->
     <script>
         'use strict';
 
         var map, drawnItems;
-        var regions = {};
         var allowedIPMarkers = {}; // New layer for Allowed IPs
-        var allowedIPs = []; // New list to track allowed IPs
         var homePosition = [51.505, -0.09];
-        var isSettingHome = false;
+
+        /*
+         * Region identity lives in layer.gm, never in layer.options: Leaflet.draw saves and
+         * restores layer.options around every edit session.
+         * gm = { token, sid, name, color, enabled, region, staged, pending, prevRegion }
+         * region is the string stored in UCI; the parent matches regions on it alone.
+         */
+        var circles = {}; // token -> layer, kept until the parent has answered for it
+        var toastTimer = null;
 
         // Define specialized icons for different marker types
         var blockedDivIcon = L.divIcon({
@@ -229,8 +251,27 @@
             }
         });
 
-        // Optional: Initialize OverlappingMarkerSpiderfier
-        // var oms = new OverlappingMarkerSpiderfier(map, { keepSpiderfied: true });
+        function post(type, data) {
+            window.parent.postMessage({ type: type, data: data }, location.origin);
+        }
+
+        function showToast(text) {
+            var el = document.getElementById('gm-toast');
+            el.textContent = text;
+            el.style.display = 'block';
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(function() { el.style.display = 'none'; }, 6000);
+        }
+
+        // Popup content as text nodes: filter names never run as markup
+        function popupContent(lines) {
+            var div = document.createElement('div');
+            lines.forEach(function(line, i) {
+                if (i) div.appendChild(document.createElement('br'));
+                div.appendChild(document.createTextNode(line));
+            });
+            return div;
+        }
 
         /**
          * Updates the map with the latest connection data.
@@ -244,7 +285,6 @@
 
             connections.forEach(function(conn) {
                 if (!conn || !conn.geo) {
-                    console.warn('Connection is null or geo is missing:', conn);
                     return;
                 }
 
@@ -260,31 +300,20 @@
                     var marker;
                     if (isAllowedIP) {
                         marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
-                        var popupContent = 'Allowed IP: ' + ip + '<br>' +
-                                        'Filter: ' + filterName;
-                        marker.bindPopup(popupContent);
+                        marker.bindPopup(popupContent(['Allowed IP: ' + ip, 'Filter: ' + filterName]));
                         allowedIPMarkers[ip] = marker;
                     } else if (allowed) {
                         marker = L.marker([geo.lat, geo.lon], { icon: allowedConnectionIcon });
-                        var popupContent = 'IP: ' + ip + '<br>' +
-                                        'Status: Allowed<br>' +
-                                        'Filter: ' + filterName;
-                        marker.bindPopup(popupContent);
+                        marker.bindPopup(popupContent(['IP: ' + ip, 'Status: Allowed', 'Filter: ' + filterName]));
                     } else {
                         marker = L.marker([geo.lat, geo.lon], { icon: blockedDivIcon });
-                        var popupContent = 'IP: ' + ip + '<br>' +
-                                        'Status: Blocked<br>' +
-                                        'Filter: ' + filterName;
-                        marker.bindPopup(popupContent);
+                        marker.bindPopup(popupContent(['IP: ' + ip, 'Status: Blocked', 'Filter: ' + filterName]));
                     }
 
                     markerClusters.addLayer(marker);
                     connectionMarkers[ip] = marker;
                 }
             });
-
-            console.log('Active Connections:', activeConnectionIPs);
-            console.log('Current Allowed IP Markers:', allowedIPMarkers);
         }
 
         /**
@@ -307,9 +336,7 @@
                 if (geo && geo.lat && geo.lon && activeConnectionIPs[ip]) { // Add only for active connections
                     if (!allowedIPMarkers[ip]) { // Add only if not already present
                         var marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
-                        var popupContent = 'Allowed IP: ' + ip + '<br>' +
-                                        'Filter: ' + filter;
-                        marker.bindPopup(popupContent);
+                        marker.bindPopup(popupContent(['Allowed IP: ' + ip, 'Filter: ' + filter]));
                         markerClusters.addLayer(marker);
                         allowedIPMarkers[ip] = marker;
                     }
@@ -321,13 +348,6 @@
                     }
                 }
             });
-
-            // Update the allowedIPs list only with active connections
-            allowedIPs = allowedIPsData
-                .filter(function(entry) { return activeConnectionIPs[entry.ip]; })
-                .map(function(entry) { return entry.ip; });
-
-            console.log('Updated Allowed IPs:', allowedIPs);
         }
 
         /**
@@ -358,9 +378,6 @@
             // Add the MarkerCluster group to the map
             map.addLayer(markerClusters);
 
-            // Optional: Add OverlappingMarkerSpiderfier to the map
-            // map.addLayer(oms);
-
             // Define custom control for Home Buttons
             L.Control.HomeButtons = L.Control.extend({
                 onAdd: function(map) {
@@ -380,7 +397,6 @@
                     
                     L.DomEvent.on(setHomeButton, 'click', function(e) {
                         L.DomEvent.stop(e);
-                        isSettingHome = true;
                         setHomeButton.style.backgroundColor = '#ffff00';
                         map.getContainer().classList.add('set-home-cursor');
                         map.once('click', onMapClick);
@@ -402,6 +418,9 @@
 
             drawnItems = new L.FeatureGroup();
             map.addLayer(drawnItems);
+
+            // No "Clear All" in the delete toolbar: it removed every circle of every filter at once
+            L.EditToolbar.Delete.prototype.removeAllLayers = null;
 
             // Initialize drawing controls
             var drawControl = new L.Control.Draw({
@@ -486,7 +505,7 @@
             legendControl.addTo(map);
 
             // Notify parent frame that the map is ready
-            window.parent.postMessage({ type: 'mapReady' }, '*');
+            post('mapReady');
             
             if (homePosition) {
                 map.setView(homePosition, 4);
@@ -501,187 +520,230 @@
             homePosition = [e.latlng.lat, e.latlng.lng];
             localStorage.setItem('homePosition', JSON.stringify(homePosition));
             map.setView(homePosition, 4);
-            isSettingHome = false;
             document.querySelector('.set-home-button').style.backgroundColor = '';
             map.getContainer().classList.remove('set-home-cursor');
-            window.parent.postMessage({ type: 'homePositionSet', data: homePosition }, '*');
         }
 
         /**
-         * Handles the creation of new shapes on the map.
+         * Builds the region string of a circle as UCI stores it.
+         * @param {Object} layer - The circle layer.
+         * @returns {string} - circle:<lat>:<lon>:<radius in meters>
+         */
+        function regionString(layer) {
+            var center = layer.getLatLng();
+            return 'circle:' + center.lat.toFixed(8) + ':' + center.lng.toFixed(8) + ':' + Math.round(layer.getRadius());
+        }
+
+        /**
+         * Parses a region string.
+         * @param {string} region - The region string from UCI.
+         * @returns {Object|null} - { lat, lng, radius } or null if it is not a valid circle.
+         */
+        function parseRegion(region) {
+            var p = String(region).split(':');
+            if (p.length !== 4 || p[0] !== 'circle' || p.slice(1).some(function(x) { return !x.trim(); }))
+                return null;
+            var lat = Number(p[1]), lng = Number(p[2]), radius = Number(p[3]);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radius) ||
+                Math.abs(lat) > 90 || Math.abs(lng) > 180 || radius <= 0)
+                return null;
+            return { lat: lat, lng: lng, radius: radius };
+        }
+
+        /**
+         * Sets style and tooltip of a circle from its layer.gm state.
+         * @param {Object} layer - The circle layer.
+         */
+        function applyLook(layer) {
+            var gm = layer.gm, color = gm.color || getColorForName(gm.name || ''), tags = [];
+            var label = document.createElement('span');
+
+            if (gm.pending) {
+                layer.setStyle({ color: '#666666', fillColor: '#666666', fillOpacity: 0.1, dashArray: '6 6' });
+                label.textContent = 'New region';
+            } else {
+                // Disabled filters: dashed and faint
+                layer.setStyle({
+                    color: color,
+                    fillColor: color,
+                    fillOpacity: gm.enabled ? 0.3 : 0.06,
+                    dashArray: gm.enabled ? null : '4 8'
+                });
+                if (!gm.enabled) tags.push('disabled');
+                if (gm.staged) tags.push('unsaved');
+                label.textContent = (gm.name || gm.sid) + (tags.length ? ' (' + tags.join(', ') + ')' : '');
+            }
+
+            if (layer.getTooltip()) {
+                layer.setTooltipContent(label);
+            } else {
+                layer.bindTooltip(label);
+            }
+        }
+
+        /**
+         * Adds a region of a filter to the map.
+         * @param {Object} filter - { sid, name, color, enabled } from the parent.
+         * @param {string} region - The region string from UCI.
+         * @param {boolean} staged - The filter has staged changes.
+         */
+        function addRegion(filter, region, staged) {
+            var c = parseRegion(region);
+            if (!c) {
+                post('regionInvalid', { sid: filter.sid, region: region });
+                return;
+            }
+
+            var layer = L.circle([c.lat, c.lng], { radius: c.radius });
+            layer.gm = {
+                token: L.stamp(layer),
+                sid: filter.sid,
+                name: filter.name,
+                color: filter.color,
+                enabled: !!filter.enabled,
+                region: region,
+                staged: staged
+            };
+            circles[layer.gm.token] = layer;
+            applyLook(layer);
+            drawnItems.addLayer(layer);
+        }
+
+        /**
+         * Replaces all regions with the filters the parent sent.
+         * @param {Object} data - { filters: [{ sid, name, color, enabled, regions }], stagedSids }
+         */
+        function setFilters(data) {
+            var staged = {};
+            (data.stagedSids || []).forEach(function(sid) { staged[sid] = true; });
+
+            drawnItems.clearLayers();
+            circles = {};
+            (data.filters || []).forEach(function(filter) {
+                (filter.regions || []).forEach(function(region) {
+                    addRegion(filter, region, !!staged[filter.sid]);
+                });
+            });
+        }
+
+        /**
+         * Updates the state of every circle of a filter.
+         * @param {string} sid - The UCI section of the filter.
+         * @param {Object} changes - Fields to merge into layer.gm.
+         */
+        function updateFilter(sid, changes) {
+            Object.keys(circles).forEach(function(token) {
+                var layer = circles[token];
+                if (layer.gm.sid === sid) {
+                    L.extend(layer.gm, changes);
+                    applyLook(layer);
+                }
+            });
+        }
+
+        function forget(token) {
+            var layer = circles[token];
+            delete circles[token];
+            if (layer && drawnItems.hasLayer(layer)) drawnItems.removeLayer(layer);
+        }
+
+        /**
+         * A new circle stays pending until the parent answers with regionSaved,
+         * regionDiscarded or regionRejected.
          * @param {Object} event - The draw event object.
          */
         function onDrawCreated(event) {
             var layer = event.layer;
-            var regionData = getRegionData(layer);
-            if (regionData) {
-                var name = prompt("Enter a name for this region:");
-                if (name) {
-                    // Initialize the region if it doesn't exist
-                    if (!regions[name]) {
-                        regions[name] = [];
-                    }
-                    setRegionColor(layer, name);
-                    layer.options.name = name;
-                    layer.bindTooltip(name); 
-                    drawnItems.addLayer(layer);
-                    regions[name].push(layer);
-                    window.parent.postMessage({ type: 'regionCreated', data: { name: name, region: regionData } }, '*');
-                } else {
-                    // Remove the layer if no name was provided
-                    drawnItems.removeLayer(layer);
-                    console.log('Region creation canceled by user.');
-                }
-            }
+            layer.gm = { token: L.stamp(layer), sid: null, name: '', region: regionString(layer), pending: true };
+            circles[layer.gm.token] = layer;
+            applyLook(layer);
+            drawnItems.addLayer(layer);
+            post('regionDrawn', { token: layer.gm.token, region: layer.gm.region });
         }
 
         /**
-         * Handles the editing of existing shapes on the map.
+         * Reports moved or resized circles with the string they were stored with.
          * @param {Object} event - The edit event object.
          */
-         function onDrawEdited(event) {
-            var layers = event.layers;
-            layers.eachLayer(function(layer) {
-                var name = layer.options.name;
-                if (name && regions[name]) {
-                    var oldRegionData = layer.options.regionData;
-                    var newRegionData = getRegionData(layer);
-                    if (newRegionData) {
-                        // Find the existing circle in the regions array
-                        var existingCircle = regions[name].find(function(circle) {
-                            return circle.options.regionData === oldRegionData;
-                        });
+        function onDrawEdited(event) {
+            event.layers.eachLayer(function(layer) {
+                var gm = layer.gm, region;
+                // A pending circle belongs to the open filter dialog
+                if (!gm || gm.pending) return;
 
-                        if (existingCircle) {
-                            // Update the existing circle's properties instead of creating a new one
-                            existingCircle.setLatLng(layer.getLatLng());
-                            existingCircle.setRadius(layer.getRadius());
-                            existingCircle.options.regionData = newRegionData;
-                            
-                            // Send both regions to the parent component
-                            window.parent.postMessage({
-                                type: 'regionEdited',
-                                data: {
-                                    name: name,
-                                    oldRegion: oldRegionData,
-                                    region: newRegionData
-                                }
-                            }, '*');
-                        }
-                    }
-                }
+                region = regionString(layer);
+                if (region === gm.region) return;
+
+                // Optimistic: a second edit before the answer must name the new string
+                gm.prevRegion = gm.region;
+                gm.region = region;
+                post('regionEdited', { token: gm.token, sid: gm.sid, oldRegion: gm.prevRegion, region: region });
             });
         }
 
         /**
-         * Handles the deletion of shapes from the map.
+         * Reports deleted circles. Leaflet.draw has already removed them from drawnItems;
+         * circles keeps them so a rejected delete can put them back.
          * @param {Object} event - The delete event object.
          */
         function onDrawDeleted(event) {
-            var layers = event.layers;
-            layers.eachLayer(function(layer) {
-                var name = layer.options.name;
-                if (name && regions[name]) {
-                    var index = regions[name].indexOf(layer);
-                    if (index > -1) {
-                        regions[name].splice(index, 1);
-                        window.parent.postMessage({ type: 'regionDeleted', data: { name: name, region: getRegionData(layer) } }, '*');
-                        if (regions[name].length === 0) {
-                            delete regions[name];
-                        }
-                    }
-                }
+            event.layers.eachLayer(function(layer) {
+                var gm = layer.gm;
+                if (!gm || gm.pending) return;
+                post('regionDeleted', { token: gm.token, sid: gm.sid, oldRegion: gm.region });
             });
         }
 
         /**
-         * Retrieves the region data from a given layer.
-         * @param {Object} layer - The map layer.
-         * @returns {string|null} - The region data string or null.
+         * Answers of the parent to regionDrawn, regionEdited and regionDeleted.
+         * @param {string} type - The message type.
+         * @param {Object} d - The message data, always with a token.
          */
-        function getRegionData(layer) {
-            if (layer.getRadius) {
-                var center = layer.getLatLng();
-                var radius = layer.getRadius();
-                return 'circle:' + center.lat.toFixed(8) + ':' + center.lng.toFixed(8) + ':' + Math.round(radius);
-            }
-            return null;
-        }
+        function onRegionAnswer(type, d) {
+            var layer = circles[d.token], c;
+            if (!layer) return;
 
-        /**
-         * Sets the color of a region based on its name.
-         * @param {Object} layer - The map layer.
-         * @param {string} name - The name of the region.
-         */
-        function setRegionColor(layer, name) {
-            var color = getColorForName(name);
-            layer.setStyle({
-                color: color,
-                fillColor: color,
-                fillOpacity: 0.3
-            });
-        }
-
-        /**
-         * Adds a new region to the map.
-         * @param {string} name - The name of the region.
-         * @param {string} data - The data string representing the region.
-         */
-        function addRegion(name, data) {
-            var parts = data.split(':');
-            if (parts[0] === 'circle' && parts.length === 4) {
-                var lat = parseFloat(parts[1]);
-                var lng = parseFloat(parts[2]);
-                var radius = parseFloat(parts[3]);
-                var circle = L.circle([lat, lng], {
-                    radius: radius,
-                    name: name
-                });
-                setRegionColor(circle, name);
-                circle.bindTooltip(name);
-                drawnItems.addLayer(circle);
-                
-                if (!regions[name]) {
-                    regions[name] = [];
+            if (type === 'regionSaved') {
+                layer.gm.sid = d.sid;
+                layer.gm.region = d.region;
+                layer.gm.pending = false;
+                delete layer.gm.prevRegion;
+                updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled, staged: true });
+            } else if (type === 'regionRemoved') {
+                forget(d.token);
+                updateFilter(layer.gm.sid, { staged: true });
+            } else if (type === 'regionDiscarded' || layer.gm.pending) {
+                forget(d.token);
+            } else {
+                // regionRejected: back to the stored geometry, and back on the map after a delete
+                if (layer.gm.prevRegion) {
+                    layer.gm.region = layer.gm.prevRegion;
+                    delete layer.gm.prevRegion;
                 }
-                regions[name].push(circle);
-                circle.options.regionData = data; // Save the original region
+                c = parseRegion(layer.gm.region);
+                if (c) {
+                    layer.setLatLng([c.lat, c.lng]);
+                    layer.setRadius(c.radius);
+                }
+                if (!drawnItems.hasLayer(layer)) drawnItems.addLayer(layer);
             }
+
+            if (type === 'regionRejected' && d.reason) showToast(d.reason);
         }
 
-        /**
-         * Clears all markers and regions from the map.
-         */
-        function clearMap() {
-            drawnItems.clearLayers();
-            regions = {};
-            clearAllowedIPs();
-            markerClusters.clearLayers(); // Clear the cluster group
-            connectionMarkers = {};
-            allowedIPMarkers = {};
-            activeConnectionIPs = {};
-        }
-
-        /**
-         * Clears all allowed IP markers from the map.
-         */
-        function clearAllowedIPs() {
-            for (var ip in allowedIPMarkers) {
-                markerClusters.removeLayer(allowedIPMarkers[ip]);
-                delete allowedIPMarkers[ip];
-            }
-        }
-
-        // Listener for messages from the parent frame
+        // Listener for messages from the parent frame; nobody else may talk to the map
         window.addEventListener('message', function(event) {
-            if (event.data.type === 'addRegion') {
-                addRegion(event.data.name, event.data.data);
-            } else if (event.data.type === 'clearMap') {
-                clearMap();
-            } else if (event.data.type === 'updateConnections') {
-                updateConnections(event.data.data);
-            } else if (event.data.type === 'updateAllowedIPs') {
-                updateAllowedIPsUI(event.data.data);
+            if (event.origin !== location.origin || event.source !== window.parent || !event.data) return;
+
+            var type = event.data.type, data = event.data.data;
+            if (type === 'setFilters') {
+                setFilters(data || {});
+            } else if (type === 'updateConnections') {
+                updateConnections(data || []);
+            } else if (type === 'updateAllowedIPs') {
+                updateAllowedIPsUI(data || []);
+            } else if (/^region(Saved|Removed|Discarded|Rejected)$/.test(type) && data) {
+                onRegionAnswer(type, data);
             }
         }, false);
 

@@ -6,6 +6,7 @@
 'require rpc';
 'require poll';
 'require fs';
+'require dom';
 
 // Version and update channel information
 const UI_VERSION = 'dev';
@@ -23,6 +24,43 @@ function formatVersionDisplay(version) {
     
     // Not a full commit hash - show as is
     return version;
+}
+
+// Region strings as the map writes them: circle:<lat>:<lon>:<radius in meters>
+var REGION_RE = /^circle:-?\d{1,2}(\.\d+)?:-?\d{1,3}(\.\d+)?:[1-9]\d*$/;
+
+// Filter names the backend supports in nft set and file names (filter_set_name in luci.geomate)
+var FILTER_NAME_RE = /^[\w .-]+$/;
+
+// Filter colors by section order, readable on the OSM tiles
+var PALETTE = ['#0072B2', '#E69F00', '#CC79A7', '#009E73', '#D55E00', '#56B4E9', '#7F4FBF', '#8C6D31'];
+
+function filterColor(index, name) {
+    if (index < PALETTE.length)
+        return PALETTE[index];
+    var hash = 0;
+    for (var i = 0; i < name.length; i++)
+        hash = (name.charCodeAt(i) + ((hash << 5) - hash)) | 0;
+    return PALETTE[Math.abs(hash) % PALETTE.length];
+}
+
+function isEmpty(v) {
+    return Array.isArray(v) ? v.length == 0 : (v == null || v === '');
+}
+
+// Suggested IP list path for a filter name
+function ipListPath(name) {
+    return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
+}
+
+// Notification banner that disappears on its own (addTimeLimitedNotification is missing in LuCI 23.05)
+function notify(text, cls) {
+    var node;
+    if (typeof ui.addTimeLimitedNotification == 'function')
+        return ui.addTimeLimitedNotification(null, E('p', {}, [ text ]), 8000, cls || 'info');
+    node = ui.addNotification(null, E('p', {}, [ text ]), cls || 'info');
+    window.setTimeout(function() { node.classList.add('fade-out'); }, 8000);
+    return node;
 }
 
 // Declare RPC methods to interact with the Geomate backend
@@ -48,7 +86,6 @@ var callGetHealthCheck = rpc.declare({
 function getServiceStatus() {
     return fs.exec('/etc/init.d/geomate', ['status']).then(function(res) {
         var output = res.stdout.trim().toLowerCase();
-        console.log('Service status output:', output);
         if (res.code === 0 && output.includes('running')) {
             return 'Running';
         } else {
@@ -63,7 +100,6 @@ function getServiceStatus() {
 // Function to check if /tmp/geomate_loading exists
 function getLoadingStatus() {
     return fs.stat('/tmp/geomate_loading').then(function() {
-        console.log('Loading file /tmp/geomate_loading is present.');
         return true; // File exists
     }).catch(function(err) {
         // If stat fails, file likely doesn't exist
@@ -72,10 +108,11 @@ function getLoadingStatus() {
 }
 
 return view.extend({
-    geoFilters: {},
     map: null,
     currentConnectionsData: [],
     allowedIPsData: [],
+    pending: {},        // last uci.changes() result
+    busy: null,         // promise chain that serializes region actions
 
     // Load initial data required for the view
     load: function() {
@@ -83,9 +120,9 @@ return view.extend({
             uci.load('geomate'),
             callGeomateConnections(),
             callGeomateAllowedIPs(),
-            getServiceStatus()
+            getServiceStatus(),
+            L.resolveDefault(uci.changes(), {})
         ]).then(function(data) {
-            var geomateConfig = data[0];
             var connectionsResult = data[1];
             var allowedIPsResult = data[2];
             var serviceStatus = data[3];
@@ -93,10 +130,7 @@ return view.extend({
             this.currentConnectionsData = connectionsResult.connections || [];
             this.allowedIPsData = allowedIPsResult.allowed_ips || [];
             this.serviceStatus = serviceStatus; // Store the service status
-    
-            console.log('Initial connectionsData:', this.currentConnectionsData);
-            console.log('Initial allowedIPsData:', this.allowedIPsData);
-            console.log('Service Status:', this.serviceStatus);
+            this.pending = data[4] || {};
     
             return data;
         }.bind(this)).catch(function(error) {
@@ -189,7 +223,8 @@ return view.extend({
         s.render = function() {
             return E('div', { id: 'geomate-map-container', style: 'position: relative;' }, [
                 E('iframe', {
-                    src: L.resource('view/geomate/map.html'),
+                    // The version parameter makes browsers fetch map.html again after an update
+                    src: L.resource('view/geomate/map.html') + '?v=' + encodeURIComponent(UI_VERSION),
                     style: 'width: 100%; height: 80vh; border: none;' // Use 80% of the viewport height
                 }),
                 // Button to toggle the visibility of active connections
@@ -310,16 +345,13 @@ return view.extend({
 
             // Send initial connections and Allowed IPs to the map after the map is ready
             window.addEventListener('message', function(event) {
-                if (event.data.type === 'mapReady') {
-                    console.log('Map is ready, loading data');
-                    self.loadGeoFilters()
-                        .then(() => {
-                            self.sendAllowedIPsToMap(self.allowedIPsData || []);
-                            self.sendConnectionsToMap(self.currentConnectionsData || []);
-                            self.updateActiveConnectionsList();
-                            // Initial version check
-                            self.checkForUpdates();
-                        });
+                if (self.isMapMessage(event) && event.data.type === 'mapReady') {
+                    self.pushFilters();
+                    self.sendAllowedIPsToMap(self.allowedIPsData || []);
+                    self.sendConnectionsToMap(self.currentConnectionsData || []);
+                    self.updateActiveConnectionsList();
+                    // Initial version check
+                    self.checkForUpdates();
 
                     // Regularly update the service status - only after map is ready
                     poll.add(function() {
@@ -367,43 +399,29 @@ return view.extend({
                             // Show health check status (inline with Running)
                             if (healthElement && healthData.checks) {
                                 var checks = healthData.checks;
-                                var html = '';
-                                
-                                // Build compact health check display
-                                var checkOrder = ['config', 'files', 'datadir', 'service', 'nft'];
                                 var checkLabels = {
-                                    'config': 'Config',
-                                    'files': 'Files', 
-                                    'datadir': 'Data',
-                                    'service': 'Autostart',
-                                    'nft': 'nftables'
+                                    'config': _('Config'),
+                                    'files': _('Files'),
+                                    'datadir': _('Data'),
+                                    'service': _('Autostart'),
+                                    'nft': _('nftables')
                                 };
-                                
-                                checkOrder.forEach(function(key) {
-                                    if (checks[key]) {
-                                        var check = checks[key];
-                                        var icon = '✓';
-                                        var color = '#10b981'; // green
-                                        
-                                        if (check.status === 'error') {
-                                            icon = '✗';
-                                            color = '#ef4444'; // red
-                                        } else if (check.status === 'warning') {
-                                            icon = '⚠';
-                                            color = '#f59e0b'; // orange
-                                        } else if (check.status === 'info') {
-                                            icon = '○';
-                                            color = '#6b7280'; // gray
-                                        }
-                                        
-                                        html += '<span style="margin-right: 10px;" title="' + (check.message || '') + '">';
-                                        html += '<span style="color: ' + color + ';">' + icon + '</span> ';
-                                        html += checkLabels[key] || key;
-                                        html += '</span>';
-                                    }
-                                });
-                                
-                                healthElement.innerHTML = html;
+                                var icons = {
+                                    'error': ['✗', '#ef4444'],
+                                    'warning': ['⚠', '#f59e0b'],
+                                    'info': ['○', '#6b7280']
+                                };
+
+                                // Build compact health check display; messages stay text, never markup
+                                dom.content(healthElement, Object.keys(checkLabels).filter(function(key) {
+                                    return checks[key];
+                                }).map(function(key) {
+                                    var icon = icons[checks[key].status] || ['✓', '#10b981'];
+                                    return E('span', { 'style': 'margin-right: 10px;', 'title': checks[key].message || '' }, [
+                                        E('span', { 'style': 'color: ' + icon[1] + ';' }, [ icon[0] ]),
+                                        ' ' + checkLabels[key]
+                                    ]);
+                                }));
                             }
 
                             // Show operational mode
@@ -439,8 +457,6 @@ return view.extend({
                             var allowedIPsData = results[1].allowed_ips || [];
                             self.currentConnectionsData = connectionsData;
                             self.allowedIPsData = allowedIPsData;
-                            console.log('Polled connectionsData:', connectionsData);
-                            console.log('Polled allowedIPsData:', allowedIPsData);
                             self.sendConnectionsToMap(connectionsData);
                             self.sendAllowedIPsToMap(allowedIPsData);
                             self.updateActiveConnectionsList();
@@ -460,454 +476,488 @@ return view.extend({
         });
     },
 
-    // Set up handlers for messages received from the map iframe
+    // Only the map iframe of this page may send messages to the view
+    isMapMessage: function(ev) {
+        var frame = this.mapFrame();
+        return ev.origin === window.location.origin && frame != null &&
+            ev.source === frame.contentWindow && ev.data != null && typeof ev.data.type == 'string';
+    },
+
+    mapFrame: function() {
+        return document.querySelector('#geomate-map-container iframe');
+    },
+
+    // Send a message to the map iframe
+    sendMessageToMap: function(type, data) {
+        var frame = this.mapFrame();
+        if (frame && frame.contentWindow)
+            frame.contentWindow.postMessage({ type: type, data: data }, window.location.origin);
+    },
+
+    sendConnectionsToMap: function(connections) {
+        this.sendMessageToMap('updateConnections', connections);
+    },
+
+    sendAllowedIPsToMap: function(allowedIPs) {
+        this.sendMessageToMap('updateAllowedIPs', allowedIPs);
+    },
+
+    // Handle region messages from the map iframe ('mapReady' is handled in render())
     setupMessageHandlers: function() {
         var self = this;
-        window.addEventListener('message', function(event) {
-            console.log('Received message from iframe:', event.data);
-            // 'mapReady' is handled by the listener in render(), which also starts the polls
-            if (event.data.type === 'regionCreated') {
-                console.log('New geo filter:', event.data.data);
-                self.updateGeoFilter(event.data.data.name, null, event.data.data.region, true);
-            } else if (event.data.type === 'regionEdited') {
-                console.log('Updating geo filter:', event.data.data);
-                var data = event.data.data;
-                self.updateGeoFilter(data.name, data.oldRegion, data.region, false);
-            } else if (event.data.type === 'regionDeleted') {
-                console.log('Deleting geo filter:', event.data.data.name, event.data.data.region);
-                // The map has removed the circle itself; reloading the filters here would
-                // draw every remaining region a second time
-                self.deleteGeoFilter(event.data.data.name, event.data.data.region)
-                    .catch(error => {
-                        console.error('Error deleting region:', error);
-                    });
+        window.addEventListener('message', function(ev) {
+            if (!self.isMapMessage(ev))
+                return;
+
+            var d = ev.data.data || {};
+            switch (ev.data.type) {
+            case 'regionDrawn':
+                self.enqueue(d.token, function() { return self.openFilterModal(d.token, d.region); });
+                break;
+            case 'regionEdited':
+                self.enqueue(d.token, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
+                break;
+            case 'regionDeleted':
+                self.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
+                break;
+            case 'regionInvalid':
+                notify(_('Filter %s has an invalid region "%s". It is not shown on the map.')
+                    .format(self.filterName(d.sid), d.region), 'warning');
+                break;
             }
         }, false);
     },
 
-    // Send the current connections data to the map iframe
-    sendConnectionsToMap: function(connections) {
-        console.log('Sending connections to the map:', connections);
-        var iframe = document.querySelector('#geomate-map-container iframe');
-        if (iframe && iframe.contentWindow) {
-            iframe.contentWindow.postMessage({ type: 'updateConnections', data: connections }, '*');
-        } else {
-            console.error('Iframe not found or contentWindow is not available');
-        }
+    // Run region actions one after another: uci.save() reloads the configuration, so a second
+    // action must not read it in between. A failed action hands its region back to the map.
+    enqueue: function(token, fn) {
+        var self = this;
+        this.busy = Promise.resolve(this.busy).then(fn).catch(function(err) {
+            var reason = _('Failed to stage the change: %s. Reload the page.').format((err && err.message) || err);
+            ui.addNotification(null, E('p', {}, [ reason ]), 'error');
+            self.sendMessageToMap('regionRejected', { token: token, reason: reason });
+        });
+        return this.busy;
     },
 
-    // Send the allowed IPs data to the map iframe
-    sendAllowedIPsToMap: function(allowedIPs) {
-        console.log('Sending Allowed IPs to the map:', allowedIPs);
-        var iframe = document.querySelector('#geomate-map-container iframe');
-        if (iframe && iframe.contentWindow) {
-            iframe.contentWindow.postMessage({ type: 'updateAllowedIPs', data: allowedIPs }, '*');
-        } else {
-            console.error('Iframe not found or contentWindow is not available');
-        }
+    filterName: function(sid) {
+        return (sid && uci.get('geomate', sid, 'name')) || sid || '?';
     },
 
-    // Load Geo-Filter configurations from UCI and send them to the map
-    loadGeoFilters: function() {
-        console.log('Loading geo filters');
-        return uci.load('geomate').then(() => {
-            this.geoFilters = {};
-            var sections = uci.sections('geomate', 'geo_filter');
-            sections.forEach(section => {
-                if (section.name) {
-                    this.geoFilters[section.name] = section;
-                    var regions = section.allowed_region;
-                    if (regions) {
-                        if (!Array.isArray(regions)) {
-                            regions = [regions];
-                        }
-                        regions.forEach(region => {
-                            if (section.enabled == '1') {
-                                this.sendMessageToMap('addRegion', { name: section.name, data: region });
-                            }
-                        });
-                    }
-                }
-            });
-            console.log('Loaded geo filters:', this.geoFilters);
+    // Filter fields the map needs; colors follow the section order
+    filterInfo: function(sid) {
+        var sections = uci.sections('geomate', 'geo_filter'),
+            index = sections.findIndex(function(s) { return s['.name'] === sid; }),
+            name = (index > -1 && sections[index].name) || '';
+
+        return {
+            sid: sid,
+            name: name,
+            color: filterColor(Math.max(index, 0), name),
+            enabled: index > -1 && sections[index].enabled === '1'
+        };
+    },
+
+    // Copy of a filter's region list; an 'option allowed_region' becomes a one-element list
+    regionList: function(sid) {
+        return sid ? L.toArray(uci.get('geomate', sid, 'allowed_region')).slice() : [];
+    },
+
+    // Send every filter to the map, also disabled ones; done once per mapReady
+    pushFilters: function() {
+        var self = this, staged = {};
+
+        L.toArray((this.pending || {}).geomate).forEach(function(change) {
+            staged[change[1]] = true;
+        });
+
+        this.sendMessageToMap('setFilters', {
+            filters: uci.sections('geomate', 'geo_filter').map(function(s) {
+                return Object.assign(self.filterInfo(s['.name']), { regions: L.toArray(s.allowed_region) });
+            }),
+            stagedSids: Object.keys(staged)
         });
     },
 
-    // Update or add a Geo-Filter based on received data
-    updateGeoFilter: function(name, oldRegion, newRegion, isNewRegion) {
+    // Stage the in-memory changes in the LuCI session and say what that means
+    stage: function() {
         var self = this;
-    
-        if (isNewRegion) {
-            // Get existing filter settings if available
-            var existingSettings = null;
-            var sections = uci.sections('geomate', 'geo_filter');
-            var existingSection = sections.find(section => section.name === name);
-            
-            if (existingSection) {
-                existingSettings = {
-                    protocol: existingSection.protocol,
-                    src_ip: existingSection.src_ip || '',
-                    src_port: existingSection.src_port || '',
-                    dest_port: existingSection.dest_port || '',
-                    allowed_ip: existingSection.allowed_ip || [],
-                    ip_list: existingSection.ip_list || ''
-                };
+        return uci.save().then(function() {
+            return L.resolveDefault(uci.changes(), {});
+        }).then(function(changes) {
+            self.pending = changes || {};
+            if (!self.stagedNote || !self.stagedNote.parentNode)
+                self.stagedNote = notify(_('Change staged. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.'));
+        });
+    },
+
+    ackRegion: function(token, sid, region) {
+        this.sendMessageToMap('regionSaved', Object.assign(this.filterInfo(sid), { token: token, region: region }));
+    },
+
+    rejectRegion: function(token, sid) {
+        var reason = _('Region of filter %s not found in the configuration. Reload the page.').format(this.filterName(sid));
+        ui.addNotification(null, E('p', {}, [ reason ]), 'warning');
+        this.sendMessageToMap('regionRejected', { token: token, reason: reason });
+    },
+
+    // A circle was moved or resized: replace the stored string it was loaded with
+    replaceRegion: function(token, sid, oldRegion, region) {
+        var list = this.regionList(sid),
+            index = list.indexOf(oldRegion);
+
+        if (index < 0 || !REGION_RE.test(region || ''))
+            return this.rejectRegion(token, sid);
+
+        list[index] = region;
+        uci.set('geomate', sid, 'allowed_region', list);
+        return this.stage().then(this.ackRegion.bind(this, token, sid, region));
+    },
+
+    // A circle was deleted; the last one of a filter needs a decision about the filter
+    removeRegion: function(token, sid, oldRegion) {
+        var self = this,
+            list = this.regionList(sid),
+            index = list.indexOf(oldRegion);
+
+        if (index < 0)
+            return this.rejectRegion(token, sid);
+
+        list.splice(index, 1);
+
+        return (list.length ? Promise.resolve('keep') : this.confirmLastRegion(sid)).then(function(choice) {
+            if (!choice)
+                return self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+
+            uci.set('geomate', sid, 'allowed_region', list.length ? list : null);
+            if (choice == 'disable')
+                uci.set('geomate', sid, 'enabled', '0');
+
+            return self.stage().then(function() {
+                self.sendMessageToMap('regionRemoved', { token: token });
+            });
+        });
+    },
+
+    // Resolves with 'disable', 'keep' or null (cancelled)
+    confirmLastRegion: function(sid) {
+        var name = this.filterName(sid),
+            enabled = uci.get('geomate', sid, 'enabled') === '1';
+
+        return new Promise(function(resolve) {
+            var button = function(cls, label, choice) {
+                return E('button', { 'class': 'btn ' + cls, 'click': function() { ui.hideModal(); resolve(choice); } }, [ label ]);
+            };
+            var preferred = enabled
+                ? button('cbi-button-negative', _('Delete and disable filter'), 'disable')
+                : button('cbi-button-negative', _('Delete region'), 'keep');
+
+            ui.showModal(_('Delete the last region of %h?').format(name), [
+                E('p', {}, [ enabled
+                    ? _('Without a region, filter %s allows no geolocated IPs; with strict mode it blocks everything except its allowed IPs.').format(name)
+                    : _('Filter %s is disabled and keeps no region.').format(name) ]),
+                E('div', { 'class': 'right' }, [
+                    button('', _('Cancel'), null), ' ',
+                    enabled ? button('cbi-button-action', _('Delete, keep filter enabled'), 'keep') : null, ' ',
+                    preferred
+                ])
+            ]);
+            preferred.focus();
+        });
+    },
+
+    // A new circle was drawn: choose or create its filter. The circle stays pending on the map
+    // until this modal ends with regionSaved, regionDiscarded or regionRejected
+    openFilterModal: function(token, region) {
+        var self = this,
+            sections = uci.sections('geomate', 'geo_filter'),
+            choices = {},
+            initial = {},
+            sid = null;
+
+        if (!REGION_RE.test(region || ''))
+            return Promise.reject(new Error(_('Invalid region %s').format(region)));
+
+        sections.forEach(function(s) {
+            if (s.name)
+                choices[s.name] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
+        });
+
+        // Existing filter names match without regard to case
+        var findFilter = function(name) {
+            name = name.toLowerCase();
+            return sections.find(function(s) { return (s.name || '').toLowerCase() === name; }) || null;
+        };
+
+        var nameW = new ui.Combobox('', choices, {
+            custom_placeholder: _('New filter name'),
+            validate: function(v) {
+                v = (v || '').trim();
+                return v === '' || FILTER_NAME_RE.test(v) || _('Use only letters, digits, spaces, "_", "." and "-"');
+            }
+        });
+
+        var ipPlaceholder = '192.168.1.0/24 or !192.168.1.128/25',
+            portPlaceholder = '25200 25300 or 27015-27020';
+
+        var fields = {
+            enabled: new ui.Checkbox('1', { value_enabled: '1', value_disabled: '0' }),
+            protocol: new ui.Select('udp', { tcp: 'TCP', udp: 'UDP' }, {}),
+            src_ip: new ui.Textfield('', { datatype: 'list(neg(ip4addr))', placeholder: ipPlaceholder }),
+            src_port: new ui.Textfield('', { datatype: 'list(neg(portrange))', placeholder: portPlaceholder }),
+            dest_port: new ui.Textfield('', { datatype: 'list(neg(portrange))', placeholder: portPlaceholder }),
+            allowed_ip: new ui.DynamicList([], null, { datatype: 'list(neg(ip4addr))', placeholder: ipPlaceholder }),
+            ip_expiry_days: new ui.Textfield('', { datatype: 'uinteger', placeholder: '0' }),
+            ip_list: new ui.Textfield('', {
+                validate: function(v) { return v === '' || v.charAt(0) === '/' || _('Expecting an absolute path'); }
+            })
+        };
+
+        var labels = {
+            enabled: _('Enable'),
+            protocol: _('Protocol'),
+            src_ip: _('Source IP'),
+            src_port: _('Source Port'),
+            dest_port: _('Destination Port'),
+            allowed_ip: _('Allowed IPs'),
+            ip_expiry_days: _('IP Expiry (Days)'),
+            ip_list: _('IP List File')
+        };
+
+        var value = function(k) {
+            var v = fields[k].getValue();
+            return Array.isArray(v) ? v.filter(function(x) { return x.trim() !== ''; }) : String(v == null ? '' : v).trim();
+        };
+
+        var currentName = function() {
+            return (nameW.getValue() || '').trim();
+        };
+
+        var suggestedList = function() {
+            var name = currentName(), sec = name ? findFilter(name) : null;
+            return name ? ipListPath(sec ? sec.name : name) : '';
+        };
+
+        // Show the settings of the chosen filter, or the defaults for a new one
+        var fill = function(sec) {
+            Object.keys(fields).forEach(function(k) {
+                var v = sec ? sec[k] : null;
+
+                if (k == 'enabled')
+                    v = (!sec || v === '1') ? '1' : '0';
+                else if (k == 'protocol')
+                    v = sec ? v : 'udp';
+                else if (k == 'allowed_ip')
+                    v = L.toArray(v);
+                else
+                    v = Array.isArray(v) ? v.join(' ') : (v == null ? '' : v);
+
+                fields[k].setValue(v);
+                initial[k] = value(k);
+            });
+        };
+
+        var hint = E('div', { 'class': 'cbi-value-description' }),
+            status = E('div', { 'class': 'cbi-value-description' });
+
+        var update = function() {
+            var name = currentName(),
+                sec = name ? findFilter(name) : null,
+                secId = sec ? sec['.name'] : null;
+
+            if (secId !== sid) {
+                sid = secId;
+                fill(sec);
             }
 
-            // Modal Dialog for new filters
-            var dynlist = new ui.DynamicList('', null, {
-                name: 'allowed_ip',
-                datatype: 'list(neg(ip4addr))',
-                placeholder: _('192.168.1.0/24 or !192.168.1.128/25')
+            fields.ip_list.node.querySelector('input').placeholder = suggestedList();
+            dom.content(hint, !name ? null : [ !sec
+                ? _('A new filter %s will be created.').format(name)
+                : (sec.enabled === '1')
+                    ? _('The region will be added to filter %s.').format(sec.name)
+                    : _('The region will be added to filter %s, which is disabled.').format(sec.name) ]);
+        };
+
+        var writeList = function(path, file) {
+            dom.content(status, [ _('Uploading...') ]);
+            return file.text().then(function(text) {
+                return fs.write(path, text);
+            }).then(function() {
+                fields.ip_list.setValue(path);
+                dom.content(status, [ _('Uploaded %s to %s.').format(file.name, path) ]);
+            }).catch(function(err) {
+                dom.content(status, [ _('Failed to upload file: %s').format(err.message) ]);
             });
+        };
 
-            ui.showModal(_('GeoFilter Settings'), [
-                E('div', { 'class': 'cbi-map' }, [
-                    E('div', { 'class': 'cbi-section' }, [
-                        E('div', { 'class': 'cbi-section-node' }, [
-                            // Name (read-only)
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Name')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('input', { 
-                                        'type': 'text',
-                                        'class': 'cbi-input-text',
-                                        'readonly': true,
-                                        'value': name
-                                    })
-                                ])
-                            ]),
-                            // Protocol
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Protocol')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('select', { 
-                                        'id': 'geomate-protocol',
-                                        'class': 'cbi-input-select'
-                                    }, [
-                                        E('option', { 
-                                            'value': 'tcp',
-                                            'selected': (existingSettings && existingSettings.protocol === 'tcp') ? 'selected' : null 
-                                        }, 'TCP'),
-                                        E('option', { 
-                                            'value': 'udp',
-                                            'selected': (!existingSettings || existingSettings.protocol === 'udp') ? 'selected' : null
-                                        }, 'UDP')
-                                    ])
-                                ])
-                            ]),
-                            // Source IP
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Source IP')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    new ui.Textfield(existingSettings ? existingSettings.src_ip : '', {
-                                        id: 'geomate-src-ip',
-                                        name: 'src_ip',
-                                        placeholder: '192.168.1.0/24',
-                                        datatype: 'ip4addr',
-                                        optional: true
-                                    }).render()
-                                ])
-                            ]),
-                            // Source Port
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Source Port')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    new ui.Textfield(existingSettings ? existingSettings.src_port : '', {
-                                        id: 'geomate-src-port',
-                                        name: 'src_port',
-                                        placeholder: '25200 25300 or 27015-27020',
-                                        datatype: 'list(neg(portrange))',
-                                        optional: true
-                                    }).render()
-                                ])
-                            ]),
-                            // Destination Port
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Destination Port')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    new ui.Textfield(existingSettings ? existingSettings.dest_port : '', {
-                                        id: 'geomate-dest-port',
-                                        name: 'dest_port',
-                                        placeholder: '25200 25300 or 27015-27020',
-                                        datatype: 'list(neg(portrange))',
-                                        optional: true
-                                    }).render()
-                                ])
-                            ]),
-                            // Allowed IPs
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('Allowed IPs')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    dynlist.render()
-                                ])
-                            ]),
-                            // IP List File
-                            E('div', { 'class': 'cbi-value' }, [
-                                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, _('IP List File')),
-                                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [
-                                    E('input', { 
-                                        'id': 'geomate-ip-list',
-                                        'type': 'text',
-                                        'class': 'cbi-input-text',
-                                        'readonly': true,
-                                        'value': existingSettings ? existingSettings.ip_list : '',
-                                        'style': 'margin-bottom: 8px; width: 100%'
-                                    }),
-                                    E('div', { 'class': 'cbi-value-field-buttons' }, [
-                                        E('button', {
-                                            'class': 'btn cbi-button-neutral',
-                                            'click': function() {
-                                                var filename = name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
-                                                var filepath = '/etc/geomate.d/' + filename;
-                                                
-                                                fs.write(filepath, '').then(function() {
-                                                    document.getElementById('geomate-ip-list').value = filepath;
-                                                }).catch(function(error) {
-                                                    ui.addNotification(null, E('p', {}, _('Failed to create empty file: ' + error.message)));
-                                                });
-                                            }
-                                        }, _('Create Empty List')),
-                                        ' ',
-                                        E('div', { 'class': 'cbi-value-field', 'style': 'display: inline-block' }, [
-                                            E('input', {
-                                                'type': 'file',
-                                                'id': 'geomate-ip-list-upload',
-                                                'style': 'display: none',
-                                                'change': function(ev) {
-                                                    var file = ev.target.files[0];
-                                                    if (!file) return;
+        // Upload to a new file at once; an existing list is only replaced after confirmation
+        var uploadList = function(file) {
+            var path = value('ip_list') || suggestedList();
 
-                                                    var filename = name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
-                                                    var filepath = '/etc/geomate.d/' + filename;
+            if (!/^\/etc\/geomate\.d\/[^\/]+$/.test(path) || path == '/etc/geomate.d/..')
+                return dom.content(status, [ _('Choose a filter name or a list file in /etc/geomate.d/ first.') ]);
 
-                                                    var reader = new FileReader();
-                                                    reader.onload = function(e) {
-                                                        fs.write(filepath, e.target.result).then(function() {
-                                                            var ipListInput = document.getElementById('geomate-ip-list');
-                                                            if (ipListInput) {
-                                                                ipListInput.value = filepath;
-                                                            }
-                                                        }).catch(function(error) {
-                                                            ui.addNotification(null, E('p', {}, _('Failed to upload file: ' + error.message)));
-                                                        });
-                                                    };
-                                                    reader.readAsText(file);
-                                                }
-                                            }),
-                                            E('button', {
-                                                'class': 'btn cbi-button-action',
-                                                'click': function() {
-                                                    document.getElementById('geomate-ip-list-upload').click();
-                                                }
-                                            }, _('Upload IP List'))
-                                        ])
-                                    ])
-                                ])
-                            ])
-                        ])
-                    ])
+            fs.stat(path).then(function() {
+                dom.content(status, [
+                    _('%s already exists. Replace its content with %s?').format(path, file.name), ' ',
+                    E('button', { 'class': 'btn cbi-button-negative', 'click': function() { writeList(path, file); } }, [ _('Overwrite') ]), ' ',
+                    E('button', { 'class': 'btn', 'click': function() {
+                        dom.content(status, [ _('Upload cancelled, %s was not changed.').format(path) ]);
+                    } }, [ _('Keep file') ])
+                ]);
+            }, function(err) {
+                if (err && err.name == 'NotFoundError')
+                    return writeList(path, file);
+                dom.content(status, [ _('Cannot check %s: %s').format(path, err.message) ]);
+            });
+        };
+
+        var fileInput = E('input', { 'type': 'file', 'style': 'display: none', 'change': function(ev) {
+            var file = ev.target.files[0];
+            ev.target.value = '';
+            if (file)
+                uploadList(file);
+        } });
+
+        var row = function(label, node, extra) {
+            return E('div', { 'class': 'cbi-value' }, [
+                E('label', { 'class': 'cbi-value-title', 'style': 'width:33%' }, [ label ]),
+                E('div', { 'class': 'cbi-value-field', 'style': 'margin-left:33%' }, [ node ].concat(extra || []))
+            ]);
+        };
+
+        var nameNode = nameW.render();
+        nameNode.addEventListener('cbi-dropdown-change', update);
+
+        var body = E('div', { 'class': 'cbi-section-node' }, [ row(_('Filter'), nameNode, [ hint ]) ]);
+        Object.keys(fields).forEach(function(k) {
+            body.appendChild(row(labels[k], fields[k].render(), (k != 'ip_list') ? null : [
+                E('div', { 'style': 'margin-top: 8px' }, [
+                    E('button', { 'class': 'btn cbi-button-neutral', 'click': function() {
+                        if (!currentName())
+                            return dom.content(status, [ _('Please specify a filter name first.') ]);
+                        fields.ip_list.setValue(suggestedList());
+                        dom.content(status, [ _('The service creates the list file at its next start if it does not exist.') ]);
+                    } }, [ _('Create Empty List') ]), ' ',
+                    E('button', { 'class': 'btn cbi-button-action', 'click': function() { fileInput.click(); } }, [ _('Upload IP List') ]),
+                    fileInput
+                ]),
+                status
+            ]));
+        });
+
+        return new Promise(function(resolve) {
+            var cancel = function() {
+                ui.hideModal();
+                self.sendMessageToMap('regionDiscarded', { token: token });
+                resolve();
+            };
+
+            var save = function() {
+                // A typed name counts even without Enter
+                var typed = nameNode.querySelector('.create-item-input');
+                if (typed && typed.value.trim()) {
+                    nameW.setValue(typed.value.trim());
+                    typed.value = '';
+                }
+
+                nameW.triggerValidation();
+                Object.keys(fields).forEach(function(k) { fields[k].triggerValidation(); });
+
+                var name = currentName();
+                if (!name)
+                    dom.content(hint, [ _('Choose a filter or enter a new name.') ]);
+
+                if (!name || !nameW.isValid() || body.querySelector('.cbi-input-invalid') ||
+                    Object.keys(fields).some(function(k) { return !fields[k].isValid(); }))
+                    return;
+
+                var values = {};
+                Object.keys(fields).forEach(function(k) { values[k] = value(k); });
+                values.ip_list = values.ip_list || suggestedList();
+
+                ui.hideModal();
+                resolve(Promise.resolve().then(function() {
+                    return self.saveRegion(token, region, name, findFilter(name), values, initial);
+                }));
+            };
+
+            ui.showModal(_('New region'), [
+                E('div', { 'class': 'cbi-map' }, [ E('div', { 'class': 'cbi-section' }, [ body ]) ]),
+                E('p', {}, [
+                    _('All options of all filters:'), ' ',
+                    E('a', { 'href': L.url('admin/services/geomate/geofilters') }, [ _('Geo Filters') ])
                 ]),
                 E('div', { 'class': 'right' }, [
-                    E('button', {
-                        'class': 'btn cbi-button-neutral',
-                        'click': ui.hideModal
-                    }, _('Cancel')),
-                    ' ',
-                    E('button', {
-                        'class': 'btn cbi-button-positive',
-                        'click': function() {
-                            var settings = {
-                                protocol: document.getElementById('geomate-protocol').value,
-                                src_ip: document.querySelector('input[name="src_ip"]').value,
-                                src_port: document.querySelector('input[name="src_port"]').value,
-                                dest_port: document.querySelector('input[name="dest_port"]').value,
-                                allowed_ip: dynlist.getValue(),
-                                ip_list: document.getElementById('geomate-ip-list').value
-                            };
-    
-                            ui.hideModal();
-                            self.saveGeoFilter(name, newRegion, settings);
-                        }
-                    }, _('Save'))
+                    E('button', { 'class': 'btn cbi-button-neutral', 'click': cancel }, [ _('Cancel') ]), ' ',
+                    E('button', { 'class': 'btn cbi-button-positive', 'click': save }, [ _('Save') ])
                 ])
             ]);
 
-            // Set DynamicList values after modal is rendered
-            requestAnimationFrame(function() {
-                if (existingSettings && existingSettings.allowed_ip) {
-                    if (!Array.isArray(existingSettings.allowed_ip)) {
-                        existingSettings.allowed_ip = [existingSettings.allowed_ip];
-                    }
-                    dynlist.setValue(existingSettings.allowed_ip);
-                }
-            });
-        } else {
-            // Logic for updating existing regions
-            return uci.load('geomate')
-                .then(() => {
-                    var sections = uci.sections('geomate', 'geo_filter');
-                    var existingSection = sections.find(section => section.name === name);
-                    
-                    if (existingSection) {
-                        var regions = uci.get('geomate', existingSection['.name'], 'allowed_region') || [];
-                        if (!Array.isArray(regions)) {
-                            regions = [regions];
-                        }
+            update();
+        });
+    },
 
-                        // Find and replace the old region
-                        var index = regions.indexOf(oldRegion);
-                        if (index > -1) {
-                            regions[index] = newRegion;
-                            uci.set('geomate', existingSection['.name'], 'allowed_region', regions);
-                            return uci.save();
-                        }
-                    }
+    // Stage a drawn region from the modal. An existing filter only gets the options the user
+    // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox
+    saveRegion: function(token, region, name, sec, values, initial) {
+        var self = this, sid;
+
+        if (sec) {
+            sid = sec['.name'];
+            var list = this.regionList(sid);
+            if (list.indexOf(region) < 0)
+                list.push(region);
+            uci.set('geomate', sid, 'allowed_region', list);
+
+            Object.keys(values).forEach(function(k) {
+                if (L.toArray(values[k]).join(' ') !== L.toArray(initial[k]).join(' '))
+                    uci.set('geomate', sid, k, isEmpty(values[k]) ? null : values[k]);
+            });
+        }
+        else {
+            sid = uci.add('geomate', 'geo_filter');
+            uci.set('geomate', sid, 'name', name);
+            uci.set('geomate', sid, 'allowed_region', [ region ]);
+
+            Object.keys(values).forEach(function(k) {
+                if (!isEmpty(values[k]))
+                    uci.set('geomate', sid, k, values[k]);
+            });
+        }
+
+        return this.stage().then(function() {
+            // uci.save() replaced the new%06x id; find the section by name and region
+            if (!sec) {
+                var found = uci.sections('geomate', 'geo_filter').find(function(s) {
+                    return s.name === name && L.toArray(s.allowed_region).indexOf(region) > -1;
                 });
-        }
+                if (!found)
+                    throw new Error(_('The region was staged but its new filter %s was not found').format(name));
+                sid = found['.name'];
+            }
+            self.ackRegion(token, sid, region);
+        });
     },
 
-    // Separate function for moving
-    handleMove: function(name, region, newPosition) {
-        return this.saveGeoFilter(name, region, null, newPosition);
-    },
-
-    // Extended saveGeoFilter function
-    saveGeoFilter: function(name, region, settings, newPosition) {
-        return uci.load('geomate')
-            .then(() => {
-                var sections = uci.sections('geomate', 'geo_filter');
-                var existingSection = sections.find(section => section.name === name);
-                
-                if (existingSection && newPosition) {
-                    // Only update position
-                    var regions = uci.get('geomate', existingSection['.name'], 'allowed_region') || [];
-                    if (!Array.isArray(regions)) regions = [regions];
-                    
-                    // Find and update the region
-                    var index = regions.indexOf(region);
-                    if (index > -1) {
-                        regions.splice(index, 1);
-                        regions.splice(newPosition, 0, region);
-                        uci.set('geomate', existingSection['.name'], 'allowed_region', regions);
-                    }
-                } else {
-                    // Normal save logic
-                    var sectionName;
-                    if (existingSection) {
-                        sectionName = existingSection['.name'];
-                        var regions = uci.get('geomate', sectionName, 'allowed_region') || [];
-                        if (!Array.isArray(regions)) regions = [regions];
-                        if (!regions.includes(region)) {
-                            regions.push(region);
-                        }
-                        uci.set('geomate', sectionName, 'allowed_region', regions);
-                    } else {
-                        sectionName = uci.add('geomate', 'geo_filter');
-                        uci.set('geomate', sectionName, 'name', name);
-                        uci.set('geomate', sectionName, 'allowed_region', [region]);
-                    }
-
-                    // Basic settings
-                    uci.set('geomate', sectionName, 'enabled', '1');
-                    
-                    // Optional settings
-                    if (settings) {
-                        if (settings.protocol) {
-                            uci.set('geomate', sectionName, 'protocol', settings.protocol);
-                        }
-                        if (settings.src_ip) {
-                            uci.set('geomate', sectionName, 'src_ip', settings.src_ip);
-                        }
-                        if (settings.src_port) {
-                            uci.set('geomate', sectionName, 'src_port', settings.src_port);
-                        }
-                        if (settings.dest_port) {
-                            uci.set('geomate', sectionName, 'dest_port', settings.dest_port);
-                        }
-                        if (settings.allowed_ip && settings.allowed_ip.length > 0) {
-                            uci.set('geomate', sectionName, 'allowed_ip', settings.allowed_ip);
-                        }
-                        if (settings.ip_list) {
-                            uci.set('geomate', sectionName, 'ip_list', settings.ip_list);
-                        }
-                    }
-                }
-
-                return uci.save();
-            });
-    },
-
-    // Send a generic message to the map iframe
-    sendMessageToMap: function(type, data) {
-        var iframe = document.querySelector('#geomate-map-container iframe');
-        if (iframe) {
-            iframe.contentWindow.postMessage({ type: type, ...data }, '*');
-        }
-    },
-
-    // Check and log the current UCI configuration for Geomate
-    checkUCIConfig: function() {
-        return uci.load('geomate')
-            .then(() => {
-                var sections = uci.sections('geomate', 'geo_filter');
-                console.log('Current UCI geomate config:', sections);
-                return sections;
-            });
-    },
-
-    // Log the current UCI values for debugging purposes
-    logUCIValues: function() {
-        return uci.load('geomate')
-            .then(() => {
-                var sections = uci.sections('geomate', 'geo_filter');
-                console.log('Current UCI geomate config:', JSON.stringify(sections, null, 2));
-            });
-    },
-
-    // Debug function to log any changes in the UCI configuration
-    debugUCI: function() {
-        return uci.changes()
-            .then(changes => {
-                console.log('Current UCI changes:', JSON.stringify(changes, null, 2));
-            })
-            .catch(error => {
-                console.error('Error getting UCI changes:', error);
-            });
-    },
-
-    // Handle the reset action to clear the map and reload geo filters
+    // form.Map.reset() renders a new map iframe, which loads its regions on mapReady
     handleReset: function(ev) {
-        return this.map.reset()
-            .then(() => {
-                this.sendMessageToMap('clearMap');
-                this.loadGeoFilters();
-                ui.addNotification(null, E('p', _('Form values have been reset')), 'success');
-            });
+        return this.map.reset().then(function() {
+            ui.addNotification(null, E('p', _('Form values have been reset')), 'success');
+        });
     },
 
     // Function to update the active connections table
     updateActiveConnectionsList: function() {
         var tbody = document.getElementById('active-connections-table-body');
         if (!tbody) return;
-    
-        // Clear the existing table content
-        while (tbody.firstChild) {
-            tbody.removeChild(tbody.firstChild);
-        }
-    
-        var connections = this.currentConnectionsData;
-    
+
         // Skip any connection object lacking filter_name to avoid errors
-        connections.forEach(function(conn) {
-            if (!conn || !conn.filter_name) {
-                console.warn('Skipping a connection with no filter_name:', conn);
-                return;  // Safely skip this item
-            }
-    
-            var geoFilterName = conn.filter_name || _('Unknown');
-            var status = _('Unknown');
-    
+        dom.content(tbody, this.currentConnectionsData.filter(function(conn) {
+            return conn && conn.filter_name;
+        }).map(function(conn) {
+            var status;
+
             // Determine the status based on connection data
             if (conn.is_allowed_ip) {
                 status = _('Allowed (Whitelist)');
@@ -921,52 +971,14 @@ return view.extend({
             } else {
                 status = _('Unknown');
             }
-    
-            var destIP = conn.dst || _('Unknown');
-            var tr = E('tr', {}, [
-                E('td', {}, destIP),
-                E('td', {}, geoFilterName),
-                E('td', {}, status)
+
+            // Cells take text nodes only: names and addresses never run as markup
+            return E('tr', {}, [
+                E('td', {}, [ conn.dst || _('Unknown') ]),
+                E('td', {}, [ conn.filter_name ]),
+                E('td', {}, [ status ])
             ]);
-            tbody.appendChild(tr);
-        });
-    
-        console.log('Active connections:', connections);
-    },
-
-    // Remove a Geo-Filter or a specific region from it
-    deleteGeoFilter: function(name, region) {
-        console.log('Removing region from UCI config:', name, region);
-        return uci.load('geomate')
-            .then(() => {
-                var sections = uci.sections('geomate', 'geo_filter');
-                var existingSection = sections.find(section => section.name === name);
-                if (existingSection) {
-                    var regionsList = existingSection.allowed_region || [];
-                    if (!Array.isArray(regionsList)) {
-                        regionsList = [regionsList];
-                    }
-
-                    var index = regionsList.indexOf(region);
-                    if (index > -1) {
-                        regionsList.splice(index, 1);
-                        console.log('Remaining regions after deletion:', regionsList);
-
-                        if (regionsList.length === 0) {
-                            // If no regions remain, disable the filter
-                            uci.set('geomate', existingSection['.name'], 'enabled', '0');
-                            uci.unset('geomate', existingSection['.name'], 'allowed_region');
-                            console.log('Disabled filter due to no regions:', name);
-                        } else {
-                            // Update the regions list
-                            uci.set('geomate', existingSection['.name'], 'allowed_region', regionsList);
-                        }
-                        
-                        return uci.save();
-                    }
-                }
-                return Promise.resolve();
-            });
+        }));
     },
 
     // Check for updates
