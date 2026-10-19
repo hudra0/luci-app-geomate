@@ -15,37 +15,108 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 
     <style>
+        html, body { margin: 0; }
         #map { height: 100vh; width: 100%; }
-        .home-buttons-container {
+
+        /* Colors of the map's own controls; the theme handover (phase 3) overrides them */
+        :root {
+            --gm-bg: #ffffff;
+            --gm-fg: #1f2328;
+            --gm-hover: #eef1f4;
+            --gm-disabled-bg: #f4f4f4;
+            --gm-disabled-fg: #a0a6ad;
+            --gm-accent: #1a6fd1;
+            --gm-accent-fg: #ffffff;
+            --gm-font: 600 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+        }
+
+        /* Map toolbar: labelled buttons in two groups (drawing, view) */
+        .gm-toolbar { display: flex; flex-direction: column; gap: 10px; }
+        .leaflet-bar.gm-toolbar-group { background: var(--gm-bg); }
+        .leaflet-bar a.gm-btn,
+        .leaflet-touch .leaflet-bar a.gm-btn {
             display: flex;
+            align-items: center;
+            gap: 8px;
+            box-sizing: border-box;
+            width: auto;
+            min-width: 36px;
+            height: 36px;
+            padding: 0 12px 0 10px;
+            line-height: 1.2;
+            font: var(--gm-font);
+            text-align: left;
+            white-space: nowrap;
+            color: var(--gm-fg);
+            background: var(--gm-bg);
         }
-        .home-button {
-            font-size: 18px;
-            font-weight: bold;
-            color: #333;
-            text-decoration: none;
-            text-align: center;
-            line-height: 30px;
-            background: white;
-            width: 30px;
-            height: 30px;
+        .gm-btn i { width: 16px; font-size: 15px; text-align: center; }
+        .gm-btn--draw i { color: var(--gm-target, var(--gm-accent)); }
+        .leaflet-bar a.gm-btn:hover { background: var(--gm-hover); color: var(--gm-fg); }
+        .leaflet-bar a.gm-btn:focus { outline: none; }
+        .leaflet-bar a.gm-btn:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: -3px; }
+        .leaflet-bar a.gm-btn.gm-btn--active,
+        .leaflet-bar a.gm-btn.gm-btn--active:hover { background: var(--gm-accent); color: var(--gm-accent-fg); }
+        .leaflet-bar a.gm-btn.gm-btn--active i { color: inherit; }
+        .leaflet-bar a.gm-btn.leaflet-disabled,
+        .leaflet-bar a.gm-btn.leaflet-disabled:hover { background: var(--gm-disabled-bg); color: var(--gm-disabled-fg); cursor: not-allowed; }
+        .leaflet-bar a.gm-btn.leaflet-disabled i { color: inherit; }
+        @media (pointer: coarse) {
+            .leaflet-bar a.gm-btn,
+            .leaflet-touch .leaflet-bar a.gm-btn { min-width: 44px; height: 44px; font-size: 14px; }
         }
-        .set-home-button {
-            border-top-left-radius: 4px;
-            border-bottom-left-radius: 4px;
-            border-right: 1px solid #ccc;
+        /* Narrow maps: icons only, the title attribute keeps the label */
+        @media (max-width: 639px) {
+            .gm-btn-label { display: none; }
+            .leaflet-bar a.gm-btn,
+            .leaflet-touch .leaflet-bar a.gm-btn { width: 36px; padding: 0; justify-content: center; }
         }
-        .go-home-button {
-            border-top-right-radius: 4px;
-            border-bottom-right-radius: 4px;
+        @media (max-width: 639px) and (pointer: coarse) {
+            .leaflet-bar a.gm-btn,
+            .leaflet-touch .leaflet-bar a.gm-btn { width: 44px; }
         }
-        .home-button:hover {
-            background: #f4f4f4;
+
+        /* Mode bar: a fixed strip on top of the map while drawing, setting home or editing */
+        .gm-mode-bar {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1001;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            gap: 6px 12px;
+            box-sizing: border-box;
+            min-height: 40px;
+            padding: 6px 12px;
+            font: var(--gm-font);
+            color: var(--gm-accent-fg);
+            background: var(--gm-accent);
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.35);
+            cursor: default;
         }
-        .set-home-cursor,
-        .set-home-cursor * {
-            cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 100 100"><text y=".9em" font-size="90">📍</text></svg>') 20 20, auto !important;
+        .gm-mode-bar[hidden] { display: none; }
+        .gm-mode-swatch { flex: none; width: 12px; height: 12px; margin-right: -6px; border: 2px solid var(--gm-accent-fg); border-radius: 50%; }
+        .gm-mode-extra:empty { display: none; }
+        .gm-mode-extra { font-variant-numeric: tabular-nums; }
+        .gm-mode-bar button {
+            min-height: 28px;
+            padding: 3px 14px;
+            font: inherit;
+            color: inherit;
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            border-radius: 4px;
+            cursor: pointer;
         }
+        .gm-mode-bar button:hover { background: rgba(255, 255, 255, 0.18); }
+        .gm-mode-bar button:focus-visible { outline: 2px solid var(--gm-accent-fg); outline-offset: 2px; }
+        @media (pointer: coarse) {
+            .gm-mode-bar button { min-height: 40px; }
+        }
+
         .custom-div-icon i {
             font-size: 20px;
         }
@@ -138,7 +209,7 @@
             top: 10px;
             left: 50%;
             transform: translateX(-50%);
-            z-index: 1001;
+            z-index: 1002;
             max-width: 80%;
             padding: 6px 12px;
             background: white;
@@ -147,6 +218,22 @@
             box-shadow: 0 1px 5px rgba(0,0,0,0.4);
             font: 13px/1.4 sans-serif;
             pointer-events: none;   /* text only: clicks and drags reach the map and its controls */
+        }
+        #gm-toast .gm-toast-action {
+            pointer-events: auto;   /* except its action button */
+            margin-left: 8px;
+            min-height: 28px;
+            padding: 3px 12px;
+            font: var(--gm-font);
+            color: var(--gm-accent-fg);
+            background: var(--gm-accent);
+            border: 0;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #gm-toast .gm-toast-action:focus-visible { outline: 2px solid var(--gm-fg); outline-offset: 2px; }
+        @media (pointer: coarse) {
+            #gm-toast .gm-toast-action { min-height: 40px; }
         }
     </style>
 </head>
@@ -160,8 +247,17 @@
         'use strict';
 
         var map, drawnItems;
-        var drawControl = null; // on the map only while the parent allows changes (setReadonly)
-        var homePosition = [51.505, -0.09];
+        var drawControl = null; // edit and delete toolbar, on the map only while the parent allows changes
+        var readonly = true;    // until the parent says otherwise (setReadonly)
+        var HOME_KEY = 'geomate-map-home';
+        var home = { center: [51.505, -0.09], zoom: 4 };
+        var toolbar = null;     // buttons of the map toolbar
+        var modeBar = null;     // strip on top of the map that explains the current mode
+        var mode = null;        // null, 'draw', 'home', 'edit' or 'delete'
+        var drawTarget = null;  // filter Draw circle draws for (selectFilter); null disables Draw
+        var drawHandler = null; // the running L.Draw.Circle
+        var drawingFor = null;  // drawTarget when the running drawing started
+        var viewFitted = false; // the start view has been fitted to the regions
 
         /*
          * Region identity lives in layer.gm, never in layer.options: Leaflet.draw saves and
@@ -245,12 +341,46 @@
             window.parent.postMessage({ type: type, data: data }, location.origin);
         }
 
-        function showToast(text) {
-            var el = document.getElementById('gm-toast');
+        /**
+         * Shows a short message on top of the map.
+         * @param {string} text - The message, shown as text.
+         * @param {Object} [action] - { label, name, sid }: a button that sends toastAction { name, sid }.
+         */
+        function showToast(text, action) {
+            var el = document.getElementById('gm-toast'), button;
+            var hide = function() { el.style.display = 'none'; };
+
             el.textContent = text;
+            if (action) {
+                button = L.DomUtil.create('button', 'gm-toast-action', el);
+                button.type = 'button';
+                button.textContent = action.label;
+                onTap(button, function() {
+                    hide();
+                    post('toastAction', { name: action.name, sid: action.sid });
+                });
+            }
             el.style.display = 'block';
             clearTimeout(toastTimer);
-            toastTimer = setTimeout(function() { el.style.display = 'none'; }, 6000);
+            toastTimer = setTimeout(hide, action ? 15000 : 6000);
+        }
+
+        /**
+         * Runs fn on a click (mouse, touch or keyboard) on el, which then goes no further.
+         * While Leaflet.draw draws, it cancels every touchstart of the page, so a touch gives
+         * no click event; touchend acts then. Not tested on touch devices yet.
+         */
+        function onTap(el, fn) {
+            L.DomEvent.on(el, 'click', function(e) {
+                L.DomEvent.stop(e);
+                fn();
+            });
+            L.DomEvent.on(el, 'touchend', function(e) {
+                if (drawHandler) {
+                    L.DomEvent.stop(e);
+                    fn();
+                }
+            });
         }
 
         // Popup content as text nodes: filter names never run as markup
@@ -304,31 +434,327 @@
         }
 
         /**
-         * Shows or hides the drawing and editing toolbar. Without write access the parent
+         * Shows or hides the drawing and editing tools. Without write access the parent
          * stages nothing, so the map offers no tools.
-         * @param {boolean} readonly - True when the user may not change regions.
+         * @param {boolean} value - True when the user may not change regions.
          */
-        function setReadonly(readonly) {
-            if (readonly && drawControl._map) {
-                map.removeControl(drawControl);
-            } else if (!readonly && !drawControl._map) {
+        function setReadonly(value) {
+            readonly = value;
+            if (readonly) {
+                cancelDraw();
+                if (drawControl._map) map.removeControl(drawControl);
+            } else if (!drawControl._map) {
                 map.addControl(drawControl);
             }
+            updateToolbar();
+        }
+
+        // Home view: { center: [lat, lng], zoom }; the older map stored only [lat, lng] (zoom 4)
+        function loadHome() {
+            var isLatLng = function(v) {
+                return Array.isArray(v) && v.length === 2 && Number.isFinite(v[0]) && Number.isFinite(v[1]) &&
+                    Math.abs(v[0]) <= 90 && Math.abs(v[1]) <= 180;
+            };
+            try {
+                var v = JSON.parse(localStorage.getItem(HOME_KEY) || 'null');
+                if (v && isLatLng(v.center) && Number.isFinite(v.zoom)) return { center: v.center, zoom: v.zoom };
+                v = JSON.parse(localStorage.getItem('homePosition') || 'null');
+                if (isLatLng(v)) return { center: v, zoom: 4 };
+            } catch (e) {}
+            return home;
+        }
+
+        function goHome() {
+            map.setView(home.center, home.zoom);
+        }
+
+        /**
+         * Zooms to all regions, or to the home view when there are none.
+         * @param {boolean} [quiet] - No note when there is no region (start view).
+         */
+        function fitAll(quiet) {
+            var bounds = drawnItems.getBounds();
+            if (bounds.isValid()) {
+                map.fitBounds(bounds.pad(0.15), { maxZoom: 10 });
+            } else {
+                goHome();
+                if (!quiet) showToast('No regions yet: showing the home view.');
+            }
+        }
+
+        /**
+         * Shows the mode bar with a text and buttons, and moves the top controls below it.
+         * @param {string} text - What the user can do now.
+         * @param {Array} buttons - [[label, fn], ...]
+         * @param {string} [color] - Filter color, shown as a dot before the text.
+         */
+        function showModeBar(text, buttons, color) {
+            modeBar.textContent = '';
+            if (color) L.DomUtil.create('span', 'gm-mode-swatch', modeBar).style.background = color;
+            L.DomUtil.create('span', 'gm-mode-text', modeBar).textContent = text;
+            L.DomUtil.create('span', 'gm-mode-extra', modeBar);
+            buttons.forEach(function(b) {
+                var el = L.DomUtil.create('button', '', modeBar);
+                el.type = 'button';
+                el.textContent = b[0];
+                onTap(el, b[1]);
+            });
+            modeBar.hidden = false;
+            layoutModeBar();
+        }
+
+        function hideModeBar() {
+            modeBar.hidden = true;
+            layoutModeBar();
+        }
+
+        // Extra text in the mode bar, e.g. the radius while drawing
+        function setModeExtra(text) {
+            var el = modeBar.querySelector('.gm-mode-extra');
+            if (el) el.textContent = text;
+        }
+
+        function layoutModeBar() {
+            var h = modeBar.hidden ? 0 : modeBar.offsetHeight;
+            map.getContainer().querySelectorAll('.leaflet-top').forEach(function(el) {
+                el.style.top = h ? h + 'px' : '';
+            });
+            document.getElementById('gm-toast').style.top = (h + 10) + 'px';
+        }
+
+        /**
+         * Formats a radius for the mode bar: meters below 1 km, one decimal below 10 km.
+         * @param {number} m - Radius in meters.
+         */
+        function formatDistance(m) {
+            if (m < 1000) return Math.round(m) + ' m';
+            if (m < 10000) return (m / 1000).toFixed(1) + ' km';
+            return Math.round(m / 1000) + ' km';
+        }
+
+        function setPressed(el, on) {
+            L.DomUtil[on ? 'addClass' : 'removeClass'](el, 'gm-btn--active');
+            el.setAttribute('aria-pressed', on ? 'true' : 'false');
+        }
+
+        function targetName(target) {
+            return target.isNew ? 'a new filter' : (target.name || target.sid);
+        }
+
+        // State, titles and visibility of the toolbar buttons
+        function updateToolbar() {
+            var a = toolbar.draw, editing = mode === 'edit' || mode === 'delete',
+                disabled = !drawTarget || editing;
+
+            toolbar.drawGroup.style.display = readonly ? 'none' : '';
+            L.DomUtil[disabled ? 'addClass' : 'removeClass'](a, 'leaflet-disabled');
+            a.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+            a.style.setProperty('--gm-target', drawTarget && drawTarget.color || '');
+            a.title = editing ? 'Finish editing first: Save or Cancel next to the edit buttons' :
+                !drawTarget ? 'Choose a filter above the map to draw a circle' :
+                mode === 'draw' ? 'Stop drawing (Esc)' :
+                'Draw a circle for ' + targetName(drawTarget);
+            setPressed(a, mode === 'draw');
+            setPressed(toolbar.setHome, mode === 'home');
+        }
+
+        /**
+         * Labelled toolbar button: icon plus text, the text hides on narrow maps.
+         * A disabled button tells why in a toast.
+         */
+        function toolbarButton(group, icon, label, title, fn, className) {
+            var a = L.DomUtil.create('a', 'gm-btn' + (className ? ' ' + className : ''), group);
+            a.href = '#';
+            a.title = title;
+            a.setAttribute('role', 'button');
+            a.setAttribute('aria-label', label);
+            L.DomUtil.create('i', 'fa-solid ' + icon, a).setAttribute('aria-hidden', 'true');
+            L.DomUtil.create('span', 'gm-btn-label', a).textContent = label;
+            onTap(a, function() {
+                if (L.DomUtil.hasClass(a, 'leaflet-disabled')) {
+                    showToast(a.title + '.');
+                } else {
+                    fn();
+                }
+            });
+            // Space works like on a button; Enter clicks the link anyway
+            L.DomEvent.on(a, 'keydown', function(e) {
+                if (e.key === ' ') {
+                    L.DomEvent.preventDefault(e);
+                    a.click();
+                }
+            });
+            return a;
+        }
+
+        var GmToolbar = L.Control.extend({
+            options: { position: 'topleft' },
+            onAdd: function() {
+                var box = L.DomUtil.create('div', 'gm-toolbar');
+                var drawGroup = L.DomUtil.create('div', 'leaflet-bar gm-toolbar-group', box);
+                var viewGroup = L.DomUtil.create('div', 'leaflet-bar gm-toolbar-group', box);
+
+                toolbar = {
+                    drawGroup: drawGroup,
+                    draw: toolbarButton(drawGroup, 'fa-circle-plus', 'Draw circle', '', toggleDraw, 'gm-btn--draw'),
+                    fit: toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all regions', function() { fitAll(false); }),
+                    home: toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome),
+                    setHome: toolbarButton(viewGroup, 'fa-location-dot', 'Set home',
+                        'Set the home view: click the map at the zoom you want', toggleSetHome)
+                };
+                L.DomEvent.disableClickPropagation(box);
+                L.DomEvent.disableScrollPropagation(box);
+                return box;
+            }
+        });
+
+        // Leaflet.draw circle handler that reports the radius while the user drags
+        var GmDrawCircle = L.Draw.Circle.extend({
+            _drawShape: function(latlng) {
+                L.Draw.Circle.prototype._drawShape.call(this, latlng);
+                this._map.fire('gm:drawradius', { radius: this._shape.getRadius() });
+            }
+        });
+
+        /**
+         * Starts drawing a circle for a filter.
+         * @param {Object} [target] - { sid, name, color, isNew } from startDraw; default drawTarget.
+         */
+        function startDraw(target) {
+            if (readonly) return;
+            if (target) selectFilter(target);
+            if (!drawTarget) {
+                showToast('Choose a filter above the map first.');
+                return;
+            }
+            if (mode === 'edit' || mode === 'delete') {
+                showToast('Finish editing first: Save or Cancel next to the edit buttons.');
+                return;
+            }
+            if (mode === 'home') stopSetHome();
+            if (drawHandler) return;
+
+            var color = drawTarget.color || '#666666';
+            drawingFor = drawTarget;
+            drawHandler = new GmDrawCircle(map, {
+                shapeOptions: { color: color, fillColor: color, weight: 2, opacity: 1, dashArray: '6,6', fillOpacity: 0.12 },
+                showRadius: true
+            });
+            drawHandler.enable();
+        }
+
+        function cancelDraw() {
+            if (!drawHandler) return;
+            map.fire('draw:canceled', { layerType: 'circle' });
+            drawHandler.disable();
+        }
+
+        function toggleDraw() {
+            if (mode === 'draw') {
+                cancelDraw();
+            } else {
+                startDraw();
+            }
+        }
+
+        function onDrawStart() {
+            mode = 'draw';
+            showModeBar('Drawing a circle for ' + targetName(drawingFor) + ': click and drag · Esc cancels',
+                [['Cancel', cancelDraw]], drawingFor.color);
+            updateToolbar();
+            post('drawState', { drawing: true });
+        }
+
+        // Also after a finished drawing: Leaflet.draw fires draw:created before it stops
+        function onDrawStop() {
+            drawHandler = null;
+            drawingFor = null;
+            if (mode === 'draw') {
+                mode = null;
+                hideModeBar();
+            }
+            updateToolbar();
+            post('drawState', { drawing: false });
+        }
+
+        /**
+         * Sets the filter Draw circle draws for. A different filter ends a running drawing.
+         * @param {Object|null} target - { sid, name, color, enabled, isNew } or null.
+         */
+        function selectFilter(target) {
+            var next = target && (target.sid || target.isNew) ? target : null;
+            var same = next && drawTarget && next.sid === drawTarget.sid && !!next.isNew === !!drawTarget.isNew;
+            drawTarget = next;
+            if (!same) cancelDraw();
+            updateToolbar();
+        }
+
+        function toggleSetHome() {
+            if (mode === 'home') {
+                stopSetHome();
+                return;
+            }
+            if (mode === 'edit' || mode === 'delete') {
+                showToast('Finish editing first: Save or Cancel next to the edit buttons.');
+                return;
+            }
+            cancelDraw();
+            mode = 'home';
+            L.DomUtil.addClass(map.getContainer(), 'leaflet-crosshair');
+            map.on('click', onSetHomeClick);
+            showModeBar('Click the map to make it the home view at the current zoom · Esc cancels',
+                [['Cancel', stopSetHome]]);
+            updateToolbar();
+        }
+
+        function stopSetHome() {
+            if (mode !== 'home') return;
+            map.off('click', onSetHomeClick);
+            L.DomUtil.removeClass(map.getContainer(), 'leaflet-crosshair');
+            mode = null;
+            hideModeBar();
+            updateToolbar();
+        }
+
+        function onSetHomeClick(e) {
+            var center = e.latlng.wrap();
+            home = { center: [center.lat, center.lng], zoom: map.getZoom() };
+            try {
+                localStorage.setItem(HOME_KEY, JSON.stringify(home));
+            } catch (err) {
+                showToast('The home view could not be saved in this browser; it lasts until the page reloads.');
+            }
+            stopSetHome();
+            goHome();
+        }
+
+        // The edit and delete toolbar of Leaflet.draw explains itself in the mode bar
+        function onEditStart(e) {
+            cancelDraw();
+            stopSetHome();
+            mode = (e.type === 'draw:deletestart') ? 'delete' : 'edit';
+            showModeBar(mode === 'edit'
+                ? 'Editing regions: drag the centre handle to move a circle, the edge handle to resize it · Save or Cancel next to the edit buttons'
+                : 'Deleting regions: click the circles to remove · Save or Cancel next to the edit buttons', []);
+            updateToolbar();
+        }
+
+        function onEditStop() {
+            mode = null;
+            hideModeBar();
+            updateToolbar();
         }
 
         /**
          * Initializes the map and its components.
          */
         function initMap() {
-            // Load the saved home position, if available
-            var savedPosition = localStorage.getItem('homePosition');
-            if (savedPosition) {
-                homePosition = JSON.parse(savedPosition);
-            }
+            home = loadHome();
 
             map = L.map('map', {
-                center: homePosition,
-                zoom: 4,
+                center: home.center,
+                zoom: home.zoom,
+                drawControlTooltips: false,
                 minZoom: 2,
                 maxBounds: [[-90, -180], [90, 180]],
                 maxBoundsViscosity: 1.0
@@ -344,43 +770,24 @@
             // Add the MarkerCluster group to the map
             map.addLayer(markerClusters);
 
-            // Define custom control for Home Buttons
-            L.Control.HomeButtons = L.Control.extend({
-                onAdd: function(map) {
-                    var container = L.DomUtil.create('div', 'leaflet-bar leaflet-control home-buttons-container');
-                    
-                    var setHomeButton = L.DomUtil.create('a', 'home-button set-home-button', container);
-                    setHomeButton.innerHTML = '📍';
-                    setHomeButton.href = '#';
-                    setHomeButton.title = 'Set home position';
+            // Map toolbar: Draw circle, Fit all, Home, Set home
+            new GmToolbar().addTo(map);
+            updateToolbar();
 
-                    var goHomeButton = L.DomUtil.create('a', 'home-button go-home-button', container);
-                    goHomeButton.innerHTML = '🏠';
-                    goHomeButton.href = '#';
-                    goHomeButton.title = 'Go to home position';
-                    
-                    L.DomEvent.disableClickPropagation(container);
-                    
-                    L.DomEvent.on(setHomeButton, 'click', function(e) {
-                        L.DomEvent.stop(e);
-                        setHomeButton.style.backgroundColor = '#ffff00';
-                        map.getContainer().classList.add('set-home-cursor');
-                        map.once('click', onMapClick);
-                    });
-                    
-                    L.DomEvent.on(goHomeButton, 'click', function(e) {
-                        L.DomEvent.stop(e);
-                        if (homePosition) {
-                            map.setView(homePosition, 4);
-                        }
-                    });
-                    
-                    return container;
-                }
+            modeBar = L.DomUtil.create('div', 'gm-mode-bar', map.getContainer());
+            modeBar.hidden = true;
+            modeBar.setAttribute('role', 'status');
+            L.DomEvent.disableClickPropagation(modeBar);
+            L.DomEvent.disableScrollPropagation(modeBar);
+            // The bar wraps on narrow maps
+            map.on('resize', layoutModeBar);
+
+            // Escape ends drawing and Set home; registered once
+            L.DomEvent.on(document, 'keydown', function(e) {
+                if (e.key !== 'Escape') return;
+                if (mode === 'draw') cancelDraw();
+                else if (mode === 'home') stopSetHome();
             });
-            
-            // Add Home Buttons control to the map
-            new L.Control.HomeButtons({ position: 'topleft' }).addTo(map);
 
             drawnItems = new L.FeatureGroup();
             map.addLayer(drawnItems);
@@ -388,23 +795,22 @@
             // No "Clear All" in the delete toolbar: it removed every circle of every filter at once
             L.EditToolbar.Delete.prototype.removeAllLayers = null;
 
-            // Drawing controls; setReadonly adds them once the parent allows changes
+            // Edit and delete toolbar until per-circle editing replaces it; the map toolbar draws.
+            // setReadonly adds it once the parent allows changes
             drawControl = new L.Control.Draw({
                 edit: { featureGroup: drawnItems },
-                draw: {
-                    polygon: false,
-                    polyline: false,
-                    rectangle: false,
-                    circle: true,
-                    marker: false,
-                    circlemarker: false
-                }
+                draw: false
             });
 
             // Event listeners for drawing actions
             map.on(L.Draw.Event.CREATED, onDrawCreated);
             map.on(L.Draw.Event.EDITED, onDrawEdited);
             map.on(L.Draw.Event.DELETED, onDrawDeleted);
+            map.on('draw:drawstart', onDrawStart);
+            map.on('draw:drawstop', onDrawStop);
+            map.on('draw:editstart draw:deletestart', onEditStart);
+            map.on('draw:editstop draw:deletestop', onEditStop);
+            map.on('gm:drawradius', function(e) { setModeExtra('r = ' + formatDistance(e.radius)); });
 
             // Add legend control
             var legendControl = L.control({ position: 'bottomright' });
@@ -471,22 +877,6 @@
 
             // Notify parent frame that the map is ready
             post('mapReady');
-            
-            if (homePosition) {
-                map.setView(homePosition, 4);
-            }
-        }
-
-        /**
-         * Handles the map click event when setting a new home position.
-         * @param {Object} e - The event object containing latlng.
-         */
-        function onMapClick(e) {
-            homePosition = [e.latlng.lat, e.latlng.lng];
-            localStorage.setItem('homePosition', JSON.stringify(homePosition));
-            map.setView(homePosition, 4);
-            document.querySelector('.set-home-button').style.backgroundColor = '';
-            map.getContainer().classList.remove('set-home-cursor');
         }
 
         /**
@@ -533,14 +923,18 @@
             var gm = layer.gm, color = gm.color, tags = [];
             var label = document.createElement('span');
 
+            // weight and opacity also reset what the draw handler's shapeOptions set
             if (gm.pending) {
-                layer.setStyle({ color: '#666666', fillColor: '#666666', fillOpacity: 0.1, dashArray: '6 6' });
-                label.textContent = 'New circle';
+                color = color || '#666666';
+                layer.setStyle({ color: color, fillColor: color, weight: 3, opacity: 1, fillOpacity: 0.1, dashArray: '6 6' });
+                label.textContent = gm.name ? gm.name + ' (new region)' : 'New circle';
             } else {
                 // Disabled filters: dashed and faint
                 layer.setStyle({
                     color: color,
                     fillColor: color,
+                    weight: 3,
+                    opacity: 1,
                     fillOpacity: gm.enabled ? 0.3 : 0.06,
                     dashArray: gm.enabled ? null : '4 8'
                 });
@@ -601,6 +995,12 @@
                     addRegion(filter, region, !!staged[filter.sid]);
                 });
             });
+
+            // Start view: all regions, or the home view without any
+            if (!viewFitted) {
+                viewFitted = true;
+                fitAll(true);
+            }
         }
 
         /**
@@ -626,22 +1026,30 @@
 
         /**
          * A new circle stays pending until the parent answers with regionSaved,
-         * regionDiscarded or regionRejected.
+         * regionDiscarded or regionRejected. It shows the color of the filter it was drawn for.
          * @param {Object} event - The draw event object.
          */
         function onDrawCreated(event) {
-            var layer = event.layer;
+            var layer = event.layer, target = drawingFor || {};
             // A click without a drag gives a circle that UCI cannot store (radius 0 m)
             if (Math.round(layer.getRadius()) < 1) {
                 showToast('Drag to draw a circle.');
                 return;
             }
             wrapCenter(layer);
-            layer.gm = { token: tokenPrefix + L.stamp(layer), sid: null, name: '', region: regionString(layer), pending: true };
+            layer.gm = {
+                token: tokenPrefix + L.stamp(layer),
+                sid: null,
+                name: target.isNew ? '' : (target.name || ''),
+                color: target.color,
+                region: regionString(layer),
+                pending: true
+            };
             circles[layer.gm.token] = layer;
             applyLook(layer);
             drawnItems.addLayer(layer);
-            post('regionDrawn', { token: layer.gm.token, region: layer.gm.region });
+            // sid null: a new filter, the parent asks for its name
+            post('regionDrawn', { token: layer.gm.token, region: layer.gm.region, sid: target.isNew ? null : (target.sid || null) });
         }
 
         /**
@@ -733,7 +1141,29 @@
             if (type === 'regionRejected' && d.reason) showToast(d.reason);
         }
 
-        // Listener for messages from the parent frame; nobody else may talk to the map
+        /*
+         * Messages between view.js (parent) and this map, { type, data }, same origin only.
+         * map -> parent:
+         *   mapReady          -
+         *   drawState         { drawing }                      a drawing started or ended
+         *   regionDrawn       { token, region, sid }           sid null: for a new filter
+         *   regionEdited      { token, sid, oldRegion, region }
+         *   regionDeleted     { token, sid, oldRegion }
+         *   regionInvalid     { sid, region }
+         *   toastAction       { name, sid }                    button in a toast, e.g. enableFilter
+         * parent -> map:
+         *   setReadonly       { readonly }                     no drawing or editing tools when true
+         *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
+         *   selectFilter      { sid, name, color, enabled, isNew } or null: what Draw circle draws for
+         *   startDraw         like selectFilter, then draw     ("Draw circle" above the map)
+         *   cancelDraw        -
+         *   fitAll            -
+         *   filterChanged     { sid, name, color, enabled }    e.g. after "Enable filter"
+         *   regionSaved       { token, sid, name, color, enabled, region }
+         *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
+         *   toast             { text, action: { label, name, sid } }
+         *   updateConnections [connection]
+         */
         window.addEventListener('message', function(event) {
             if (event.origin !== location.origin || event.source !== window.parent || !event.data) return;
 
@@ -744,8 +1174,20 @@
                 updateConnections(data || []);
             } else if (type === 'setReadonly') {
                 setReadonly(!data || data.readonly !== false);
+            } else if (type === 'selectFilter') {
+                selectFilter(data || null);
+            } else if (type === 'startDraw') {
+                startDraw(data || null);
+            } else if (type === 'cancelDraw') {
+                cancelDraw();
+            } else if (type === 'fitAll') {
+                fitAll(false);
+            } else if (type === 'filterChanged' && data && data.sid) {
+                updateFilter(data.sid, { name: data.name, color: data.color, enabled: !!data.enabled, staged: true });
             } else if (type === 'toast' && data && data.text) {
-                showToast(String(data.text));
+                var action = data.action;
+                showToast(String(data.text), (action && action.name && action.label)
+                    ? { label: String(action.label), name: String(action.name), sid: action.sid } : null);
             } else if (/^region(Saved|Removed|Discarded|Rejected)$/.test(type) && data) {
                 onRegionAnswer(type, data);
             }
