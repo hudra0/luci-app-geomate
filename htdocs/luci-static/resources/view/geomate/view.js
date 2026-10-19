@@ -1,6 +1,5 @@
 'use strict';
 'require view';
-'require form';
 'require uci';
 'require ui';
 'require rpc';
@@ -64,17 +63,18 @@ function errorText(err) {
     return String((err && err.message) || err).split('\n')[0];
 }
 
-// Declare RPC methods to interact with the Geomate backend
+// Declare RPC methods to interact with the Geomate backend. Whitelisted IPs reach the map through
+// getGeomateConnections (is_allowed_ip): the map shows only IPs with an active connection
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
     method: 'getGeomateConnections',
-    params: []
+    expect: { connections: [] }
 });
 
-var callGeomateAllowedIPs = rpc.declare({
+var callGetStatus = rpc.declare({
     object: 'luci.geomate',
-    method: 'getAllowedIPs',
-    params: []
+    method: 'getStatus',
+    expect: { status: {} }
 });
 
 var callGetHealthCheck = rpc.declare({
@@ -83,452 +83,384 @@ var callGetHealthCheck = rpc.declare({
     expect: { health: {} }
 });
 
-// Function to retrieve the current status of the Geomate service
-function getServiceStatus() {
-    return fs.exec('/etc/init.d/geomate', ['status']).then(function(res) {
-        var output = res.stdout.trim().toLowerCase();
-        if (res.code === 0 && output.includes('running')) {
-            return 'Running';
-        } else {
-            return 'Not Running';
-        }
-    }).catch(function(err) {
-        console.error('Error getting service status:', err);
-        return 'Not Running';
-    });
-}
-
-// Function to check if /tmp/geomate_loading exists
-function getLoadingStatus() {
-    return fs.stat('/tmp/geomate_loading').then(function() {
-        return true; // File exists
-    }).catch(function(err) {
-        // If stat fails, file likely doesn't exist
-        return false;
-    });
-}
+// Poll intervals in seconds
+var CONNECTIONS_INTERVAL = 5,
+    STATUS_INTERVAL = 10,
+    VERSION_INTERVAL = 3600;
 
 return view.extend({
-    map: null,
-    currentConnectionsData: [],
-    allowedIPsData: [],
+    // Every region action stages at once: there is nothing left for a Save button to do
+    handleSave: null,
+
     pending: {},        // last uci.changes() result
     busy: null,         // promise chain that serializes region actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
+    connections: [],    // last getGeomateConnections result
+    status: null,       // last getStatus result, null when it failed
+    health: null,       // last getHealthCheck result, null when it failed
+    readonly: true,     // no write access, or no configuration: the map only shows
+    mapReady: false,
+    nodes: null,        // nodes that the polls update in place
+    pollFns: null,      // bound poll functions; poll.add() and poll.remove() match them by identity
+    connectionsBusy: null,  // running getGeomateConnections request
+    versionBusy: null,      // running check_version request
 
-    // Load initial data required for the view
+    // Each call may fail on its own; the page then renders with what it got
     load: function() {
         this.reported = {};
         return Promise.all([
-            uci.load('geomate'),
-            callGeomateConnections(),
-            callGeomateAllowedIPs(),
-            getServiceStatus(),
+            L.resolveDefault(uci.load('geomate'), null),
+            L.resolveDefault(callGetStatus(), null),
+            L.resolveDefault(callGetHealthCheck(), null),
             L.resolveDefault(uci.changes(), {})
-        ]).then(function(data) {
-            var connectionsResult = data[1];
-            var allowedIPsResult = data[2];
-            var serviceStatus = data[3];
-    
-            this.currentConnectionsData = connectionsResult.connections || [];
-            this.allowedIPsData = allowedIPsResult.allowed_ips || [];
-            this.serviceStatus = serviceStatus; // Store the service status
-            this.pending = data[4] || {};
-    
-            return data;
-        }.bind(this)).catch(function(error) {
-            console.error('Error loading data:', error);
+        ]);
+    },
+
+    // Plain nodes, no form.Map: the footer buttons and the polls never render the map iframe again
+    render: function(data) {
+        var configLoaded = data[0] != null;
+
+        this.status = data[1];
+        this.health = data[2];
+        this.pending = data[3] || {};
+        // hasViewPermission() is what the footer uses without a form.Map to disable its buttons
+        this.readonly = !L.hasViewPermission() || !configLoaded;
+        this.nodes = {};
+
+        if (!configLoaded)
+            ui.addNotification(null, E('p', {}, [
+                _('The geomate configuration could not be loaded, so the map cannot show or change regions. Reload the page.')
+            ]), 'error');
+
+        var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
+
+        window.addEventListener('message', L.bind(this.handleMessage, this), false);
+        this.updateStatus();
+        this.startPolls();
+
+        return nodes;
+    },
+
+    renderStatus: function() {
+        var n = this.nodes;
+
+        n.indicator = E('div', {
+            id: 'service-status-indicator',
+            style: 'width: 12px; height: 12px; border-radius: 50%; margin-right: 8px;'
+        });
+        n.state = E('span', { id: 'service-status-text', style: 'margin: 0; font-weight: bold;' });
+        n.health = E('span', { id: 'health-check-status', style: 'font-size: 13px; margin-left: 8px;' });
+        n.loading = E('span', {
+            id: 'geomate-loading-indicator',
+            style: 'display: none; color: orange; margin-left: 8px;'
+        }, [ _('Loading GeoFilter data ...') ]);
+        n.pending = E('span', {
+            id: 'geomate-pending-changes',
+            style: 'display: none; margin-left: 8px; font-weight: bold;',
+            title: _('Staged changes take effect only after Save & Apply and are lost on logout or session expiry.')
+        });
+        n.mode = E('p', { id: 'operational-mode-text', style: 'margin: 0;' });
+        n.version = E('span', { id: 'version-display', style: 'color: #6b7280;' }, [ _('Loading version...') ]);
+        n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
+
+        return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
+            // Service status, health checks, loading and pending changes in one row
+            E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
+                E('div', { style: 'display: flex; align-items: center;' }, [ n.indicator, n.state ]),
+                n.health,
+                n.loading,
+                n.pending
+            ]),
+            // Operational mode and versions
+            E('div', {
+                id: 'operational-mode-container',
+                style: 'margin-top: 8px; display: flex; justify-content: space-between; align-items: center;'
+            }, [
+                n.mode,
+                E('div', { style: 'font-size: 13px; color: #6b7280;' }, [ n.version, n.update ])
+            ])
+        ]);
+    },
+
+    renderMap: function() {
+        this.nodes.frame = E('iframe', {
+            // The version parameter makes browsers fetch map.html again after an update
+            src: L.resource('view/geomate/map.html') + '?v=' + encodeURIComponent(UI_VERSION),
+            style: 'width: 100%; height: 80vh; border: none;' // Use 80% of the viewport height
+        });
+
+        return E('div', { id: 'geomate-map-container', style: 'position: relative;' }, [
+            this.nodes.frame,
+            // Button to toggle the visibility of active connections
+            E('button', {
+                id: 'toggle-connections-button',
+                type: 'button',
+                style: `
+                    position: absolute;
+                    top: 10px;
+                    right: 30px;
+                    z-index: 1000;
+                    padding: 8px 12px;
+                    background-color: rgba(0, 123, 255, 0.8);
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    cursor: pointer;
+                `,
+                click: L.bind(this.toggleConnections, this)
+            }, [ _('Active Connections') ])
+        ]);
+    },
+
+    // Table of active connections, hidden until the toggle button shows it
+    renderConnections: function() {
+        // Define CSS styles for the active connections container and table
+        var style = E('style', {}, `
+            #active-connections-container {
+                padding: 10px;
+                box-sizing: border-box;
+                background-color: #f9f9f9;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+                display: none; /* Hidden by default */
+                margin-left: 9px; /* Add left margin */
+            }
+            #active-connections-container .table-wrapper {
+                max-height: 400px;
+                overflow-y: auto;
+            }
+            #active-connections-container table {
+                width: 100%;
+                border-collapse: collapse;
+                font-family: Arial, sans-serif;
+                font-size: 14px;
+            }
+            #active-connections-container th,
+            #active-connections-container td {
+                padding: 12px 8px;
+                border-bottom: 1px solid #ddd;
+                text-align: left;
+            }
+            #active-connections-container th {
+                background-color: #607D8B;
+                color: black;
+                position: sticky;
+                top: 0;
+                z-index: 1;
+            }
+            #active-connections-container tr:nth-child(even) {
+                background-color: #f2f2f2;
+            }
+            #active-connections-container tr:hover {
+                background-color: #e0f7fa;
+            }
+        `);
+
+        this.nodes.connectionsBody = E('tbody', { id: 'active-connections-table-body' });
+        this.nodes.connections = E('div', { id: 'active-connections-container' }, [
+            style,
+            E('h3', { style: 'text-align: center;' }, [ _('Active Connections') ]),
+            E('div', { class: 'table-wrapper' }, [
+                E('table', { class: 'table' }, [
+                    E('thead', {}, [
+                        E('tr', {}, [
+                            E('th', {}, [ _('IP') ]),
+                            E('th', {}, [ _('Geo-Filter Name') ]),
+                            E('th', {}, [ _('Status') ])
+                        ])
+                    ]),
+                    this.nodes.connectionsBody
+                ])
+            ])
+        ]);
+
+        return this.nodes.connections;
+    },
+
+    // Show or hide the connections table; the map gets smaller while it is shown
+    toggleConnections: function() {
+        var box = this.nodes.connections,
+            show = box.style.display !== 'block';
+
+        box.style.display = show ? 'block' : 'none';
+        this.nodes.frame.style.height = show ? '600px' : '80vh';
+        if (show)
+            box.scrollIntoView({ behavior: 'smooth' });
+    },
+
+    // Show the last status, health check and staged changes
+    updateStatus: function() {
+        var n = this.nodes,
+            st = this.status,
+            checks = this.health && this.health.checks,
+            running = !!(st && st.running),
+            count = L.toArray((this.pending || {}).geomate).length;
+
+        if (!n)
+            return;
+
+        n.indicator.style.backgroundColor = st ? (running ? 'green' : 'red') : 'gray';
+        n.state.textContent = st ? (running ? _('Running') : _('Not Running')) : _('Status unknown');
+        n.loading.style.display = (st ? st.loading : (this.health && this.health.loading)) ? 'inline' : 'none';
+
+        // Compact health check display; messages stay text, never markup
+        var checkLabels = {
+            'config': _('Config'),
+            'files': _('Files'),
+            'datadir': _('Data'),
+            'service': _('Autostart'),
+            'nft': _('nftables')
+        };
+        var icons = {
+            'error': ['✗', '#ef4444'],
+            'warning': ['⚠', '#f59e0b'],
+            'info': ['○', '#6b7280']
+        };
+        dom.content(n.health, !checks ? null : Object.keys(checkLabels).filter(function(key) {
+            return checks[key];
+        }).map(function(key) {
+            var icon = icons[checks[key].status] || ['✓', '#10b981'];
+            return E('span', { 'style': 'margin-right: 10px;', 'title': checks[key].message || '' }, [
+                E('span', { 'style': 'color: ' + icon[1] + ';' }, [ icon[0] ]),
+                ' ' + checkLabels[key]
+            ]);
+        }));
+
+        // Operational mode of the committed configuration, the one the service runs with
+        var mode = st && st.operational_mode, modeText = '', modeStyle = '';
+        if (mode === 'monitor') {
+            modeText = _('Mode: Monitor Only - Connections are tracked but NOT blocked');
+            modeStyle = 'color: orange; font-weight: bold;';
+        } else if (mode === 'static') {
+            modeText = _('Mode: Static - Using predefined IP lists');
+            modeStyle = 'color: blue;';
+        } else if (mode) {
+            modeText = _('Mode: Dynamic - Building IP lists automatically');
+            modeStyle = 'color: green;';
+        }
+        n.mode.textContent = modeText;
+        n.mode.style.cssText = 'margin: 0; ' + modeStyle;
+
+        n.pending.style.display = count ? 'inline' : 'none';
+        n.pending.textContent = (count == 1)
+            ? _('1 change pending: active after Save & Apply')
+            : _('%d changes pending: active after Save & Apply').format(count);
+    },
+
+    // Polls are added once, after the first render, as bound functions: poll.add() skips only a
+    // function it already has. poll runs a function when its global tick is a multiple of the
+    // interval, so the first connections and version requests are sent here; load() brought the status
+    startPolls: function() {
+        if (this.pollFns)
+            return;
+
+        this.pollFns = {
+            connections: L.bind(this.pollConnections, this),
+            status: L.bind(this.pollStatus, this),
+            version: L.bind(this.checkForUpdates, this)
+        };
+
+        if (!document.hidden)
+            poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
+        poll.add(this.pollFns.status, STATUS_INTERVAL);
+        poll.add(this.pollFns.version, VERSION_INTERVAL);
+
+        this.pollConnections();
+        this.checkForUpdates();
+
+        document.addEventListener('visibilitychange', L.bind(this.handleVisibilityChange, this));
+    },
+
+    // No connection requests while the tab is hidden
+    handleVisibilityChange: function() {
+        if (document.hidden) {
+            poll.remove(this.pollFns.connections);
+        } else {
+            poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
+            // Fresh data at once, unless the user paused LuCI's auto refresh
+            if (poll.active())
+                this.pollConnections();
+        }
+    },
+
+    pollStatus: function() {
+        var self = this;
+        return Promise.all([
+            L.resolveDefault(callGetStatus(), null),
+            L.resolveDefault(callGetHealthCheck(), null),
+            L.resolveDefault(uci.changes(), null)
+        ]).then(function(r) {
+            self.status = r[0];
+            self.health = r[1];
+            if (r[2])
+                self.pending = r[2];
+            self.updateStatus();
         });
     },
 
-    // Render the form and map interface
-    render: function(data) {
+    // One request at a time: a direct call while the poll's request runs shares it
+    pollConnections: function() {
         var self = this;
-        var m, s, o;
-        var geomateConfig = data[0];
 
-        // We only handle connectionsResult, allowedIPsResult after map is ready
-        // to prevent heavy parallel load
-        var connectionsResult = data[1];
-        var allowedIPsResult = data[2];
-        // We'll defer serviceStatus calls to after mapReady event
-        // var serviceStatus = data[3]; // remove immediate usage
-
-        this.currentConnectionsData = connectionsResult.connections || [];
-        this.allowedIPsData = allowedIPsResult.allowed_ips || [];
-        // No immediate console here for serviceStatus; wait until poll
-
-        m = new form.Map('geomate', '', '');
-
-        // Section to display the current status of the Geomate service
-        s = m.section(form.TypedSection, '_service_status', _('Service Status'));
-        s.anonymous = true;
-        s.render = function() {
-            var statusColor = self.serviceStatus === 'Running' ? 'green' : 'red';
-            var statusText = self.serviceStatus === 'Running' ? _('Running') : _('Not Running');
-        
-            return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
-                // Service status + Health checks row (combined)
-                E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
-                    // Colored circle + status text
-                    E('div', { style: 'display: flex; align-items: center;' }, [
-                        E('div', {
-                            id: 'service-status-indicator',
-                            style: `
-                                width: 12px;
-                                height: 12px;
-                                border-radius: 50%;
-                                background-color: ${statusColor};
-                                margin-right: 8px;
-                            `
-                        }),
-                        E('span', { id: 'service-status-text', style: 'margin: 0; font-weight: bold;' }, statusText)
-                    ]),
-                    // Health check status (inline)
-                    E('span', { 
-                        id: 'health-check-status',
-                        style: 'font-size: 13px; margin-left: 8px;'
-                    }, ''),
-                    // Loading message (hidden by default)
-                    E('span', {
-                        id: 'geomate-loading-indicator',
-                        style: 'display: none; color: orange; margin-left: 8px;'
-                    }, _('Loading GeoFilter data ...'))
-                ]),
-                // Operational mode row
-                E('div', { 
-                    id: 'operational-mode-container',
-                    style: 'margin-top: 8px; display: none; justify-content: space-between; align-items: center;' 
-                }, [
-                    E('p', { 
-                        id: 'operational-mode-text',
-                        style: 'margin: 0; font-weight: normal;'
-                    }, ''),
-                    E('div', { 
-                        style: 'font-size: 13px; color: #6b7280;' 
-                    }, [
-                        E('span', {
-                            id: 'version-display',
-                            style: 'color: #6b7280;'
-                        }, _('Loading version...')),
-                        E('span', { 
-                            id: 'version-update-status',
-                            style: 'margin-left: 8px; font-style: italic;'
-                        }, '')
-                    ])
-                ])
-            ]);
-        };
-
-        // Section to embed the map interface
-        s = m.section(form.TypedSection, '_map', _('Map'));
-        s.anonymous = true;
-        s.render = function() {
-            return E('div', { id: 'geomate-map-container', style: 'position: relative;' }, [
-                E('iframe', {
-                    // The version parameter makes browsers fetch map.html again after an update
-                    src: L.resource('view/geomate/map.html') + '?v=' + encodeURIComponent(UI_VERSION),
-                    style: 'width: 100%; height: 80vh; border: none;' // Use 80% of the viewport height
-                }),
-                // Button to toggle the visibility of active connections
-                E('button', {
-                    id: 'toggle-connections-button',
-                    style: `
-                        position: absolute;
-                        top: 10px;
-                        right: 30px;
-                        z-index: 1000;
-                        padding: 8px 12px;
-                        background-color: rgba(0, 123, 255, 0.8);
-                        color: white;
-                        border: none;
-                        border-radius: 4px;
-                        cursor: pointer;
-                    `
-                }, _('Active Connections'))
-            ]);
-        };
-
-        // Section to display active connections in a table
-        s = m.section(form.TypedSection, '_active_connections');
-        s.anonymous = true;
-        s.render = function() {
-            // Define CSS styles for the active connections container and table
-            var style = E('style', {}, `
-                #active-connections-container {
-                    padding: 10px;
-                    box-sizing: border-box;
-                    background-color: #f9f9f9;
-                    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-                    display: none; /* Hidden by default */
-                    margin-left: 9px; /* Add left margin */
-                }
-                #active-connections-container .table-wrapper {
-                    max-height: 400px;
-                    overflow-y: auto;
-                }
-                #active-connections-container table {
-                    width: 100%;
-                    border-collapse: collapse;
-                    font-family: Arial, sans-serif;
-                    font-size: 14px;
-                }
-                #active-connections-container th, 
-                #active-connections-container td {
-                    padding: 12px 8px;
-                    border-bottom: 1px solid #ddd;
-                    text-align: left;
-                }
-                #active-connections-container th {
-                    background-color: #607D8B;
-                    color: black;
-                    position: sticky;
-                    top: 0;
-                    z-index: 1;
-                }
-                #active-connections-container tr:nth-child(even) {
-                    background-color: #f2f2f2;
-                }
-                #active-connections-container tr:hover {
-                    background-color: #e0f7fa;
-                }
-            `);
-
-            return E('div', {
-                id: 'active-connections-container'
-            }, [
-                style,
-                E('h3', { style: 'text-align: center;' }, _('Active Connections')),
-                E('div', { class: 'table-wrapper' }, [
-                    E('table', { class: 'table' }, [
-                        E('thead', {}, [
-                            E('tr', {}, [
-                                E('th', {}, _('IP')),
-                                E('th', {}, _('Geo-Filter Name')),
-                                E('th', {}, _('Status'))
-                            ])
-                        ]),
-                        E('tbody', { id: 'active-connections-table-body' })
-                    ])
-                ])
-            ]);
-        };
-
-        return m.render().then(function(rendered) {
-            self.map = m;
-            self.setupMessageHandlers();
-        
-            // Handle the toggle button to show or hide active connections
-            var toggleButton = rendered.querySelector('#toggle-connections-button');
-            var connectionsContainer = rendered.querySelector('#active-connections-container');
-            var mapIframe = rendered.querySelector('#geomate-map-container iframe');
-            var originalMapHeight = null;
-        
-            if (mapIframe) {
-                originalMapHeight = mapIframe.style.height || getComputedStyle(mapIframe).height;
-            }
-        
-            toggleButton.addEventListener('click', function() {
-                if (connectionsContainer.style.display === 'none' || connectionsContainer.style.display === '') {
-                    connectionsContainer.style.display = 'block';
-                    // Scroll to the "Active Connections" section smoothly
-                    connectionsContainer.scrollIntoView({ behavior: 'smooth' });
-                    // Reduce the height of the map for better visibility
-                    if (mapIframe) {
-                        mapIframe.style.height = '600px'; // Reduced height
-                    }
-                } else {
-                    connectionsContainer.style.display = 'none';
-                    // Reset the map height to its original value
-                    if (mapIframe && originalMapHeight) {
-                        mapIframe.style.height = originalMapHeight;
-                    }
-                }
+        if (!this.connectionsBusy)
+            this.connectionsBusy = L.resolveDefault(callGeomateConnections(), null).then(function(list) {
+                if (!list)
+                    return;
+                self.connections = list;
+                self.sendMessageToMap('updateConnections', list);
+                self.updateActiveConnectionsList();
+            }).finally(function() {
+                self.connectionsBusy = null;
             });
 
-            // Send initial connections and Allowed IPs to the map after the map is ready
-            window.addEventListener('message', function(event) {
-                if (self.isMapMessage(event) && event.data.type === 'mapReady') {
-                    self.pushFilters();
-                    self.sendAllowedIPsToMap(self.allowedIPsData || []);
-                    self.sendConnectionsToMap(self.currentConnectionsData || []);
-                    self.updateActiveConnectionsList();
-                    // Initial version check
-                    self.checkForUpdates();
-
-                    // Regularly update the service status - only after map is ready
-                    poll.add(function() {
-                        return Promise.all([
-                            getServiceStatus(),
-                            getLoadingStatus(),
-                            uci.load('geomate').then(function() {
-                                var globalConfig = uci.sections('geomate', 'global')[0];
-                                return globalConfig ? globalConfig.operational_mode : 'dynamic';
-                            }),
-                            callGetHealthCheck()
-                        ]).then(function(results) {
-                            var serviceStatus = results[0];
-                            var loadingStatus = results[1];
-                            var operationalMode = results[2];
-                            var healthData = results[3] || {};
-                            self.serviceStatus = serviceStatus;
-
-                            var statusElement = document.getElementById('service-status-text');
-                            var indicatorElement = document.getElementById('service-status-indicator');
-                            var loadingElement = document.getElementById('geomate-loading-indicator');
-                            var modeContainer = document.getElementById('operational-mode-container');
-                            var modeElement = document.getElementById('operational-mode-text');
-                            var healthElement = document.getElementById('health-check-status');
-
-                            if (statusElement) {
-                                var statusText = (serviceStatus === 'Running') ? _('Running') : _('Not Running');
-                                statusElement.textContent = statusText;
-                            }
-
-                            if (indicatorElement) {
-                                var statusColor = (serviceStatus === 'Running') ? 'green' : 'red';
-                                indicatorElement.style.backgroundColor = statusColor;
-                            }
-
-                            // Show or hide the loading message                            
-                            if (loadingElement) {
-                                if (loadingStatus === true) {
-                                    loadingElement.style.display = 'inline';
-                                } else {
-                                    loadingElement.style.display = 'none';
-                                }
-                            }
-
-                            // Show health check status (inline with Running)
-                            if (healthElement && healthData.checks) {
-                                var checks = healthData.checks;
-                                var checkLabels = {
-                                    'config': _('Config'),
-                                    'files': _('Files'),
-                                    'datadir': _('Data'),
-                                    'service': _('Autostart'),
-                                    'nft': _('nftables')
-                                };
-                                var icons = {
-                                    'error': ['✗', '#ef4444'],
-                                    'warning': ['⚠', '#f59e0b'],
-                                    'info': ['○', '#6b7280']
-                                };
-
-                                // Build compact health check display; messages stay text, never markup
-                                dom.content(healthElement, Object.keys(checkLabels).filter(function(key) {
-                                    return checks[key];
-                                }).map(function(key) {
-                                    var icon = icons[checks[key].status] || ['✓', '#10b981'];
-                                    return E('span', { 'style': 'margin-right: 10px;', 'title': checks[key].message || '' }, [
-                                        E('span', { 'style': 'color: ' + icon[1] + ';' }, [ icon[0] ]),
-                                        ' ' + checkLabels[key]
-                                    ]);
-                                }));
-                            }
-
-                            // Show operational mode
-                            if (modeContainer && modeElement) {
-                                var modeText = '';
-                                var modeStyle = '';
-                                
-                                if (operationalMode === 'monitor') {
-                                    modeText = _('Mode: Monitor Only - Connections are tracked but NOT blocked');
-                                    modeStyle = 'color: orange; font-weight: bold;';
-                                } else if (operationalMode === 'static') {
-                                    modeText = _('Mode: Static - Using predefined IP lists');
-                                    modeStyle = 'color: blue;';
-                                } else {
-                                    modeText = _('Mode: Dynamic - Building IP lists automatically');
-                                    modeStyle = 'color: green;';
-                                }
-                                
-                                modeElement.textContent = modeText;
-                                modeElement.style.cssText = 'margin: 0; ' + modeStyle;
-                                modeContainer.style.display = 'flex';
-                            }
-                        });
-                    }, 5); // check service status every 5 seconds
-
-                    // Polling connections+allowedIPs
-                    poll.add(function() {
-                        return Promise.all([
-                            callGeomateConnections(),
-                            callGeomateAllowedIPs()
-                        ]).then(function(results) {
-                            var connectionsData = results[0].connections || [];
-                            var allowedIPsData = results[1].allowed_ips || [];
-                            self.currentConnectionsData = connectionsData;
-                            self.allowedIPsData = allowedIPsData;
-                            self.sendConnectionsToMap(connectionsData);
-                            self.sendAllowedIPsToMap(allowedIPsData);
-                            self.updateActiveConnectionsList();
-                        }).catch(function(error) {
-                            console.error('Error fetching data:', error);
-                        });
-                    }, 2); // Interval in seconds
-
-                    // Check for version updates every 60 minutes
-                    poll.add(function() {
-                        return self.checkForUpdates();
-                    }, 3600); // 3600 seconds
-                }
-            }, false);
-
-            return rendered;
-        });
+        return this.connectionsBusy;
     },
 
     // Only the map iframe of this page may send messages to the view
     isMapMessage: function(ev) {
-        var frame = this.mapFrame();
+        var frame = this.nodes && this.nodes.frame;
         return ev.origin === window.location.origin && frame != null &&
             ev.source === frame.contentWindow && ev.data != null && typeof ev.data.type == 'string';
     },
 
-    mapFrame: function() {
-        return document.querySelector('#geomate-map-container iframe');
-    },
-
-    // Send a message to the map iframe
+    // Send a message to the map iframe once it has loaded
     sendMessageToMap: function(type, data) {
-        var frame = this.mapFrame();
-        if (frame && frame.contentWindow)
+        var frame = this.nodes && this.nodes.frame;
+        if (this.mapReady && frame && frame.contentWindow)
             frame.contentWindow.postMessage({ type: type, data: data }, window.location.origin);
     },
 
-    sendConnectionsToMap: function(connections) {
-        this.sendMessageToMap('updateConnections', connections);
-    },
+    // The one message listener of the view
+    handleMessage: function(ev) {
+        if (!this.isMapMessage(ev))
+            return;
 
-    sendAllowedIPsToMap: function(allowedIPs) {
-        this.sendMessageToMap('updateAllowedIPs', allowedIPs);
-    },
+        var self = this, type = ev.data.type, d = ev.data.data || {};
 
-    // Handle region messages from the map iframe ('mapReady' is handled in render())
-    setupMessageHandlers: function() {
-        var self = this;
-        window.addEventListener('message', function(ev) {
-            if (!self.isMapMessage(ev))
-                return;
+        // Without write access nothing is staged; the map has no drawing tools then anyway
+        if (this.readonly && /^region(Drawn|Edited|Deleted)$/.test(type))
+            return this.sendMessageToMap((type == 'regionDrawn') ? 'regionDiscarded' : 'regionRejected', { token: d.token, reason: '' });
 
-            var d = ev.data.data || {};
-            switch (ev.data.type) {
-            case 'regionDrawn':
-                self.enqueue(d.token, function() { return self.openFilterModal(d.token, d.region); });
-                break;
-            case 'regionEdited':
-                self.enqueue(d.token, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
-                break;
-            case 'regionDeleted':
-                self.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
-                break;
-            case 'regionInvalid':
-                self.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
-                    .format(self.filterName(d.sid), d.region));
-                break;
-            }
-        }, false);
+        switch (type) {
+        case 'mapReady':
+            this.mapReady = true;
+            this.sendMessageToMap('setReadonly', { readonly: this.readonly });
+            this.pushFilters();
+            this.sendMessageToMap('updateConnections', this.connections);
+            break;
+        case 'regionDrawn':
+            this.enqueue(d.token, function() { return self.openFilterModal(d.token, d.region); });
+            break;
+        case 'regionEdited':
+            this.enqueue(d.token, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
+            break;
+        case 'regionDeleted':
+            this.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
+            break;
+        case 'regionInvalid':
+            this.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
+                .format(this.filterName(d.sid), d.region));
+            break;
+        }
     },
 
     // Run region actions one after another: uci.save() reloads the configuration, so a second
@@ -607,6 +539,7 @@ return view.extend({
             return L.resolveDefault(uci.changes(), {});
         }).then(function(changes) {
             self.pending = changes || {};
+            self.updateStatus();
         });
     },
 
@@ -1040,20 +973,63 @@ return view.extend({
         });
     },
 
-    // form.Map.reset() renders a new map iframe, which loads its regions on mapReady
+    // Region actions stage at once; apply what the session has staged after the running one
+    handleSaveApply: function(ev, mode) {
+        return Promise.resolve(this.busy).then(function() {
+            ui.changes.apply(mode == '0');
+        });
+    },
+
+    // Staged changes live in the LuCI session, so Reset means revert. LuCI reverts every
+    // configuration with staged changes at once (like the header's Unsaved Changes dialog)
     handleReset: function(ev) {
-        return this.map.reset().then(function() {
-            ui.addNotification(null, E('p', _('Form values have been reset')), 'success');
+        var self = this;
+
+        return L.resolveDefault(uci.changes(), null).then(function(changes) {
+            if (changes) {
+                self.pending = changes;
+                self.updateStatus();
+            }
+
+            var pending = self.pending || {},
+                count = L.toArray(pending.geomate).length,
+                others = Object.keys(pending).filter(function(config) {
+                    return config != 'geomate' && L.toArray(pending[config]).length;
+                });
+
+            if (!count) {
+                ui.addNotification(null, E('p', {}, [ _('Geomate has no staged changes to revert.') ]), 'info');
+                return;
+            }
+
+            // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
+            var body = [
+                E('p', {}, [ (count == 1)
+                    ? _('Geomate has 1 staged change. It is not active yet; reverting discards it.')
+                    : _('Geomate has %d staged changes. They are not active yet; reverting discards them.').format(count) ]),
+                E('p', {}, [ _('Like Revert in the Unsaved Changes dialog, this reverts the staged changes of every configuration in this session, then reloads the page.') ])
+            ];
+            if (others.length)
+                body.push(E('p', {}, [ _('Also reverted: the staged changes of %s.').format(others.join(', ')) ]));
+            body.push(E('div', { 'class': 'right' }, [
+                E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
+                E('button', { 'class': 'btn cbi-button-negative', 'click': ui.createHandlerFn(self, function() {
+                    ui.hideModal();
+                    ui.changes.revert();
+                }) }, [ _('Revert') ])
+            ]));
+
+            ui.showModal(_('Revert staged changes?'), body);
         });
     },
 
     // Function to update the active connections table
     updateActiveConnectionsList: function() {
-        var tbody = document.getElementById('active-connections-table-body');
+        var tbody = this.nodes && this.nodes.connectionsBody;
         if (!tbody) return;
 
         // Skip any connection object lacking filter_name to avoid errors
-        dom.content(tbody, this.currentConnectionsData.filter(function(conn) {
+        dom.content(tbody, this.connections.filter(function(conn) {
             return conn && conn.filter_name;
         }).map(function(conn) {
             var status;
@@ -1081,10 +1057,15 @@ return view.extend({
         }));
     },
 
-    // Check for updates
+    // Check for updates. check_version asks GitHub: this runs at page load and hourly, one call at a time
     checkForUpdates: function() {
-        var statusElement = document.getElementById('version-update-status');
-        var versionDisplayElement = document.getElementById('version-display');
+        var self = this;
+        var statusElement = this.nodes && this.nodes.update;
+        var versionDisplayElement = this.nodes && this.nodes.version;
+
+        if (this.versionBusy) {
+            return this.versionBusy;
+        }
         
         if (!statusElement) {
             return Promise.resolve();
@@ -1093,7 +1074,13 @@ return view.extend({
         statusElement.textContent = _('Checking...');
         statusElement.style.color = '#6b7280';
 
-        return fs.exec('/etc/init.d/geomate', ['check_version']).then(function(result) {
+        // LuCI batches the RPC calls of one animation frame into one HTTP request. check_version
+        // waits for GitHub, so it starts later than the polls and does not delay their answers
+        this.versionBusy = new Promise(function(resolve) {
+            window.setTimeout(resolve, 500);
+        }).then(function() {
+            return fs.exec('/etc/init.d/geomate', ['check_version']);
+        }).then(function(result) {
             var output = result.stdout || '';
             var backendUpdateAvailable = false;
             var frontendUpdateAvailable = false;
@@ -1156,6 +1143,10 @@ return view.extend({
             console.error('Error checking for updates:', error);
             statusElement.textContent = _('Check failed');
             statusElement.style.color = '#dc2626';
+        }).finally(function() {
+            self.versionBusy = null;
         });
+
+        return this.versionBusy;
     }
 });
