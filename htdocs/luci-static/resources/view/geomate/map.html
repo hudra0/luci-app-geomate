@@ -492,7 +492,8 @@
             modeBar.textContent = '';
             if (color) L.DomUtil.create('span', 'gm-mode-swatch', modeBar).style.background = color;
             L.DomUtil.create('span', 'gm-mode-text', modeBar).textContent = text;
-            L.DomUtil.create('span', 'gm-mode-extra', modeBar);
+            // The bar is a live region: the radius changes on every drag move, screen readers skip it
+            L.DomUtil.create('span', 'gm-mode-extra', modeBar).setAttribute('aria-hidden', 'true');
             buttons.forEach(function(b) {
                 var el = L.DomUtil.create('button', '', modeBar);
                 el.type = 'button';
@@ -508,10 +509,13 @@
             layoutModeBar();
         }
 
-        // Extra text in the mode bar, e.g. the radius while drawing
+        // Extra text in the mode bar, e.g. the radius while drawing. The text can wrap the bar
+        // to one more line on narrow maps, so the controls move down when its height changes
         function setModeExtra(text) {
-            var el = modeBar.querySelector('.gm-mode-extra');
-            if (el) el.textContent = text;
+            var el = modeBar.querySelector('.gm-mode-extra'), h = modeBar.offsetHeight;
+            if (!el) return;
+            el.textContent = text;
+            if (modeBar.offsetHeight !== h) layoutModeBar();
         }
 
         function layoutModeBar() {
@@ -541,16 +545,29 @@
             return target.isNew ? 'a new filter' : (target.name || target.sid);
         }
 
+        var EDIT_FIRST = 'Finish editing first: Save or Cancel next to the edit buttons';
+
+        // Leaflet.draw's edit or delete mode runs
+        function isEditing() {
+            return mode === 'edit' || mode === 'delete';
+        }
+
+        // Draw and Set home wait for the edit mode to end; says so in a toast
+        function blockedByEdit() {
+            if (isEditing()) showToast(EDIT_FIRST + '.');
+            return isEditing();
+        }
+
         // State, titles and visibility of the toolbar buttons
         function updateToolbar() {
-            var a = toolbar.draw, editing = mode === 'edit' || mode === 'delete',
+            var a = toolbar.draw, editing = isEditing(),
                 disabled = !drawTarget || editing;
 
             toolbar.drawGroup.style.display = readonly ? 'none' : '';
             L.DomUtil[disabled ? 'addClass' : 'removeClass'](a, 'leaflet-disabled');
             a.setAttribute('aria-disabled', disabled ? 'true' : 'false');
             a.style.setProperty('--gm-target', drawTarget && drawTarget.color || '');
-            a.title = editing ? 'Finish editing first: Save or Cancel next to the edit buttons' :
+            a.title = editing ? EDIT_FIRST :
                 !drawTarget ? 'Choose a filter above the map to draw a circle' :
                 mode === 'draw' ? 'Stop drawing (Esc)' :
                 'Draw a circle for ' + targetName(drawTarget);
@@ -594,14 +611,15 @@
                 var drawGroup = L.DomUtil.create('div', 'leaflet-bar gm-toolbar-group', box);
                 var viewGroup = L.DomUtil.create('div', 'leaflet-bar gm-toolbar-group', box);
 
+                // Only the buttons whose state changes are kept
                 toolbar = {
                     drawGroup: drawGroup,
-                    draw: toolbarButton(drawGroup, 'fa-circle-plus', 'Draw circle', '', toggleDraw, 'gm-btn--draw'),
-                    fit: toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all regions', function() { fitAll(false); }),
-                    home: toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome),
-                    setHome: toolbarButton(viewGroup, 'fa-location-dot', 'Set home',
-                        'Set the home view: click the map at the zoom you want', toggleSetHome)
+                    draw: toolbarButton(drawGroup, 'fa-circle-plus', 'Draw circle', '', toggleDraw, 'gm-btn--draw')
                 };
+                toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all regions', function() { fitAll(false); });
+                toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome);
+                toolbar.setHome = toolbarButton(viewGroup, 'fa-location-dot', 'Set home',
+                    'Set the home view: click the map at the zoom you want', toggleSetHome);
                 L.DomEvent.disableClickPropagation(box);
                 L.DomEvent.disableScrollPropagation(box);
                 return box;
@@ -627,10 +645,7 @@
                 showToast('Choose a filter above the map first.');
                 return;
             }
-            if (mode === 'edit' || mode === 'delete') {
-                showToast('Finish editing first: Save or Cancel next to the edit buttons.');
-                return;
-            }
+            if (blockedByEdit()) return;
             if (mode === 'home') stopSetHome();
             if (drawHandler) return;
 
@@ -694,10 +709,7 @@
                 stopSetHome();
                 return;
             }
-            if (mode === 'edit' || mode === 'delete') {
-                showToast('Finish editing first: Save or Cancel next to the edit buttons.');
-                return;
-            }
+            if (blockedByEdit()) return;
             cancelDraw();
             mode = 'home';
             L.DomUtil.addClass(map.getContainer(), 'leaflet-crosshair');

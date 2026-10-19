@@ -225,17 +225,16 @@ return view.extend({
             .gm-map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px 8px; text-align: left; }
             .gm-map-actions .btn { margin: 0; white-space: nowrap; }
             .gm-map-actions .gm-picker { display: inline-flex; align-items: center; gap: 6px; }
-            .gm-map-actions .gm-picker > div { display: inline-block; }
             .gm-map-actions .gm-picker select { width: auto; min-width: 12em; max-width: 22em; margin: 0; }
             .gm-map-actions .gm-spacer { flex: 1 1 0; }
             .gm-map-actions .gm-pending-chip { border-radius: 999px; }
             .gm-map-actions .btn[disabled] { cursor: not-allowed; }
         `);
 
-        n.picker = E('span', { 'class': 'gm-picker-select' });
+        n.picker = E('span');
         n.enable = E('button', {
             'class': 'btn cbi-button cbi-button-positive',
-            'title': _('Enable the chosen filter. Like every map change it is staged: it takes effect only after Save & Apply.'),
+            'title': _('Enable the chosen filter. The change is staged: it takes effect only after Save & Apply and is lost on logout or session expiry.'),
             'click': ui.createHandlerFn(this, function() {
                 var t = this.pickTarget();
                 return t && t.sid ? this.enableFilter(t.sid) : null;
@@ -260,7 +259,6 @@ return view.extend({
         n.chip = E('button', {
             'class': 'btn cbi-button cbi-button-apply gm-pending-chip',
             'style': 'display: none',
-            'title': _('Not active yet. Staged changes take effect only after Save & Apply and are lost on logout or session expiry.'),
             'click': ui.createHandlerFn(this, 'handleSaveApply', null, '0')
         });
         // Only for users who may change regions
@@ -276,26 +274,36 @@ return view.extend({
     // (Re)build the filter picker, e.g. after a new filter or a changed enabled flag.
     // value: a section id, NEW_FILTER or '' (nothing chosen)
     renderPicker: function(value) {
-        var sections = uci.sections('geomate', 'geo_filter').filter(function(s) { return s.name; }),
-            choices = { '': _('Choose a filter…') };
+        var f = this.filterChoices(_('Choose a filter…'));
 
-        sections.forEach(function(s) {
-            choices[s['.name']] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
-        });
-        choices[NEW_FILTER] = _('New filter…');
+        if (!f.choices.hasOwnProperty(value) || value === '')
+            value = f.sections.length ? '' : NEW_FILTER;
 
-        if (!choices.hasOwnProperty(value) || value === '')
-            value = sections.length ? '' : NEW_FILTER;
-
-        this.picker = new ui.Select(value, choices, {
-            sort: [ '' ].concat(sections.map(function(s) { return s['.name']; }), [ NEW_FILTER ])
-        });
+        this.picker = new ui.Select(value, f.choices, { sort: f.sort });
 
         var node = this.picker.render();
         node.querySelector('select').setAttribute('aria-label', _('Filter for new circles'));
         node.addEventListener('widget-change', L.bind(this.handlePick, this));
         dom.content(this.nodes.picker, node);
         this.handlePick();
+    },
+
+    // Choices of a filter select: placeholder (''), every named filter in config order, then
+    // 'New filter…'. Returns { sections, choices, sort } for ui.Select
+    filterChoices: function(placeholder) {
+        var sections = uci.sections('geomate', 'geo_filter').filter(function(s) { return s.name; }),
+            choices = { '': placeholder };
+
+        sections.forEach(function(s) {
+            choices[s['.name']] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
+        });
+        choices[NEW_FILTER] = _('New filter…');
+
+        return {
+            sections: sections,
+            choices: choices,
+            sort: [ '' ].concat(sections.map(function(s) { return s['.name']; }), [ NEW_FILTER ])
+        };
     },
 
     // The remembered choice as a picker value; a section id only while it still has that name
@@ -348,20 +356,22 @@ return view.extend({
             return this.sendMessageToMap('cancelDraw');
         if (!t || this.readonly)
             return;
-        // Escape reaches the map's own handler only while the map has the keyboard focus
-        this.nodes.frame.focus();
+        // Escape reaches the map's own handler only while the map has the keyboard focus;
+        // preventScroll: the 80vh map is often only partly visible, the page must not jump
+        this.nodes.frame.focus({ preventScroll: true });
         this.sendMessageToMap('startDraw', t);
     },
 
     // Enabled state, labels and titles of the action bar
     updateActions: function() {
-        var n = this.nodes, t = this.pickTarget(), count;
+        var n = this.nodes, t = this.pickTarget(), count, others;
 
         if (!n || !n.draw)
             return;
 
         n.editTools.style.display = this.readonly ? 'none' : '';
-        n.enable.style.display = (t && !t.isNew && !t.enabled) ? '' : 'none';
+        // Only with a region: without one an enabled filter blocks all its traffic in strict mode
+        n.enable.style.display = (t && !t.isNew && !t.enabled && this.regionList(t.sid).length) ? '' : 'none';
 
         n.draw.disabled = !this.mapReady || (!t && !this.drawing);
         n.draw.setAttribute('aria-pressed', this.drawing ? 'true' : 'false');
@@ -373,10 +383,22 @@ return view.extend({
         n.fit.disabled = !this.mapReady;
 
         count = L.toArray((this.pending || {}).geomate).length;
+        others = this.otherStagedConfigs();
         n.chip.style.display = (count && !this.readonly) ? '' : 'none';
         n.chip.textContent = (count == 1)
             ? _('1 change pending · Save & Apply')
             : _('%d changes pending · Save & Apply').format(count);
+        n.chip.title = _('Not active yet. Staged changes take effect only after Save & Apply and are lost on logout or session expiry.') +
+            (others.length ? ' ' + _('Save & Apply also applies the staged changes of %s.').format(others.join(', ')) : '');
+    },
+
+    // Configurations other than geomate with staged changes in this session. Save & Apply and
+    // Revert act on all of them
+    otherStagedConfigs: function() {
+        var pending = this.pending || {};
+        return Object.keys(pending).filter(function(config) {
+            return config != 'geomate' && L.toArray(pending[config]).length;
+        });
     },
 
     renderMap: function() {
@@ -778,6 +800,7 @@ return view.extend({
 
         var name = this.filterName(sid),
             list = this.regionList(sid),
+            handWritten = uci.get('geomate', sid, 'allowed_region'),
             toast;
 
         if (list.indexOf(region) < 0)
@@ -789,6 +812,9 @@ return view.extend({
             ? { text: _('Region added to filter %s. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.').format(name) }
             : { text: _('Region added to filter %s, which is disabled: the region filters nothing until the filter is enabled. Staged changes take effect only after Save & Apply and are lost on logout or session expiry.').format(name),
                 action: { name: 'enableFilter', sid: sid, label: _('Enable filter') } };
+        // The dialog path says this before saving; here the region is already staged
+        if (typeof handWritten == 'string')
+            toast.text += ' ' + _('It replaced the hand-written "option allowed_region" (%s).').format(handWritten);
 
         return this.stage(toast).then(this.ackRegion.bind(this, token, sid, region));
     },
@@ -801,6 +827,11 @@ return view.extend({
             if (!sid || (uci.get('geomate', sid) || {})['.type'] !== 'geo_filter' ||
                 uci.get('geomate', sid, 'enabled') === '1')
                 return;
+            // A filter without a region blocks all its traffic in strict mode: the Geo Filters page decides that
+            if (!self.regionList(sid).length)
+                return self.sendMessageToMap('toast', {
+                    text: _('Filter %s has no region and stays disabled. Draw a region first, or enable it on the Geo Filters page.').format(self.filterName(sid))
+                });
 
             uci.set('geomate', sid, 'enabled', '1');
             return self.stage({
@@ -909,19 +940,13 @@ return view.extend({
     // pick: NEW_FILTER opens with the name field focused, '' with the filter list
     openFilterModal: function(token, region, pick) {
         var self = this,
-            sections = uci.sections('geomate', 'geo_filter').filter(function(s) { return s.name; }),
-            NEW = NEW_FILTER,
-            choices = { '': _('-- Please choose --') },
+            f = this.filterChoices(_('-- Please choose --')),
+            sections = f.sections,
             initial = {},
             sid = null;
 
         if (!validRegion(region))
             return Promise.reject(new Error(_('Invalid circle %s').format(region)));
-
-        sections.forEach(function(s) {
-            choices[s['.name']] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
-        });
-        choices[NEW] = _('New filter…');
 
         // Existing filter names match without regard to case
         var findFilter = function(name) {
@@ -930,9 +955,7 @@ return view.extend({
         };
 
         // Every filter in config order, then 'New filter…'; without filters the name field shows at once
-        var filterW = new ui.Select((pick === NEW || !sections.length) ? NEW : '', choices, {
-            sort: [ '' ].concat(sections.map(function(s) { return s['.name']; }), [ NEW ])
-        });
+        var filterW = new ui.Select((pick === NEW_FILTER || !sections.length) ? NEW_FILTER : '', f.choices, { sort: f.sort });
 
         var nameW = new ui.Textfield('', {
             optional: false,
@@ -978,13 +1001,13 @@ return view.extend({
         };
 
         var isNew = function() {
-            return filterW.getValue() === NEW;
+            return filterW.getValue() === NEW_FILTER;
         };
 
         // The filter the region goes to: the picked one, or an existing one the typed name matches
         var target = function() {
             var picked = filterW.getValue(), typed = (nameW.getValue() || '').trim();
-            if (picked === NEW)
+            if (picked === NEW_FILTER)
                 return typed ? findFilter(typed) : null;
             return sections.find(function(s) { return s['.name'] === picked; }) || null;
         };
@@ -1182,7 +1205,7 @@ return view.extend({
                     return self.saveRegion(token, region, name, sec, values, initial);
                 }).then(function(savedSid) {
                     // 'New filter…' above the map moves on to the filter the region went to
-                    if (self.picker && self.picker.getValue() === NEW)
+                    if (self.picker && self.picker.getValue() === NEW_FILTER)
                         self.renderPicker(savedSid);
                 }));
             };
