@@ -133,7 +133,7 @@
             .gm-menu-item { min-height: 44px; }
         }
 
-        /* Mode bar: a fixed strip on top of the map while drawing, setting home or editing */
+        /* Mode bar: a fixed strip on top of the map while drawing or editing */
         .gm-mode-bar {
             position: absolute;
             top: 0;
@@ -477,12 +477,13 @@
         // padding in degrees (LatLngBounds.pad) moves the Mercator centre of the bounds north,
         // and at the lowest zoom the view stays centred on the padded bounds and cuts the south
         var FIT_PADDING = [40, 40];
-        var home = { center: [51.505, -0.09], zoom: 4 };
+        var DEFAULT_VIEW = { center: [51.505, -0.09], zoom: 4 };   // without home view and circles
+        var home = null;        // home view saved in this browser: { center, zoom }, or null
         var toolbar = null;     // buttons of the map toolbar
         var modeBar = null;     // strip on top of the map that explains the current mode
         var selBar = null;      // nodes of the strip below the map while a circle is selected
         var legend = null;      // nodes of the legend that change
-        var mode = null;        // null, 'draw', 'home' or 'edit'
+        var mode = null;        // null, 'draw' or 'edit'
         var drawMenu = null;    // menu of the Draw circle button (createDrawMenu)
         var drawHandler = null; // the running L.Draw.Circle
         var drawingFor = null;  // filter of the running drawing: { sid, name, color, enabled } or { isNew, color }
@@ -719,7 +720,8 @@
             updateToolbar();
         }
 
-        // Home view: { center: [lat, lng], zoom }; the older map stored only [lat, lng] (zoom 4)
+        // Saved home view: { center: [lat, lng], zoom }, or null; the older map stored only
+        // [lat, lng] (zoom 4)
         function loadHome() {
             var isLatLng = function(v) {
                 return Array.isArray(v) && v.length === 2 && Number.isFinite(v[0]) && Number.isFinite(v[1]) &&
@@ -731,11 +733,26 @@
                 v = JSON.parse(localStorage.getItem('homePosition') || 'null');
                 if (isLatLng(v)) return { center: v, zoom: 4 };
             } catch (e) {}
-            return home;
+            return null;
         }
 
+        // Home: the saved home view, else all circles. setView keeps the zoom at the lowest
+        // zoom or above
         function goHome() {
-            map.setView(home.center, home.zoom);
+            if (home) map.setView(home.center, home.zoom);
+            else fitAll(false);
+        }
+
+        // Set home: the current view becomes the home view, the map stays where it is
+        function setHome() {
+            var center = map.getCenter().wrap();
+            home = { center: [center.lat, center.lng], zoom: map.getZoom() };
+            try {
+                localStorage.setItem(HOME_KEY, JSON.stringify(home));
+                showToast('Home view saved.');
+            } catch (err) {
+                showToast('Could not save the home view in this browser.');
+            }
         }
 
         /**
@@ -743,13 +760,19 @@
          * @param {boolean} [quiet] - No note when there is no region (start view).
          */
         function fitAll(quiet) {
-            var bounds = drawnItems.getBounds();
+            var bounds = drawnItems.getBounds(), view = home || DEFAULT_VIEW;
             if (bounds.isValid()) {
                 map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 10 });
             } else {
-                goHome();
+                map.setView(view.center, view.zoom);
                 if (!quiet) showToast('No circles yet.');
             }
+        }
+
+        // The start view: the saved home view, else all regions
+        function fitStartView() {
+            if (home) map.setView(home.center, home.zoom);
+            else fitAll(true);
         }
 
         /**
@@ -790,7 +813,7 @@
         // turns) fits it again, until the user has touched the map
         function onMapResize() {
             updateMinZoom();
-            if (refitUntil && Date.now() < refitUntil) fitAll(true);
+            if (refitUntil && Date.now() < refitUntil) fitStartView();
             else refitUntil = 0;
         }
 
@@ -864,7 +887,7 @@
         }
 
         /**
-         * Draw and Set home end the editing of a selected circle that has no changes; a changed
+         * Draw ends the editing of a selected circle that has no changes; a changed
          * one waits for Done or Cancel, a toast says so.
          * @returns {boolean} - True while a changed circle is selected.
          */
@@ -889,7 +912,6 @@
             a.title = disabled ? 'Filters not loaded yet' :
                 mode === 'draw' ? 'Cancel drawing (Esc)' : 'Draw a circle';
             setPressed(a, mode === 'draw');
-            setPressed(toolbar.setHome, mode === 'home');
         }
 
         /**
@@ -946,8 +968,7 @@
                 L.DomUtil.create('i', 'fa-solid fa-caret-down gm-btn-caret', toolbar.draw).setAttribute('aria-hidden', 'true');
                 toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all circles', function() { fitAll(false); });
                 toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome);
-                toolbar.setHome = toolbarButton(viewGroup, 'fa-location-dot', 'Set home',
-                    'Set the home view', toggleSetHome);
+                toolbarButton(viewGroup, 'fa-location-dot', 'Set home', 'Save this view as home', setHome);
                 L.DomEvent.disableClickPropagation(box);
                 L.DomEvent.disableScrollPropagation(box);
                 return box;
@@ -1112,7 +1133,6 @@
         function startDraw(target) {
             if (readonly || !target) return;
             if (blockedByEdit()) return;
-            if (mode === 'home') stopSetHome();
             if (drawHandler) return;
 
             var color = target.color || DEFAULT_COLOR;
@@ -1155,42 +1175,6 @@
             holdLegend(false);
             updateToolbar();
             post('drawState', { drawing: false });
-        }
-
-        function toggleSetHome() {
-            if (mode === 'home') {
-                stopSetHome();
-                return;
-            }
-            if (blockedByEdit()) return;
-            cancelDraw();
-            mode = 'home';
-            L.DomUtil.addClass(map.getContainer(), 'leaflet-crosshair');
-            map.on('click', onSetHomeClick);
-            showModeBar('Click the map to set the home view. Esc cancels.',
-                [['Cancel', stopSetHome]]);
-            updateToolbar();
-        }
-
-        function stopSetHome() {
-            if (mode !== 'home') return;
-            map.off('click', onSetHomeClick);
-            L.DomUtil.removeClass(map.getContainer(), 'leaflet-crosshair');
-            mode = null;
-            hideModeBar();
-            updateToolbar();
-        }
-
-        function onSetHomeClick(e) {
-            var center = e.latlng.wrap();
-            home = { center: [center.lat, center.lng], zoom: map.getZoom() };
-            try {
-                localStorage.setItem(HOME_KEY, JSON.stringify(home));
-            } catch (err) {
-                showToast('Could not save the home view in this browser.');
-            }
-            stopSetHome();
-            goHome();
         }
 
         /**
@@ -1266,12 +1250,12 @@
          * A click on a circle selects the smallest circle under the pointer; another click at
          * the same spot (within 6 px and 2 s) selects the next larger one, after the largest the
          * smallest again. The second click of a double-click does not cycle: the map zooms in
-         * instead. Not while drawing (the click belongs to the drawing) or setting home (the click
-         * goes on to the map), and not without write access.
+         * instead. Not while drawing (the click belongs to the drawing), and not without write
+         * access.
          */
         function onCircleClick(e) {
             var now = Date.now(), list, pick, i;
-            if (readonly || mode === 'draw' || mode === 'home' || drawHandler) return;
+            if (readonly || mode === 'draw' || drawHandler) return;
             list = circlesAt(e.latlng, e.target);
             if (!list.length) return;
             L.DomEvent.stopPropagation(e);  // no map click, which would end the selection
@@ -1773,8 +1757,8 @@
             home = loadHome();
 
             map = L.map('map', {
-                center: home.center,
-                zoom: home.zoom,
+                center: (home || DEFAULT_VIEW).center,
+                zoom: (home || DEFAULT_VIEW).zoom,
                 drawControlTooltips: false,
                 minZoom: 2,
                 maxBounds: [[-90, -180], [90, 180]],
@@ -1813,13 +1797,12 @@
 
             createSelectionBar();
 
-            // Escape closes the draw menu, ends drawing, Set home, the delete question and the
-            // editing of a circle; registered once
+            // Escape closes the draw menu, ends drawing, the delete question and the editing of
+            // a circle; registered once
             L.DomEvent.on(document, 'keydown', function(e) {
                 if (e.key !== 'Escape') return;
                 if (!drawMenu.hidden) closeDrawMenu(true);
                 else if (mode === 'draw') cancelDraw();
-                else if (mode === 'home') stopSetHome();
                 else if (selection && selection.armed) renderDeleteButton(false);
                 else if (mode === 'edit') endSelection(false);
             });
@@ -2047,12 +2030,12 @@
             refreshDrawMenu();
             updateToolbar();
 
-            // Start view: all regions, or the home view without any. The iframe may have changed
+            // Start view: the saved home view, else all regions. The iframe may have changed
             // its size since the map measured it, and may still do so while the page settles
             if (!viewFitted) {
                 viewFitted = true;
                 map.invalidateSize();
-                fitAll(true);
+                fitStartView();
                 refitUntil = Date.now() + 5000;
             }
         }
