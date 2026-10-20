@@ -252,7 +252,8 @@
         .leaflet-container path.leaflet-interactive:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: 2px; }
 
         /* Edit handles of the selected circle (L.Edit.Circle icons): white, round, a ring in the
-           filter color (--gm-handle-color on the map container), a 44 px hit area. Leaflet sets the
+           filter color (--gm-handle-color on the map container), a hit area 8 px wider on every
+           side (44 px around a 28 px handle). Leaflet sets the
            marker z-index inline from the screen position; the resize handle always wins */
         .leaflet-marker-icon.gm-handle { opacity: 1 !important; }
         .leaflet-marker-icon.gm-handle::after { content: ""; position: absolute; inset: -8px; border-radius: 50%; }
@@ -608,13 +609,13 @@
         var toastTimer = null;
 
         /*
-         * Edit handles of the selected circle: round, 28 px, a ring in the filter color, the
-         * resize handle always above the move handle (CSS). Leaflet 1.9.4 reports L.Browser.touch
-         * on desktop browsers too, and L.Edit.SimpleShape then takes the touch icons: set all four
-         * before the first circle exists.
+         * Edit handles of the selected circle: round, HANDLE_SIZE (28 px, 36 px on touch screens),
+         * a ring in the filter color, the resize handle always above the move handle (CSS).
+         * Leaflet 1.9.4 reports L.Browser.touch on desktop browsers too, and L.Edit.SimpleShape
+         * then takes the touch icons: set all four before the first circle exists.
          */
-        // Touch screens get 36 px handles: CSS cannot resize them, Leaflet positions the icon by iconSize.
-        // Not tested on a touch device yet
+        // The size is set here, not in CSS: Leaflet positions the icon by iconSize. The touch
+        // size is not tested on a touch device yet
         var HANDLE_SIZE = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ? 36 : 28;
 
         function handleIcon(kind, glyph, title) {
@@ -1992,7 +1993,7 @@
             updateMinZoom();
             map.addLayer(markerClusters);
 
-            // Map toolbar: Draw circle (with its menu), Fit all, Home, Set home
+            // Map toolbar: Draw circle (with its menu), Fit all, Home, Set home, Fullscreen
             new GmToolbar().addTo(map);
             createDrawMenu();
             updateToolbar();
