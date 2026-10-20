@@ -102,16 +102,21 @@ var callUciChanges = rpc.declare({
 // Poll intervals in seconds
 var CONNECTIONS_INTERVAL = 5,
     STATUS_INTERVAL = 10,
-    VERSION_INTERVAL = 3600;
+    VERSION_INTERVAL = 3600,
+    // Failed getGeomateConnections requests in a row before the status row says the list is old
+    CONNECTIONS_STALE_AFTER = 3;
 
 return view.extend({
     // Every region action stages at once: there is nothing left for a Save button to do
     handleSave: null,
 
     pending: {},        // last staged changes (callUciChanges)
+    pendingSeq: 0,      // counts writes of pending by stage() and handleReset(); an older poll reply loses
     busy: null,         // promise chain that serializes region actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
+    connectionsAt: null,    // time of the last getGeomateConnections reply
+    connectionsFailed: 0,   // failed getGeomateConnections requests since that reply
     status: null,       // last getStatus result, null when it failed
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
@@ -175,16 +180,21 @@ return view.extend({
             style: 'display: none; margin-left: 8px; font-weight: bold;',
             title: _('Staged changes take effect only after Save & Apply and are lost on logout or session expiry.')
         });
+        n.stale = E('span', {
+            id: 'geomate-connections-stale',
+            style: 'display: none; color: orange; margin-left: 8px;'
+        });
         n.mode = E('p', { id: 'operational-mode-text', style: 'margin: 0;' });
         n.version = E('span', { id: 'version-display', style: 'color: #6b7280;' }, [ _('Loading version...') ]);
         n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
 
         return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
-            // Service status, health checks, loading and pending changes in one row
+            // Service status, health checks, loading, stale connections and pending changes in one row
             E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
                 E('div', { style: 'display: flex; align-items: center;' }, [ n.indicator, n.state ]),
                 n.health,
                 n.loading,
+                n.stale,
                 n.pending
             ]),
             // Operational mode and versions
@@ -357,6 +367,13 @@ return view.extend({
         n.mode.textContent = modeText;
         n.mode.style.cssText = 'margin: 0; ' + modeStyle;
 
+        // A single failed request keeps the last list silently; a lasting failure becomes visible
+        var stale = this.connectionsFailed >= CONNECTIONS_STALE_AFTER;
+        n.stale.style.display = stale ? 'inline' : 'none';
+        n.stale.textContent = !stale ? '' : this.connectionsAt
+            ? _('Connections not updated since %s: the map shows the last known list').format(new Date(this.connectionsAt).toLocaleTimeString())
+            : _('Connections unavailable');
+
         n.pending.style.display = count ? 'inline' : 'none';
         n.pending.textContent = (count == 1)
             ? _('1 change pending: active after Save & Apply')
@@ -403,7 +420,7 @@ return view.extend({
 
     // One request at a time, like pollConnections()
     pollStatus: function() {
-        var self = this;
+        var self = this, seq = this.pendingSeq;
 
         if (!this.statusBusy)
             this.statusBusy = Promise.all([
@@ -414,7 +431,8 @@ return view.extend({
                 self.status = r[0];
                 self.health = r[1];
                 self.statusLoaded = true;
-                if (r[2])
+                // A region action or Reset may have read newer staged changes meanwhile
+                if (r[2] && seq == self.pendingSeq)
                     self.pending = r[2];
                 self.updateStatus();
             }).finally(function() {
@@ -430,6 +448,13 @@ return view.extend({
 
         if (!this.connectionsBusy)
             this.connectionsBusy = L.resolveDefault(callGeomateConnections(), null).then(function(list) {
+                var failed = self.connectionsFailed;
+
+                self.connectionsFailed = list ? 0 : failed + 1;
+                if (list)
+                    self.connectionsAt = Date.now();
+                if (self.connectionsFailed >= CONNECTIONS_STALE_AFTER || failed >= CONNECTIONS_STALE_AFTER)
+                    self.updateStatus();
                 if (!list)
                     return;
                 self.connections = list;
@@ -565,8 +590,10 @@ return view.extend({
         return uci.save().then(function() {
             return L.resolveDefault(callUciChanges(), null);
         }).then(function(changes) {
-            if (changes)
+            if (changes) {
                 self.pending = changes;
+                self.pendingSeq++;
+            }
             self.updateStatus();
         });
     },
@@ -1009,13 +1036,17 @@ return view.extend({
     },
 
     // Staged changes live in the LuCI session, so Reset means revert. LuCI reverts every
-    // configuration with staged changes at once (like the header's Unsaved Changes dialog)
+    // configuration with staged changes at once (like the header's Unsaved Changes dialog).
+    // Like Save & Apply it waits for a running region action, so the count includes its change
     handleReset: function(ev) {
         var self = this;
 
-        return L.resolveDefault(callUciChanges(), null).then(function(changes) {
+        return Promise.resolve(this.busy).then(function() {
+            return L.resolveDefault(callUciChanges(), null);
+        }).then(function(changes) {
             if (changes) {
                 self.pending = changes;
+                self.pendingSeq++;
                 self.updateStatus();
             }
 
