@@ -443,6 +443,7 @@
         var drawingFor = null;  // drawTarget when the running drawing started
         var drawEndedAt = 0;    // a click right after a drawing ends selects no circle
         var viewFitted = false; // the start view has been fitted to the regions
+        var refitUntil = 0;     // until then a resize fits the start view again; user input ends it
         var radiusPill = null;  // radius at the resize handle (edit) or at the cursor (draw)
 
         /*
@@ -705,6 +706,24 @@
         }
 
         /**
+         * Lowest zoom: 2, where the world is 1024 px wide. A map narrower than 640 px shows less
+         * than 225 degrees of longitude there, too little for Fit all with regions in America and
+         * Europe (fitBounds stops at the lowest zoom): it may go to 1.
+         */
+        function updateMinZoom() {
+            var z = map.getSize().x < 640 ? 1 : 2;
+            if (map.getMinZoom() !== z) map.setMinZoom(z);
+        }
+
+        // A resize shortly after the start view was fitted (the page still settles, a phone
+        // turns) fits it again, until the user has touched the map
+        function onMapResize() {
+            updateMinZoom();
+            if (refitUntil && Date.now() < refitUntil) fitAll(true);
+            else refitUntil = 0;
+        }
+
+        /**
          * Shows the mode bar with a text and buttons, and moves the top controls below it.
          * @param {string} text - What the user can do now.
          * @param {Array} buttons - [[label, fn], ...]
@@ -906,6 +925,7 @@
             mode = 'draw';
             showModeBar('Drawing a circle for ' + targetName(drawingFor) + ': click and drag · Esc cancels',
                 [['Cancel', cancelDraw]], drawingFor.color);
+            holdLegend(true);
             updateToolbar();
             post('drawState', { drawing: true });
         }
@@ -920,6 +940,7 @@
                 mode = null;
                 hideModeBar();
             }
+            holdLegend(false);
             updateToolbar();
             post('drawState', { drawing: false });
         }
@@ -1076,10 +1097,32 @@
             showModeBar('Editing ' + filterLabel(gm) + ': drag the centre to move, the edge handle to resize · ' +
                 'Done or a click on the map keeps the change, Esc cancels', [], color);
             showSelectionBar();
+            holdLegend(true);
             updateEditVisuals(layer);
             updateToolbar();
-            if (screenRadius(layer) < 40)
-                map.fitBounds(layer.getBounds(), { padding: [80, 80], maxZoom: 16 });
+            if (screenRadius(layer) < 40) zoomToCircle(layer);
+        }
+
+        /**
+         * Zooms in on a circle that is small on screen: its radius then takes about a fifth of
+         * the smaller side of the map area between the mode bar and the selection bar, at least
+         * 60 px, so the resize handle has room to be dragged outwards. The circle ends up in the
+         * middle of that area.
+         * @param {Object} layer - The selected circle.
+         */
+        function zoomToCircle(layer) {
+            var size = map.getSize(), zoom = map.getZoom(), max = map.getMaxZoom(),
+                top = modeBar.hidden ? 0 : modeBar.offsetHeight,
+                bottom = selBar.box.hidden ? 0 : selBar.box.offsetHeight,
+                target = Math.max(60, Math.min(size.x, size.y - top - bottom) / 5),
+                r = screenRadius(layer), z, center;
+            if (!(r > 0)) return;
+            // The screen radius doubles with every zoom level
+            z = Math.min(max, Math.round(zoom + Math.log2(target / r)));
+            if (z < max && r * Math.pow(2, z - zoom) < 60) z++;
+            if (z <= zoom) return;
+            center = map.unproject(map.project(layer.getLatLng(), z).subtract([0, (top - bottom) / 2]), z);
+            map.setView(center, z);
         }
 
         /**
@@ -1110,6 +1153,7 @@
             mode = null;
             hideModeBar();
             hideSelectionBar();
+            holdLegend(false);
             updateToolbar();
         }
 
@@ -1405,6 +1449,23 @@
             }
         }
 
+        /**
+         * An open legend closes while a circle is drawn or selected: it covers the corner where
+         * the resize handle often ends up. It opens again afterwards, unless the user toggled it
+         * meanwhile; the stored preference stays as it is.
+         * @param {boolean} on - Drawing or editing starts (true) or ends (false).
+         */
+        function holdLegend(on) {
+            if (!legend) return;
+            if (on && !legend.held && !legend.body.hidden) {
+                legend.held = true;
+                setLegendOpen(false, false);
+            } else if (!on && legend.held) {
+                legend.held = false;
+                setLegendOpen(true, false);
+            }
+        }
+
         var GmLegend = L.Control.extend({
             options: { position: 'bottomright' },
             onAdd: function() {
@@ -1453,7 +1514,10 @@
                 L.DomUtil.create('span', '', toggle).textContent = 'Legend';
                 legend.chevron = L.DomUtil.create('i', '', toggle);
                 legend.chevron.setAttribute('aria-hidden', 'true');
-                onTap(toggle, function() { setLegendOpen(body.hidden, true); });
+                onTap(toggle, function() {
+                    legend.held = false;
+                    setLegendOpen(body.hidden, true);
+                });
 
                 L.DomEvent.disableClickPropagation(box);
                 L.DomEvent.disableScrollPropagation(box);
@@ -1497,6 +1561,12 @@
             L.DomEvent.disableScrollPropagation(modeBar);
             // The bar wraps on narrow maps
             map.on('resize', layoutBars);
+            updateMinZoom();
+            map.on('resize', onMapResize);
+            // Any input on the map keeps its view from now on: no more start view fitting
+            ['pointerdown', 'mousedown', 'touchstart', 'wheel', 'keydown'].forEach(function(type) {
+                map.getContainer().addEventListener(type, function() { refitUntil = 0; }, { capture: true, passive: true });
+            });
 
             createSelectionBar();
 
@@ -1643,7 +1713,6 @@
             lb.text.textContent = text;
             lb.chip.textContent = chip;
             lb.chip.hidden = !chip;
-            lb.chip.title = (chip === 'pending') ? 'Staged: active after Save & Apply, lost on logout or session expiry' : '';
             showLabel(layer, changed);
         }
 
@@ -1735,10 +1804,13 @@
             });
             renderLegendFilters();
 
-            // Start view: all regions, or the home view without any
+            // Start view: all regions, or the home view without any. The iframe may have changed
+            // its size since the map measured it, and may still do so while the page settles
             if (!viewFitted) {
                 viewFitted = true;
+                map.invalidateSize();
                 fitAll(true);
+                refitUntil = Date.now() + 5000;
             }
         }
 
