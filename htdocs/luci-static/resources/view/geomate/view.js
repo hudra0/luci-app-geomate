@@ -111,7 +111,6 @@ return view.extend({
     handleSave: null,
 
     pending: {},        // last staged changes (callUciChanges)
-    pendingSeq: 0,      // counts writes of pending by stage() and handleReset(); an older poll reply loses
     busy: null,         // promise chain that serializes region actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
@@ -175,11 +174,6 @@ return view.extend({
             id: 'geomate-loading-indicator',
             style: 'display: none; color: orange; margin-left: 8px;'
         }, [ _('Loading GeoFilter data ...') ]);
-        n.pending = E('span', {
-            id: 'geomate-pending-changes',
-            style: 'display: none; margin-left: 8px; font-weight: bold;',
-            title: _('Staged changes take effect only after Save & Apply and are lost on logout or session expiry.')
-        });
         n.stale = E('span', {
             id: 'geomate-connections-stale',
             style: 'display: none; color: orange; margin-left: 8px;'
@@ -189,13 +183,13 @@ return view.extend({
         n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
 
         return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
-            // Service status, health checks, loading, stale connections and pending changes in one row
+            // Service status, health checks, loading and stale connections in one row. Staged
+            // changes: LuCI's own Unsaved Changes indicator in the header
             E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
                 E('div', { style: 'display: flex; align-items: center;' }, [ n.indicator, n.state ]),
                 n.health,
                 n.loading,
-                n.stale,
-                n.pending
+                n.stale
             ]),
             // Operational mode and versions
             E('div', {
@@ -313,13 +307,12 @@ return view.extend({
             box.scrollIntoView({ behavior: 'smooth' });
     },
 
-    // Show the last status, health check and staged changes
+    // Show the last status and health check
     updateStatus: function() {
         var n = this.nodes,
             st = this.status,
             checks = this.health && this.health.checks,
-            running = !!(st && st.running),
-            count = L.toArray((this.pending || {}).geomate).length;
+            running = !!(st && st.running);
 
         if (!n)
             return;
@@ -373,11 +366,6 @@ return view.extend({
         n.stale.textContent = !stale ? '' : this.connectionsAt
             ? _('Connections not updated since %s: the map shows the last known list').format(new Date(this.connectionsAt).toLocaleTimeString())
             : _('Connections unavailable');
-
-        n.pending.style.display = count ? 'inline' : 'none';
-        n.pending.textContent = (count == 1)
-            ? _('1 change pending: active after Save & Apply')
-            : _('%d changes pending: active after Save & Apply').format(count);
     },
 
     // Polls are added once, after the first render, as bound functions: poll.add() skips only a
@@ -420,20 +408,16 @@ return view.extend({
 
     // One request at a time, like pollConnections()
     pollStatus: function() {
-        var self = this, seq = this.pendingSeq;
+        var self = this;
 
         if (!this.statusBusy)
             this.statusBusy = Promise.all([
                 L.resolveDefault(callGetStatus(), null),
-                L.resolveDefault(callGetHealthCheck(), null),
-                L.resolveDefault(callUciChanges(), null)
+                L.resolveDefault(callGetHealthCheck(), null)
             ]).then(function(r) {
                 self.status = r[0];
                 self.health = r[1];
                 self.statusLoaded = true;
-                // A region action or Reset may have read newer staged changes meanwhile
-                if (r[2] && seq == self.pendingSeq)
-                    self.pending = r[2];
                 self.updateStatus();
             }).finally(function() {
                 self.statusBusy = null;
@@ -590,11 +574,8 @@ return view.extend({
         return uci.save().then(function() {
             return L.resolveDefault(callUciChanges(), null);
         }).then(function(changes) {
-            if (changes) {
+            if (changes)
                 self.pending = changes;
-                self.pendingSeq++;
-            }
-            self.updateStatus();
         });
     },
 
@@ -1044,11 +1025,8 @@ return view.extend({
         return Promise.resolve(this.busy).then(function() {
             return L.resolveDefault(callUciChanges(), null);
         }).then(function(changes) {
-            if (changes) {
+            if (changes)
                 self.pending = changes;
-                self.pendingSeq++;
-                self.updateStatus();
-            }
 
             var pending = self.pending || {},
                 count = L.toArray(pending.geomate).length,
