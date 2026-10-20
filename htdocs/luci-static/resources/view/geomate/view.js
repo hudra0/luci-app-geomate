@@ -869,7 +869,8 @@ return view.extend({
         var uploadList = function(file) {
             var path = value('ip_list') || suggestedList();
 
-            if (!/^\/etc\/geomate\.d\/[^\/]+$/.test(path) || path == '/etc/geomate.d/..')
+            // A file directly in /etc/geomate.d; '.' and '..' name a directory
+            if (!/^\/etc\/geomate\.d\/(?!\.\.?$)[^\/]+$/.test(path))
                 return dom.content(status, [ _('Choose a filter name or a list file in /etc/geomate.d/ first.') ]);
 
             // Geo data files and the updater's md5 registries live there too
