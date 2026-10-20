@@ -41,6 +41,12 @@ function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
 }
 
+// The message of an error without the stack trace, which L.raise() appends to RPC errors (same
+// as in view.js)
+function errorText(err) {
+    return String((err && err.message) || err).split('\n')[0];
+}
+
 // Radius in meters of a region 'circle:<lat>:<lon>:<radius in meters>', or null when the string
 // is no valid circle (finite numbers, |lat| <= 90, |lon| <= 180, radius >= 1)
 function parseRegion(region) {
@@ -163,7 +169,7 @@ function uploadList(opt, sid, path, file) {
             opt.map.lookupOption('ip_list', sid)[0].getUIElement(sid).setValue(path);
             dom.content(status, [ _('Uploaded %s to %s.').format(file.name, path) ]);
         }).catch(function(err) {
-            dom.content(status, [ _('Failed to upload file: %s').format(err.message) ]);
+            dom.content(status, [ _('Failed to upload file: %s').format(errorText(err)) ]);
         });
     };
 
@@ -178,7 +184,7 @@ function uploadList(opt, sid, path, file) {
     }, function(err) {
         if (err && err.name == 'NotFoundError')
             return write();
-        dom.content(status, [ _('Cannot check %s: %s').format(path, err.message) ]);
+        dom.content(status, [ _('Cannot check %s: %s').format(path, errorText(err)) ]);
     });
 }
 
@@ -323,7 +329,7 @@ return view.extend({
                             
                             return fs.exec_direct('/etc/geolocate.sh', [])
                                 .catch(function(err) {
-                                    ui.addNotification(null, E('p', {}, _('Failed to start geolocation process: ') + err.message), 'error');
+                                    ui.addNotification(null, E('p', {}, _('Failed to start geolocation process: ') + errorText(err)), 'error');
                                 });
                         }
                     }, _('Proceed'))
