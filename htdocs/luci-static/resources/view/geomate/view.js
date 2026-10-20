@@ -59,6 +59,11 @@ function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
 }
 
+// The message of an error without the stack trace, which L.raise() appends to RPC errors
+function errorText(err) {
+    return String((err && err.message) || err).split('\n')[0];
+}
+
 // Declare RPC methods to interact with the Geomate backend
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
@@ -531,7 +536,7 @@ return view.extend({
     enqueue: function(token, fn) {
         var self = this;
         this.busy = Promise.resolve(this.busy).then(fn).catch(function(err) {
-            var reason = _('Change failed: %s. Reload the page.').format((err && err.message) || err);
+            var reason = _('Change failed: %s. Reload the page.').format(errorText(err));
             ui.addNotification(null, E('p', {}, [ reason ]), 'error');
             self.sendMessageToMap('regionRejected', { token: token, reason: reason });
             // A failed uci.save() keeps its changes in memory; drop them so a later save does not stage them
@@ -871,7 +876,7 @@ return view.extend({
                 dom.content(status, [ _('Uploaded %s to %s.').format(file.name, path) ]);
                 update();
             }).catch(function(err) {
-                dom.content(status, [ _('Failed to upload file: %s').format(err.message) ]);
+                dom.content(status, [ _('Failed to upload file: %s').format(errorText(err)) ]);
             });
         };
 
@@ -898,7 +903,7 @@ return view.extend({
             }, function(err) {
                 if (err && err.name == 'NotFoundError')
                     return writeList(path, file);
-                dom.content(status, [ _('Cannot check %s: %s').format(path, err.message) ]);
+                dom.content(status, [ _('Cannot check %s: %s').format(path, errorText(err)) ]);
             });
         };
 
