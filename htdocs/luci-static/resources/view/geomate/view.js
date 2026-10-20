@@ -53,6 +53,11 @@ function filterColor(index) {
     return PALETTE[index % PALETTE.length];
 }
 
+// The section id names a geo_filter section of the loaded configuration
+function isGeoFilter(sid) {
+    return !!sid && (uci.get('geomate', sid) || {})['.type'] === 'geo_filter';
+}
+
 function isEmpty(v) {
     return Array.isArray(v) ? v.length == 0 : (v == null || v === '');
 }
@@ -124,6 +129,7 @@ return view.extend({
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
     writable: false,    // the user may change and apply configurations (L.hasViewPermission)
+    applying: false,    // Save & Apply waits for a running region action (handleSaveApply)
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
     nodes: null,        // nodes that the polls update in place
@@ -216,8 +222,8 @@ return view.extend({
         ]);
     },
 
-    // Action bar above the map in LuCI button classes, so it follows the theme:
-    // filter picker, Draw circle, Active connections and the staged changes chip. Fit all is in
+    // Action bar above the map in LuCI button classes, so it follows the theme: filter picker,
+    // Enable filter, Draw circle, Active connections and the staged changes chip. Fit all is in
     // the map toolbar
     renderActions: function() {
         var n = this.nodes;
@@ -325,7 +331,7 @@ return view.extend({
             return { sid: null, name: '', isNew: true, enabled: true,
                 // The color the new section gets: it is appended after the existing ones
                 color: filterColor(uci.sections('geomate', 'geo_filter').length) };
-        if (!v || (uci.get('geomate', v) || {})['.type'] !== 'geo_filter')
+        if (!isGeoFilter(v))
             return null;
         return Object.assign(this.filterInfo(v), { isNew: false });
     },
@@ -378,11 +384,12 @@ return view.extend({
             : _('Draw a circle for filter %s').format(t.name);
 
         // Also without write access or a loaded configuration: the count stays true. Applying
-        // needs write access, like the footer's Save & Apply
+        // needs write access, like the footer's Save & Apply. Polls must not enable the chip
+        // while an apply waits (ui.createHandlerFn disabled it)
         count = L.toArray((this.pending || {}).geomate).length;
         others = this.otherStagedConfigs();
         n.chip.style.display = count ? '' : 'none';
-        n.chip.disabled = !this.writable;
+        n.chip.disabled = !this.writable || this.applying;
         n.chip.textContent = (count == 1)
             ? _('1 change pending · Save & Apply')
             : _('%d changes pending · Save & Apply').format(count);
@@ -788,9 +795,7 @@ return view.extend({
     // A circle was drawn in the map for the filter picked above it (sid), or for a new filter
     // (sid null). An existing filter gets the region without a dialog
     addDrawnRegion: function(token, region, sid) {
-        var exists = sid && (uci.get('geomate', sid) || {})['.type'] === 'geo_filter';
-
-        if (!exists)
+        if (!isGeoFilter(sid))
             // A filter that disappeared since it was picked: the dialog's filter list decides
             return this.openFilterModal(token, region, sid ? '' : NEW_FILTER);
         if (!validRegion(region))
@@ -822,8 +827,7 @@ return view.extend({
         var self = this;
 
         return this.enqueue(null, function() {
-            if (!sid || (uci.get('geomate', sid) || {})['.type'] !== 'geo_filter' ||
-                uci.get('geomate', sid, 'enabled') === '1')
+            if (!isGeoFilter(sid) || uci.get('geomate', sid, 'enabled') === '1')
                 return;
             // A filter without a region blocks all its traffic in strict mode: the Geo Filters page decides that
             if (!self.regionList(sid).length)
@@ -1273,8 +1277,15 @@ return view.extend({
 
     // Region actions stage at once; apply what the session has staged after the running one
     handleSaveApply: function(ev, mode) {
+        var self = this;
+
+        this.applying = true;
+        this.updateActions();
         return Promise.resolve(this.busy).then(function() {
             ui.changes.apply(mode == '0');
+        }).finally(function() {
+            self.applying = false;
+            self.updateActions();
         });
     },
 
