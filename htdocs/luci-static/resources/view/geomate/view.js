@@ -250,9 +250,10 @@ return view.extend({
         // Define CSS styles for the active connections container and table
         var style = E('style', {}, `
             /* No side margin: the header and the map share the edges of the page content */
-            .gm-connections-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 12px 0 8px; }
-            .gm-connections-head h3 { margin: 0; }
-            .gm-connections-head .btn { margin: 0; }
+            .gm-connections-head { display: flex; flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 8px; margin: 12px 0 8px; }
+            /* A theme may give h3 width: 100%, which pushed the button to a second row */
+            .gm-connections-head h3 { flex: 1 1 0; min-width: 0; width: auto; margin: 0; }
+            .gm-connections-head .btn { flex: none; margin: 0; }
             #active-connections-container {
                 padding: 10px;
                 box-sizing: border-box;
