@@ -59,7 +59,7 @@ function regionList(section_id) {
     return Array.isArray(v) ? v : [];
 }
 
-// Regions written as 'option allowed_region', which the service ignores
+// Regions written as 'option allowed_region', which the service start skips
 function regionIsOption(section_id) {
     return typeof uci.get('geomate', section_id, 'allowed_region') == 'string';
 }
@@ -345,7 +345,7 @@ return view.extend({
         o.rmempty = false;
 
         // Tooltip of the status and regions columns for a hand-written 'option allowed_region'
-        var optionNote = _('Geomate reads only "list allowed_region", not "option allowed_region".');
+        var optionNote = _('Written as "option allowed_region" instead of "list allowed_region": the service start skips it and the map cannot show it.');
 
         // Status column - what the running service does with the filter. Staged changes are not
         // active before Save & Apply, and the service sees only what that has committed. A word
@@ -372,7 +372,7 @@ return view.extend({
                 // The service does not start while Geomate is disabled globally
                 if (uci.get('geomate', 'global', 'enabled') !== '1') problem(_('Service off'), _('Geomate is disabled in the global settings.'));
                 if (hasNftError(filterName)) problem(_('nftables error'), _('See /tmp/geomate_nft_errors.log on the router.'));
-                if (regionIsOption(section_id)) problem(_('Regions ignored'), optionNote);
+                if (regionIsOption(section_id)) problem(_('Region not a list'), optionNote);
                 else if (!regionList(section_id).some(function(r) { return parseRegion(r) !== null; })) problem(_('No regions'));
                 if (!uci.get('geomate', section_id, 'ip_list')) problem(_('No IP list'));
             }
@@ -430,7 +430,7 @@ return view.extend({
             var invalid = regions.length - radii.length;
             var nodes;
 
-            if (regionIsOption(section_id)) return E('span', { 'title': optionNote }, [ _('Ignored') ]);
+            if (regionIsOption(section_id)) return E('span', { 'title': optionNote }, [ _('Not a list') ]);
             if (!regions.length) return '–';
 
             if (invalid) parts.push(_('%d invalid').format(invalid));
