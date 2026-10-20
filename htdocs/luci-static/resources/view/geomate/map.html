@@ -533,8 +533,8 @@
                 html: '<span class="gm-handle-dot" title="' + title + '"><i class="fa-solid ' + glyph + '" aria-hidden="true"></i></span>'
             });
         }
-        var moveHandleIcon = handleIcon('move', 'fa-arrows-up-down-left-right', 'Drag to move the circle');
-        var resizeHandleIcon = handleIcon('resize', 'fa-up-right-and-down-left-from-center', 'Drag to change the radius');
+        var moveHandleIcon = handleIcon('move', 'fa-arrows-up-down-left-right', 'Drag to move');
+        var resizeHandleIcon = handleIcon('resize', 'fa-up-right-and-down-left-from-center', 'Drag to resize');
         L.Edit.Circle.mergeOptions({
             moveIcon: moveHandleIcon,
             resizeIcon: resizeHandleIcon,
@@ -748,7 +748,7 @@
                 map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 10 });
             } else {
                 goHome();
-                if (!quiet) showToast('No regions yet: showing the home view.');
+                if (!quiet) showToast('No circles yet.');
             }
         }
 
@@ -874,7 +874,7 @@
                 endSelection(false);
                 return false;
             }
-            showToast('Finish editing the selected circle first: Done or Cancel below the map.');
+            showToast('Click Done or Cancel first.');
             return true;
         }
 
@@ -886,8 +886,8 @@
             L.DomUtil[disabled ? 'addClass' : 'removeClass'](a, 'leaflet-disabled');
             a.setAttribute('aria-disabled', disabled ? 'true' : 'false');
             a.setAttribute('aria-expanded', (drawMenu && !drawMenu.hidden) ? 'true' : 'false');
-            a.title = disabled ? 'The filters are not loaded yet' :
-                mode === 'draw' ? 'Stop drawing (Esc)' : 'Draw a circle for a filter';
+            a.title = disabled ? 'Filters not loaded yet' :
+                mode === 'draw' ? 'Cancel drawing (Esc)' : 'Draw a circle';
             setPressed(a, mode === 'draw');
             setPressed(toolbar.setHome, mode === 'home');
         }
@@ -944,10 +944,10 @@
                     draw: toolbarButton(drawGroup, 'fa-circle-plus', 'Draw circle', '', onDrawButton, 'gm-btn--draw')
                 };
                 L.DomUtil.create('i', 'fa-solid fa-caret-down gm-btn-caret', toolbar.draw).setAttribute('aria-hidden', 'true');
-                toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all regions', function() { fitAll(false); });
+                toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all circles', function() { fitAll(false); });
                 toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome);
                 toolbar.setHome = toolbarButton(viewGroup, 'fa-location-dot', 'Set home',
-                    'Set the home view: click the map at the zoom you want', toggleSetHome);
+                    'Set the home view', toggleSetHome);
                 L.DomEvent.disableClickPropagation(box);
                 L.DomEvent.disableScrollPropagation(box);
                 return box;
@@ -1006,7 +1006,7 @@
             mark.setAttribute('aria-hidden', 'true');
             if (color) mark.style.background = color;
             L.DomUtil.create('span', 'gm-menu-name', b).textContent = label;
-            if (disabled) L.DomUtil.create('span', 'gm-menu-note', b).textContent = '(disabled)';
+            if (disabled) L.DomUtil.create('span', 'gm-menu-note', b).textContent = 'Disabled';
             onTap(b, function() {
                 closeDrawMenu(false);
                 fn();
@@ -1126,7 +1126,7 @@
         function onDrawStart() {
             closeDrawMenu(false);
             mode = 'draw';
-            showModeBar('Drawing a circle for ' + targetName(drawingFor) + ': click and drag · Esc cancels',
+            showModeBar('Drag on the map to draw a circle for ' + targetName(drawingFor) + '. Esc cancels.',
                 [['Cancel', cancelDraw]], drawingFor.color);
             holdLegend(true);
             updateToolbar();
@@ -1158,7 +1158,7 @@
             mode = 'home';
             L.DomUtil.addClass(map.getContainer(), 'leaflet-crosshair');
             map.on('click', onSetHomeClick);
-            showModeBar('Click the map to make it the home view at the current zoom · Esc cancels',
+            showModeBar('Click the map to set the home view. Esc cancels.',
                 [['Cancel', stopSetHome]]);
             updateToolbar();
         }
@@ -1178,7 +1178,7 @@
             try {
                 localStorage.setItem(HOME_KEY, JSON.stringify(home));
             } catch (err) {
-                showToast('The home view could not be saved in this browser; it lasts until the page reloads.');
+                showToast('Could not save the home view in this browser.');
             }
             stopSetHome();
             goHome();
@@ -1330,8 +1330,7 @@
             // options.editing and options.original are unset, so the circle keeps its style
             layer.editing.enable();
             applyState(layer);
-            showModeBar('Editing ' + filterLabel(gm) + ': drag the centre to move, the edge handle to resize · ' +
-                'Done or a click on the map keeps the change, Esc cancels', [], color);
+            showModeBar('Drag the centre to move, the edge to resize. Esc cancels.', [], color);
             showSelectionBar();
             holdLegend(true);
             updateEditVisuals(layer);
@@ -1446,7 +1445,7 @@
             selBar.radius.max = '20000';
             selBar.radius.step = 'any';
             selBar.radius.setAttribute('inputmode', 'decimal');
-            selBar.radius.title = 'Radius in km; the circle follows at once';
+            selBar.radius.title = 'Radius in km';
             L.DomUtil.create('span', '', field).textContent = 'km';
             L.DomEvent.on(selBar.radius, 'input', onRadiusInput);
             L.DomEvent.on(selBar.radius, 'keydown', function(e) {
@@ -1457,12 +1456,12 @@
             });
 
             selBar.center = L.DomUtil.create('span', 'gm-sel-center', box);
-            selBar.center.title = 'Centre: latitude, longitude';
+            selBar.center.title = 'Latitude, longitude';
 
             actions = L.DomUtil.create('span', 'gm-sel-actions', box);
             barButton(actions, 'Done', 'gm-bar-btn--primary', function() { endSelection(true); },
-                'Keep the change; it is staged like every region change');
-            barButton(actions, 'Cancel', '', function() { endSelection(false); }, 'Undo the changes of this edit (Esc)');
+                'Keep the change');
+            barButton(actions, 'Cancel', '', function() { endSelection(false); }, 'Undo the change (Esc)');
             selBar.del = L.DomUtil.create('span', 'gm-sel-delete', actions);
 
             L.DomEvent.disableClickPropagation(box);
@@ -1507,23 +1506,21 @@
         }
 
         /**
-         * Delete in two steps: the first click asks "Delete 'BF6 · 683 km'? Yes / No",
+         * Delete in two steps: the first click asks "Delete circle? Yes / No",
          * which falls back to Delete after 5 s.
          * @param {boolean} armed - Show the question instead of the Delete button.
          */
         function renderDeleteButton(armed) {
-            var s = selection, box = selBar.del, hadFocus = box.contains(document.activeElement), gm, no;
+            var s = selection, box = selBar.del, hadFocus = box.contains(document.activeElement), no;
             if (!s) return;
             clearTimeout(s.deleteTimer);
             s.armed = armed;
             box.textContent = '';
             if (!armed) {
                 no = barButton(box, 'Delete', 'gm-bar-btn--danger', function() { renderDeleteButton(true); },
-                    'Delete this circle; asks once more');
+                    'Delete this circle');
             } else {
-                gm = s.layer.gm;
-                L.DomUtil.create('span', '', box).textContent =
-                    "Delete '" + (gm.name || gm.sid) + ' · ' + formatDistance(s.backup.radius) + "'?";
+                L.DomUtil.create('span', '', box).textContent = 'Delete circle?';
                 barButton(box, 'Yes', 'gm-bar-btn--danger-solid', requestDelete);
                 no = barButton(box, 'No', '', function() { renderDeleteButton(false); });
                 s.deleteTimer = setTimeout(function() {
@@ -1642,10 +1639,10 @@
                 L.DomUtil.create('span', '', meta).textContent =
                     (n === 1 ? '1 circle' : n + ' circles') + (f.enabled ? '' : ' (disabled)');
                 eye = iconButton(li, hidden ? 'fa-eye-slash' : 'fa-eye',
-                    (hidden ? 'Show the circles of ' : 'Hide the circles of ') + name, f.sid + ' eye',
+                    (hidden ? 'Show ' : 'Hide ') + name, f.sid + ' eye',
                     function() { setFilterVisible(f.sid, hidden); });
                 eye.setAttribute('aria-pressed', hidden ? 'false' : 'true');
-                fit = iconButton(li, 'fa-magnifying-glass', 'Zoom to the circles of ' + name, f.sid + ' fit',
+                fit = iconButton(li, 'fa-magnifying-glass', 'Zoom to ' + name, f.sid + ' fit',
                     function() { fitFilter(f.sid); });
                 eye.disabled = fit.disabled = !n;
             });
@@ -1715,31 +1712,30 @@
 
                 L.DomUtil.create('h3', '', body).textContent = 'Circles';
                 [
-                    ['enabled', 'Enabled filter'],
-                    ['disabled', 'Disabled filter: filters nothing'],
-                    ['unsaved', 'Unsaved', 'Changed in this session: active after Save & Apply, lost on logout'],
-                    ['selected', 'Selected for editing']
+                    ['enabled', 'Enabled'],
+                    ['disabled', 'Disabled'],
+                    ['unsaved', 'Unsaved'],
+                    ['selected', 'Selected']
                 ].forEach(function(s) {
                     var swatch = legendItem(body, s[1]);
                     L.DomUtil.create('span', 'gm-legend-ring gm-legend-ring--' + s[0], swatch);
-                    if (s[2]) swatch.parentNode.title = s[2];
                 });
 
                 L.DomUtil.create('h3', '', body).textContent = 'Connections';
                 [
-                    ['fa-check-circle', 'green', 'Allowed connection (within a region)'],
-                    ['fa-exclamation-triangle', 'red', 'Blocked connection (outside the regions)'],
-                    ['fa-user', 'blue', 'Allowed IP (whitelist)']
+                    ['fa-check-circle', 'green', 'Allowed'],
+                    ['fa-exclamation-triangle', 'red', 'Blocked'],
+                    ['fa-user', 'blue', 'Whitelisted']
                 ].forEach(function(m) {
                     var i = L.DomUtil.create('i', 'fa ' + m[0], legendItem(body, m[2]));
                     i.style.color = m[1];
                     i.setAttribute('aria-hidden', 'true');
                 });
                 [
-                    ['rgba(0, 128, 0, 0.6)', 'Several allowed connections'],
-                    ['rgba(255, 0, 0, 0.6)', 'Several blocked connections'],
-                    ['rgba(0, 0, 255, 0.6)', 'Several allowed IPs'],
-                    ['rgba(255, 165, 0, 0.6)', 'Mixed connection types']
+                    ['rgba(0, 128, 0, 0.6)', 'Several allowed'],
+                    ['rgba(255, 0, 0, 0.6)', 'Several blocked'],
+                    ['rgba(0, 0, 255, 0.6)', 'Several whitelisted'],
+                    ['rgba(255, 165, 0, 0.6)', 'Mixed']
                 ].forEach(function(c) {
                     L.DomUtil.create('span', 'gm-legend-cluster', legendItem(body, c[1])).style.background = c[0];
                 });
@@ -1827,7 +1823,7 @@
             map.on('draw:drawstart', onDrawStart);
             map.on('draw:drawstop', onDrawStop);
             map.on('gm:drawradius', function(e) {
-                setModeExtra('r = ' + formatDistance(e.radius));
+                setModeExtra('Radius ' + formatDistance(e.radius));
                 showPill(e.latlng, formatDistance(e.radius));
             });
             map.on('draw:editmove draw:editresize', function(e) { updateEditVisuals(e.layer); });

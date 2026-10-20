@@ -634,25 +634,19 @@ return view.extend({
 
         var name = this.filterName(sid),
             list = this.regionList(sid),
-            handWritten = uci.get('geomate', sid, 'allowed_region'),
-            disabled = uci.get('geomate', sid, 'enabled') !== '1',
-            notes = [];
+            disabled = uci.get('geomate', sid, 'enabled') !== '1';
 
         if (list.indexOf(region) < 0)
             list.push(region);
         uci.set('geomate', sid, 'allowed_region', list);
 
         // Drawing never enables a filter; a disabled one gets a one-click offer. An enabled filter
-        // needs no note: the dashed circle and LuCI's Unsaved Changes show the change
-        if (disabled)
-            notes.push(_('Filter %s is disabled, so the new circle has no effect yet.').format(name));
-        // The dialog path says this before saving; here the region is already staged
-        if (typeof handWritten == 'string')
-            notes.push(_('The circle replaced the hand-written "option allowed_region" (%s).').format(handWritten));
-
-        return this.stage(!notes.length ? null : {
-            text: notes.join(' '),
-            action: disabled ? { name: 'enableFilter', sid: sid, label: _('Enable') } : null
+        // needs no note: the dashed circle and LuCI's Unsaved Changes show the change. A circle
+        // drawn for a filter with a hand-written 'option allowed_region' replaces it, which the
+        // warning at page load has announced
+        return this.stage(!disabled ? null : {
+            text: _('Filter %s is disabled.').format(name),
+            action: { name: 'enableFilter', sid: sid, label: _('Enable') }
         }).then(this.ackRegion.bind(this, token, sid, region));
     },
 
@@ -666,7 +660,7 @@ return view.extend({
             // A filter without a region blocks all its traffic in strict mode: the Geo Filters page decides that
             if (!self.regionList(sid).length)
                 return self.sendMessageToMap('toast', {
-                    text: _('Filter %s has no region and stays disabled. Draw a region first, or enable it on the Geo Filters page.').format(self.filterName(sid))
+                    text: _('Draw a circle for filter %s before enabling it.').format(self.filterName(sid))
                 });
 
             uci.set('geomate', sid, 'enabled', '1');
@@ -1043,7 +1037,7 @@ return view.extend({
                 }));
             };
 
-            ui.showModal(_('New circle'), [
+            ui.showModal((pick === NEW_FILTER) ? _('New filter') : _('New circle'), [
                 E('div', { 'class': 'cbi-map' }, [ E('div', { 'class': 'cbi-section' }, [ body ]) ]),
                 E('p', {}, [
                     _('More options:'), ' ',
