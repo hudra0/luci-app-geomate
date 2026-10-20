@@ -149,7 +149,7 @@ return view.extend({
 
         if (!configLoaded)
             ui.addNotification(null, E('p', {}, [
-                _('The geomate configuration could not be loaded, so the map cannot show or change regions. Reload the page.')
+                _('Could not load the geomate configuration. Reload the page.')
             ]), 'error');
 
         var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
@@ -364,7 +364,7 @@ return view.extend({
         var stale = this.connectionsFailed >= CONNECTIONS_STALE_AFTER;
         n.stale.style.display = stale ? 'inline' : 'none';
         n.stale.textContent = !stale ? '' : this.connectionsAt
-            ? _('Connections not updated since %s: the map shows the last known list').format(new Date(this.connectionsAt).toLocaleTimeString())
+            ? _('Connections not updated since %s').format(new Date(this.connectionsAt).toLocaleTimeString())
             : _('Connections unavailable');
     },
 
@@ -1018,7 +1018,7 @@ return view.extend({
 
     // Staged changes live in the LuCI session, so Reset means revert. LuCI reverts every
     // configuration with staged changes at once (like the header's Unsaved Changes dialog).
-    // Like Save & Apply it waits for a running region action, so the count includes its change
+    // Like Save & Apply it waits for a running region action, so the reset includes its change
     handleReset: function(ev) {
         var self = this;
 
@@ -1028,35 +1028,21 @@ return view.extend({
             if (changes)
                 self.pending = changes;
 
-            var pending = self.pending || {},
-                count = L.toArray(pending.geomate).length,
-                others = Object.keys(pending).filter(function(config) {
-                    return config != 'geomate' && L.toArray(pending[config]).length;
-                });
-
-            if (!count) {
-                ui.addNotification(null, E('p', {}, [ _('Geomate has no staged changes to revert.') ]), 'info');
+            if (!L.toArray((self.pending || {}).geomate).length) {
+                ui.addNotification(null, E('p', {}, [ _('Geomate has no unsaved changes.') ]), 'info');
                 return;
             }
 
-            // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
-            var body = [
-                E('p', {}, [ (count == 1)
-                    ? _('Geomate has 1 staged change. It is not active yet; reverting discards it.')
-                    : _('Geomate has %d staged changes. They are not active yet; reverting discards them.').format(count) ]),
-                E('p', {}, [ _('Like Revert in the Unsaved Changes dialog, this reverts the staged changes of every configuration in this session, then reloads the page.') ])
-            ];
-            if (others.length)
-                body.push(E('p', {}, [ _('Also reverted: the staged changes of %s.').format(others.join(', ')) ]));
-            body.push(E('div', { 'class': 'right' }, [
-                E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
-                E('button', { 'class': 'btn cbi-button-negative', 'click': ui.createHandlerFn(self, function() {
-                    ui.hideModal();
-                    ui.changes.revert();
-                }) }, [ _('Revert') ])
-            ]));
-
-            ui.showModal(_('Revert staged changes?'), body);
+            ui.showModal(_('Unsaved changes'), [
+                E('p', {}, [ _('Discard all unsaved changes and reload the page?') ]),
+                E('div', { 'class': 'right' }, [
+                    E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
+                    E('button', { 'class': 'btn cbi-button-negative', 'click': ui.createHandlerFn(self, function() {
+                        ui.hideModal();
+                        ui.changes.revert();
+                    }) }, [ _('Reset') ])
+                ])
+            ]);
         });
     },
 
