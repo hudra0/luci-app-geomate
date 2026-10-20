@@ -954,11 +954,20 @@
             }
         });
 
-        // Leaflet.draw circle handler that reports the radius and the cursor while the user drags
+        // Leaflet.draw circle handler that reports the radius and the cursor while the user drags.
+        // A click without a drag draws no shape; Leaflet.draw would end the drawing without a
+        // word, so it goes on and the map says how to draw
         var GmDrawCircle = L.Draw.Circle.extend({
             _drawShape: function(latlng) {
                 L.Draw.Circle.prototype._drawShape.call(this, latlng);
                 this._map.fire('gm:drawradius', { radius: this._shape.getRadius(), latlng: latlng });
+            },
+            _onMouseUp: function() {
+                if (this._shape) return L.Draw.Circle.prototype._onMouseUp.call(this);
+                this._isDrawing = false;
+                L.DomEvent.off(document, 'mouseup', this._onMouseUp, this);
+                L.DomEvent.off(document, 'touchend', this._onMouseUp, this);
+                showToast('Drag to draw a circle.');
             }
         });
 
@@ -1257,7 +1266,7 @@
          * A click on a circle selects the smallest circle under the pointer; another click at
          * the same spot (within 6 px and 2 s) selects the next larger one, after the largest the
          * smallest again. The second click of a double-click does not cycle: the map zooms in
-         * instead. Not while drawing (the click may end the drawing) or setting home (the click
+         * instead. Not while drawing (the click belongs to the drawing) or setting home (the click
          * goes on to the map), and not without write access.
          */
         function onCircleClick(e) {
