@@ -839,10 +839,11 @@ return view.extend({
     // read it in between. checkStaged() may stop an action before it changes anything; its
     // circle then goes back (token), or onRefuse(reason) answers. An action with a circle queued
     // before the map got all filters again (pushFilters) is dropped: the map no longer has its
-    // circle. So is an action whose filter id sid names another filter now (movedFilter). A
-    // failed action shows the error, and the map shows the configuration again (resync)
+    // circle. So is an action whose filter id sid names another filter now than at the click
+    // (movedFilter; a resync queued before may have renamed the id in sidNames since). A failed
+    // action shows the error, and the map shows the configuration again (resync)
     enqueue: function(token, sid, fn, onRefuse) {
-        var self = this, generation = this.generation;
+        var self = this, generation = this.generation, known = this.sidNames[sid];
 
         this.busy = Promise.resolve(this.busy).then(function() {
             if (self.readonly)
@@ -859,7 +860,7 @@ return view.extend({
                     return onRefuse ? onRefuse(reason) : self.sendMessageToMap('toast', { text: reason });
                 }
                 return self.loadConfig().then(function() {
-                    if (self.movedFilter(sid))
+                    if (self.movedFilter(sid, known))
                         throw filtersChanged();
                     return fn();
                 });
@@ -879,11 +880,12 @@ return view.extend({
         return uci.load('geomate');
     },
 
-    // The map's section id sid names another filter than when the map got it: geo_filter
+    // The section id sid names another filter than known, the name the map had for it: geo_filter
     // sections are anonymous, so deleting one (e.g. in another tab) shifts the ids of all filters
-    // after it. An id that is gone does not count: the actions handle a deleted filter themselves
-    movedFilter: function(sid) {
-        return isGeoFilter(sid) && this.sidNames[sid] !== (uci.get('geomate', sid, 'name') || '');
+    // after it. An id that is gone does not count: the actions handle a deleted filter themselves.
+    // Filters are told apart by name only, so two filters of the same name pass as one
+    movedFilter: function(sid, known) {
+        return isGeoFilter(sid) && known !== (uci.get('geomate', sid, 'name') || '');
     },
 
     // The one call that makes map changes active: commit the geomate configuration of this
@@ -1190,12 +1192,16 @@ return view.extend({
             throw failure(_('Could not save the circle of filter %s.').format(this.filterName(sid)));
     },
 
-    // Confirm an applied circle to the map, which learns a new filter's id this way
+    // Confirm an applied circle to the map, which learns a new filter's id this way. A dialog
+    // picks from the configuration as loaded now: when the map knows that id under another
+    // name (ids shifted), it gets all filters again instead of relabelling the stale entry
     ackRegion: function(token, sid, region) {
-        var info = this.filterInfo(sid);
+        var info = this.filterInfo(sid), known = this.sidNames[sid];
 
         this.sidNames[sid] = info.name;
         this.sendMessageToMap('regionSaved', Object.assign(info, { token: token, region: region }));
+        if (known !== undefined && known !== info.name)
+            this.pushFilters();
     },
 
     rejectRegion: function(token, sid, reason) {
@@ -1239,7 +1245,7 @@ return view.extend({
         })).then(function(choice) {
             if (!choice)
                 return self.sendMessageToMap('regionRejected', { token: token, reason: '' });
-            if (self.movedFilter(sid))
+            if (self.movedFilter(sid, self.sidNames[sid]))
                 throw filtersChanged();
 
             var before = filterOptions(sid), index, text = null;
