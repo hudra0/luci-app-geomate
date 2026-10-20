@@ -991,14 +991,12 @@
         }
 
         /**
-         * Radius of a circle on screen in pixels. Leaflet keeps it in _radius once the circle
-         * is on the map; without it the bounds give it.
+         * Radius of a circle on screen in pixels at the current zoom, from its bounds. Not from
+         * Leaflet's _radius: on zoomend the renderer updates it only after our own listener.
          * @param {Object} layer - The circle layer.
          */
         function screenRadius(layer) {
-            var b;
-            if (typeof layer._radius === 'number') return layer._radius;
-            b = layer.getLatLng().toBounds(layer.getRadius() * 2);
+            var b = layer.getLatLng().toBounds(layer.getRadius() * 2);
             return (map.latLngToLayerPoint(b.getNorthEast()).x - map.latLngToLayerPoint(b.getSouthWest()).x) / 2;
         }
 
@@ -1103,7 +1101,9 @@
             if (!commit) {
                 layer.setLatLng(s.backup.latlng);
                 layer.setRadius(s.backup.radius);
-            } else if (circles[layer.gm.token]) {
+            } else if (circles[layer.gm.token] && regionString(layer) !== s.region) {
+                // Against the string of selection time: gm.region is the raw UCI string,
+                // which may differ in format from an unchanged geometry
                 reportEdit(layer);
             }
             applyState(layer);
@@ -1267,8 +1267,11 @@
             reportDelete(layer);
         }
 
-        // Click on the map: the selected circle keeps its changes, like Done
-        function onMapClick() {
+        // Click on the map: the selected circle keeps its changes, like Done. A handle pressed
+        // without dragging also reaches the map as a click; it keeps the selection.
+        function onMapClick(e) {
+            var t = e.originalEvent && e.originalEvent.target;
+            if (t && t.closest && t.closest('.gm-handle')) return;
             if (mode === 'edit') endSelection(true);
         }
 
