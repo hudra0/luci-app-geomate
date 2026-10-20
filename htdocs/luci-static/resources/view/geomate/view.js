@@ -792,12 +792,17 @@ return view.extend({
             return name ? ipListPath(name) : '';
         };
 
-        // Show the settings of the chosen filter, or the defaults for a new one
+        // The values typed for a new filter while the fields show an existing one
+        var draft = null;
+
+        // Show the settings of the chosen filter; for a new one the values typed for it, or the defaults
         var fill = function(sec) {
             Object.keys(fields).forEach(function(k) {
                 var v = sec ? sec[k] : null;
 
-                if (k == 'enabled')
+                if (!sec && draft)
+                    v = draft[k];
+                else if (k == 'enabled')
                     v = (!sec || v === '1') ? '1' : '0';
                 else if (k == 'protocol')
                     v = sec ? v : 'udp';
@@ -834,6 +839,9 @@ return view.extend({
             nameNode.style.display = isNew() ? '' : 'none';
 
             if (secId !== sid) {
+                // A typed name can match an existing filter for a moment: keep the new filter's values
+                if (sid === null)
+                    draft = Object.keys(fields).reduce(function(d, k) { d[k] = fields[k].getValue(); return d; }, {});
                 sid = secId;
                 fill(sec);
             }
