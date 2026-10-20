@@ -99,6 +99,11 @@ function failure(text) {
     return err;
 }
 
+// The Enable button of a map toast (toastAction enableFilter)
+function enableAction(sid) {
+    return { name: 'enableFilter', sid: sid, label: _('Enable') };
+}
+
 // Suggested IP list path for a filter name
 function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
@@ -845,14 +850,21 @@ return view.extend({
                         return self.sendMessageToMap('regionRejected', { token: token, reason: reason });
                     return onRefuse ? onRefuse(reason) : self.sendMessageToMap('toast', { text: reason });
                 }
-                uci.unload('geomate');
-                return uci.load('geomate').then(function() { return fn(); });
+                return self.loadConfig().then(function() { return fn(); });
             });
         }).catch(function(err) {
             return self.resync((err && err.plain) ? err.message
-                : _('Could not apply the change: %s').format((err && err.message) || err), token);
+                : _('Could not apply the change: %s').format(errorText(err)), token);
         });
         return this.busy;
+    },
+
+    // Drop the in-memory configuration and load it as the session holds it now: at the start of
+    // each map action, and again after a dialog, which may have stayed open while another tab
+    // applied changes
+    loadConfig: function() {
+        uci.unload('geomate');
+        return uci.load('geomate');
     },
 
     // The one call that makes map changes active: commit the geomate configuration of this
@@ -977,20 +989,24 @@ return view.extend({
      * @param {Array} [extra] - Toast buttons before Undo: [{ name, sid, label }].
      */
     showApplied: function(sid, before, text, extra) {
-        this.undo = { id: ++this.undoSeq, sid: sid, before: before, after: filterOptions(sid) };
-        this.sendUndoToast(text || _('Applied.'), extra);
+        this.undo = { id: ++this.undoSeq, sid: sid, before: before, after: filterOptions(sid), extra: extra || [] };
+        this.sendToast(text || _('Applied.'), this.undo);
     },
 
-    sendUndoToast: function(text, extra) {
-        this.sendMessageToMap('toast', {
-            text: text,
-            actions: (extra || []).concat([ { name: 'undo', id: this.undo.id, label: _('Undo') } ])
-        });
+    // A map toast with the buttons of the applied change u (its extra buttons and Undo) while it
+    // is the last change. action: a button the toast gets in any case. A refused toast button
+    // (checkStaged) shows its toast again this way, so Enable and Undo both stay available
+    sendToast: function(text, u, action) {
+        var actions = (u && u === this.undo) ? u.extra.concat([ { name: 'undo', id: u.id, label: _('Undo') } ]) : [];
+
+        if (action && !actions.some(function(a) { return a.name === action.name && a.sid === action.sid; }))
+            actions.unshift(action);
+        this.sendMessageToMap('toast', { text: text, actions: actions });
     },
 
     // Undo in the map toast: write back the options the change set, apply that, show all
     // filters again. Not when they have changed since, e.g. in another tab. A refusal by
-    // checkStaged() offers Undo again
+    // checkStaged() offers the toast's buttons again
     undoChange: function(id) {
         var self = this, u = this.undo;
 
@@ -1030,10 +1046,7 @@ return view.extend({
                 self.sendMessageToMap('toast', { text: _('Undone.') });
             });
         }, function(reason) {
-            if (self.undo === u)
-                self.sendUndoToast(reason);
-            else
-                self.sendMessageToMap('toast', { text: reason });
+            self.sendToast(reason, u);
         });
     },
 
@@ -1112,16 +1125,16 @@ return view.extend({
         return this.applyChange(this.checkRegion.bind(this, sid, region)).then(function() {
             self.ackRegion(token, sid, region);
             if (disabled)
-                self.showApplied(sid, before, _('Applied. Filter %s is disabled.').format(name),
-                    [ { name: 'enableFilter', sid: sid, label: _('Enable') } ]);
+                self.showApplied(sid, before, _('Applied. Filter %s is disabled.').format(name), [ enableAction(sid) ]);
             else
                 self.showApplied(sid, before);
         });
     },
 
-    // Apply enabled=1 for a filter, from the toast after drawing
+    // Apply enabled=1 for a filter, from the toast after drawing. A refusal by checkStaged()
+    // offers Enable again, and Undo while the toast's change is the last one
     enableFilter: function(sid) {
-        var self = this;
+        var self = this, u = this.undo;
 
         return this.enqueue(null, function() {
             if (!isGeoFilter(sid) || uci.get('geomate', sid, 'enabled') === '1')
@@ -1141,6 +1154,8 @@ return view.extend({
                 self.sendMessageToMap('filterChanged', self.filterInfo(sid));
                 self.showApplied(sid, before);
             });
+        }, function(reason) {
+            self.sendToast(reason, u, enableAction(sid));
         });
     },
 
@@ -1182,21 +1197,31 @@ return view.extend({
         });
     },
 
-    // A circle was deleted; the last one of a filter needs a decision about the filter
+    // A circle was deleted; the last one of a filter needs a decision about the filter. After
+    // that dialog the configuration is loaded again, and the list and Undo's copy come from it
     removeRegion: function(token, sid, oldRegion) {
         var self = this,
-            list = this.regionList(sid),
-            index = list.indexOf(oldRegion),
-            before = filterOptions(sid);
+            list = this.regionList(sid);
 
-        if (index < 0)
+        if (list.indexOf(oldRegion) < 0)
             return this.rejectRegion(token, sid);
 
-        list.splice(index, 1);
-
-        return (list.length ? Promise.resolve('keep') : this.confirmLastRegion(sid)).then(function(choice) {
+        return ((list.length > 1) ? Promise.resolve('keep') : this.confirmLastRegion(sid).then(function(choice) {
+            return choice && self.loadConfig().then(function() { return choice; });
+        })).then(function(choice) {
             if (!choice)
                 return self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+
+            var before = filterOptions(sid), index;
+
+            list = self.regionList(sid);
+            index = list.indexOf(oldRegion);
+            if (index < 0)
+                return self.rejectRegion(token, sid);
+            list.splice(index, 1);
+            // A circle added in the meantime: no longer the last one, the filter stays as it is
+            if (list.length)
+                choice = 'keep';
 
             uci.set('geomate', sid, 'allowed_region', list.length ? list : null);
             if (choice == 'disable')
@@ -1520,8 +1545,10 @@ return view.extend({
                 Object.keys(fields).forEach(function(k) { values[k] = value(k); });
                 values.ip_list = values.ip_list || suggestedList();
 
+                // The dialog may have stayed open while another tab applied changes: write on
+                // the configuration as the session holds it now
                 ui.hideModal();
-                resolve(Promise.resolve().then(function() {
+                resolve(self.loadConfig().then(function() {
                     return self.saveRegion(token, region, name, sec, values, initial);
                 }));
             };
@@ -1544,9 +1571,19 @@ return view.extend({
     },
 
     // Apply a drawn region from the modal. An existing filter only gets the options the user
-    // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox
+    // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox.
+    // The caller has loaded the configuration again after the dialog, sec is the dialog's copy:
+    // the filter may be gone now, or a filter of the new name may exist (names match without
+    // regard to case, as in the dialog)
     saveRegion: function(token, region, name, sec, values, initial) {
         var self = this, sid, before = null;
+
+        if (sec && !isGeoFilter(sec['.name']))
+            throw failure(_('Not applied: filter %s was deleted in the meantime.').format(name));
+        if (!sec && uci.sections('geomate', 'geo_filter').some(function(s) {
+            return String(s.name || '').toLowerCase() === name.toLowerCase();
+        }))
+            throw failure(_('Not applied: filter %s was created in the meantime.').format(name));
 
         if (sec) {
             sid = sec['.name'];
