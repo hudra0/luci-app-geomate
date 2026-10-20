@@ -158,7 +158,7 @@ return view.extend({
                 _('Could not load the geomate configuration. Reload the page.')
             ]), 'error');
 
-        var nodes = E([], [ this.renderStatus(), this.renderActions(), this.renderMap(), this.renderConnections() ]);
+        var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
 
         window.addEventListener('message', L.bind(this.handleMessage, this), false);
         // Escape outside the map also ends drawing; the map handles it when it has the focus
@@ -213,27 +213,6 @@ return view.extend({
         ]);
     },
 
-    // Row above the map with the connections toggle, in LuCI button classes so it follows the
-    // theme. Circles are drawn from the map toolbar
-    renderActions: function() {
-        var n = this.nodes;
-
-        var style = E('style', {}, `
-            /* No side margin: the row and the map below it share the edges of the page content */
-            .gm-map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px; text-align: left; }
-            .gm-map-actions .btn { margin: 0; white-space: nowrap; }
-        `);
-
-        n.toggle = E('button', {
-            'class': 'btn cbi-button cbi-button-neutral',
-            'aria-pressed': 'false',
-            'title': _('Show or hide the table of active connections below the map'),
-            'click': L.bind(this.toggleConnections, this)
-        }, [ _('Active connections') ]);
-
-        return E('div', { 'class': 'cbi-section-actions gm-map-actions' }, [ style, n.toggle ]);
-    },
-
     // Choices of the filter select in the new region dialog: placeholder (''), every named
     // filter in config order, then 'New filter…'. Returns { sections, choices, sort } for ui.Select
     filterChoices: function(placeholder) {
@@ -252,15 +231,6 @@ return view.extend({
         };
     },
 
-    // Configurations other than geomate with staged changes in this session. Save & Apply and
-    // Revert act on all of them
-    otherStagedConfigs: function() {
-        var pending = this.pending || {};
-        return Object.keys(pending).filter(function(config) {
-            return config != 'geomate' && L.toArray(pending[config]).length;
-        });
-    },
-
     renderMap: function() {
         this.nodes.frame = E('iframe', {
             // The version parameter makes browsers fetch map.html again after an update
@@ -269,13 +239,20 @@ return view.extend({
             style: 'width: 100%; height: 80vh; border: none;' // Use 80% of the viewport height
         });
 
-        return E('div', { id: 'geomate-map-container' }, [ this.nodes.frame ]);
+        return E('div', { id: 'geomate-map-container', style: 'margin-top: 12px;' }, [ this.nodes.frame ]);
     },
 
-    // Table of active connections, hidden until the toggle button shows it
+    // Below the map: a header "Active connections (n)" with a Show/Hide button, and the table,
+    // hidden until shown
     renderConnections: function() {
+        var n = this.nodes;
+
         // Define CSS styles for the active connections container and table
         var style = E('style', {}, `
+            /* No side margin: the header and the map share the edges of the page content */
+            .gm-connections-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 12px 0 8px; }
+            .gm-connections-head h3 { margin: 0; }
+            .gm-connections-head .btn { margin: 0; }
             #active-connections-container {
                 padding: 10px;
                 box-sizing: border-box;
@@ -315,10 +292,16 @@ return view.extend({
             }
         `);
 
-        this.nodes.connectionsBody = E('tbody', { id: 'active-connections-table-body' });
-        this.nodes.connections = E('div', { id: 'active-connections-container' }, [
-            style,
-            E('h3', { style: 'text-align: center;' }, [ _('Active Connections') ]),
+        n.connectionsTitle = E('h3', {}, [ _('Active connections') ]);
+        n.toggle = E('button', {
+            'class': 'btn cbi-button cbi-button-neutral',
+            'aria-expanded': 'false',
+            'aria-controls': 'active-connections-container',
+            'click': L.bind(this.toggleConnections, this)
+        }, [ _('Show') ]);
+
+        n.connectionsBody = E('tbody', { id: 'active-connections-table-body' });
+        n.connections = E('div', { id: 'active-connections-container' }, [
             E('div', { class: 'table-wrapper' }, [
                 E('table', { class: 'table' }, [
                     E('thead', {}, [
@@ -328,27 +311,29 @@ return view.extend({
                             E('th', {}, [ _('Status') ])
                         ])
                     ]),
-                    this.nodes.connectionsBody
+                    n.connectionsBody
                 ])
             ])
         ]);
 
-        return this.nodes.connections;
+        return E('div', {}, [
+            style,
+            E('div', { 'class': 'gm-connections-head' }, [ n.connectionsTitle, n.toggle ]),
+            n.connections
+        ]);
     },
 
     // Show or hide the connections table; the map gets smaller while it is shown
     toggleConnections: function() {
-        var box = this.nodes.connections,
-            button = this.nodes.toggle,
-            show = box.style.display !== 'block';
+        var n = this.nodes,
+            show = n.connections.style.display !== 'block';
 
-        box.style.display = show ? 'block' : 'none';
-        button.setAttribute('aria-pressed', show ? 'true' : 'false');
-        button.classList.toggle('cbi-button-action', show);
-        button.classList.toggle('cbi-button-neutral', !show);
-        this.nodes.frame.style.height = show ? '600px' : '80vh';
+        n.connections.style.display = show ? 'block' : 'none';
+        n.toggle.textContent = show ? _('Hide') : _('Show');
+        n.toggle.setAttribute('aria-expanded', show ? 'true' : 'false');
+        n.frame.style.height = show ? '600px' : '80vh';
         if (show)
-            box.scrollIntoView({ behavior: 'smooth' });
+            n.connections.scrollIntoView({ behavior: 'smooth' });
     },
 
     // Show the last status and health check
@@ -1173,7 +1158,7 @@ return view.extend({
             return conn && conn.filter_name;
         });
 
-        this.nodes.toggle.textContent = _('Active connections (%d)').format(list.length);
+        this.nodes.connectionsTitle.textContent = _('Active connections (%d)').format(list.length);
 
         dom.content(tbody, list.map(function(conn) {
             var status;
