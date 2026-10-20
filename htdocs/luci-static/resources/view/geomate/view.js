@@ -895,6 +895,9 @@ return view.extend({
                 if (self.regionList(sid).length !== list.length)
                     return self.rejectRegion(token, sid, _('Could not delete the circle of filter %s. Reload the page.').format(self.filterName(sid)));
                 self.sendMessageToMap('regionRemoved', { token: token });
+                // The legend and the draw target show the filter as disabled now
+                if (choice == 'disable')
+                    self.sendMessageToMap('filterChanged', self.filterInfo(sid));
             });
         });
     },

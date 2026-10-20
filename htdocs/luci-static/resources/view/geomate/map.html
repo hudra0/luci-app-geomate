@@ -883,13 +883,15 @@
                 shapeOptions: { color: color, fillColor: color, weight: 2, opacity: 1, dashArray: '6,6', fillOpacity: 0.12 },
                 showRadius: true
             });
+            // Leaflet.draw focuses the map container without preventScroll; with the focus
+            // already there that call does nothing, so the LuCI page does not jump to the map
+            map.getContainer().focus({ preventScroll: true });
             drawHandler.enable();
         }
 
+        // disable() fires draw:drawstop, which onDrawStop handles
         function cancelDraw() {
-            if (!drawHandler) return;
-            map.fire('draw:canceled', { layerType: 'circle' });
-            drawHandler.disable();
+            if (drawHandler) drawHandler.disable();
         }
 
         function toggleDraw() {
