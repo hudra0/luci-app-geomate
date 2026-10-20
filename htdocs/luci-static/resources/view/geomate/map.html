@@ -1926,10 +1926,7 @@
             var set = function(name, on) { L.DomUtil[on ? 'addClass' : 'removeClass'](el, name); };
             if (!el) return;
             set('gm-circle', true);
-            set('gm-circle--new', !!gm.pending);
             set('gm-circle--disabled', !gm.pending && !gm.enabled);
-            set('gm-circle--unsaved', !gm.pending && !!gm.staged);
-            set('gm-circle--deleting', !!gm.deleting);
             set('gm-circle--selected', !!gm.selected);
         }
 
