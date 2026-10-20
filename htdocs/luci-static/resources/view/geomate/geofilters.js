@@ -61,9 +61,11 @@ function formatRadius(meters) {
     return (km >= 10 ? Math.round(km) : Math.round(km * 10) / 10) + ' km';
 }
 
-// The session has uncommitted changes in this filter section
-function isPending(sid) {
-    return L.toArray(pending.geomate).some(function(change) { return change[1] === sid; });
+// The session has uncommitted changes in this section, or in this option of it
+function isPending(sid, option) {
+    return L.toArray(pending.geomate).some(function(change) {
+        return change[1] === sid && (option == null || change[2] === option);
+    });
 }
 
 // The running service reports nft errors for this filter. The error log may hold the name with
@@ -100,7 +102,8 @@ function listPath(opt, sid) {
         path = String(opt.map.lookupOption('ip_list', sid)[0].formvalue(sid) || '').trim() || (name ? ipListPath(name) : ''),
         error = null;
 
-    if (!/^\/etc\/geomate\.d\/[^\/]+$/.test(path) || path == '/etc/geomate.d/..')
+    // A file directly in /etc/geomate.d; '.' and '..' name a directory
+    if (!/^\/etc\/geomate\.d\/(?!\.\.?$)[^\/]+$/.test(path))
         error = _('Choose a filter name or a list file in /etc/geomate.d/ first.');
     // Geo data files and the updater's md5 registries live there too
     else if (/\.(json|md5)$/i.test(path))
@@ -338,7 +341,9 @@ return view.extend({
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
             var enabled = uci.get('geomate', section_id, 'enabled') === '1';
-            var staged = isPending(section_id);
+            // The checks below read staged values: a staged change of the global switch
+            // (service disabled) is pending for every enabled filter too
+            var staged = isPending(section_id) || (enabled && isPending('global', 'enabled'));
             var problems = [];
 
             if (!filterName || (!enabled && !staged)) return '–';

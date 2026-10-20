@@ -254,7 +254,7 @@ return view.extend({
         try { sid = decodeURIComponent(match[1]); } catch (e) { sid = null; }
         window.history.replaceState(null, '', window.location.pathname + window.location.search);
 
-        return (sid && (uci.get('geomate', sid) || {})['.type'] === 'geo_filter') ? sid : null;
+        return isGeoFilter(sid) ? sid : null;
     },
 
     renderStatus: function() {
