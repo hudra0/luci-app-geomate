@@ -141,11 +141,11 @@ function uploadList(opt, sid, path, file) {
 
     return fs.stat(path).then(function() {
         dom.content(status, [
-            _('%s already exists. Replace its content with %s?').format(path, file.name), ' ',
-            E('button', { 'class': 'btn cbi-button-negative', 'click': write }, [ _('Overwrite') ]), ' ',
+            _('%s already exists. Replace it with %s?').format(path, file.name), ' ',
+            E('button', { 'class': 'btn cbi-button-negative', 'click': write }, [ _('Replace') ]), ' ',
             E('button', { 'class': 'btn', 'click': function() {
-                dom.content(status, [ _('Upload cancelled, %s was not changed.').format(path) ]);
-            } }, [ _('Keep file') ])
+                dom.content(status, [ _('Upload cancelled.') ]);
+            } }, [ _('Cancel') ])
         ]);
     }, function(err) {
         if (err && err.name == 'NotFoundError')
@@ -221,7 +221,7 @@ return view.extend({
             if (geoMode === 'frequent' && geoStats.geolocation) {
                 var geoLastRun = geoStats.geolocation.last_run_ago || 0;
                 line(_('Geolocation (frequent):'), (geoLastRun > 0 && geoLastRun < 86400)
-                    ? _('Last %s ago, %d IPs pending').format(formatTime(geoLastRun), geoStats.geolocation.pending_ips || 0)
+                    ? _('Last %s ago, %d IPs queued').format(formatTime(geoLastRun), geoStats.geolocation.pending_ips || 0)
                     : notRun());
             }
 
@@ -329,7 +329,8 @@ return view.extend({
         s.addremove = true;  // Allow adding and removing filters
         s.anonymous = true;
         s.modaltitle = function(section_id) {
-            return _('Geo filter: %h').format(uci.get('geomate', section_id, 'name') || _('new'));
+            var name = uci.get('geomate', section_id, 'name');
+            return name ? _('Filter %h').format(name) : _('New filter');
         };
         filters = s;
 
@@ -343,34 +344,41 @@ return view.extend({
         o = s.option(form.Value, 'name', _('Name'));
         o.rmempty = false;
 
+        // Tooltip of the status and regions columns for a hand-written 'option allowed_region'
+        var optionNote = _('Geomate reads only "list allowed_region", not "option allowed_region".');
+
         // Status column - what the running service does with the filter. Staged changes are not
-        // active before Save & Apply, and the service sees only what that has committed
+        // active before Save & Apply, and the service sees only what that has committed. A word
+        // that needs a reason gets it as a tooltip
         o = s.option(form.DummyValue, '_status', _('Status'));
         o.modalonly = false;
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
             var enabled = uci.get('geomate', section_id, 'enabled') === '1';
             // The checks below read staged values: a staged change of the global switch
-            // (service disabled) is pending for every enabled filter too
+            // (service disabled) is unsaved for every enabled filter too
             var staged = isPending(section_id) || (enabled && isPending('global', 'enabled'));
-            var problems = [];
+            var words = [], notes = [];
+            var problem = function(word, note) {
+                words.push(word);
+                if (note) notes.push(note);
+            };
 
-            if (!filterName || (!enabled && !staged)) return '–';
+            if (!filterName) return '–';
+            if (!enabled && !staged) return _('Disabled');
 
+            if (staged) words.push(_('Unsaved'));
             if (enabled) {
                 // The service does not start while Geomate is disabled globally
-                if (uci.get('geomate', 'global', 'enabled') !== '1') problems.push(_('service disabled'));
-                if (hasNftError(filterName)) problems.push(_('nft error'));
-                if (regionIsOption(section_id)) problems.push(_('regions ignored (option, not list)'));
-                else if (!regionList(section_id).some(function(r) { return parseRegion(r) !== null; })) problems.push(_('no regions'));
-                if (!uci.get('geomate', section_id, 'ip_list')) problems.push(_('no IP list'));
+                if (uci.get('geomate', 'global', 'enabled') !== '1') problem(_('Service off'), _('Geomate is disabled in the global settings.'));
+                if (hasNftError(filterName)) problem(_('nftables error'), _('See /tmp/geomate_nft_errors.log on the router.'));
+                if (regionIsOption(section_id)) problem(_('Regions ignored'), optionNote);
+                else if (!regionList(section_id).some(function(r) { return parseRegion(r) !== null; })) problem(_('No regions'));
+                if (!uci.get('geomate', section_id, 'ip_list')) problem(_('No IP list'));
             }
 
-            if (staged)
-                return E('span', { 'title': _('Staged changes take effect only after Save & Apply; they are lost on logout or session expiry.') },
-                    [ _('pending (Save & Apply)') + (problems.length ? ' · ' + problems.join(', ') : '') ]);
-
-            return problems.length ? problems.join(', ') : _('active');
+            if (!words.length) return _('Active');
+            return E('span', notes.length ? { 'title': notes.join('\n') } : {}, [ words.join(', ') ]);
         };
 
         // IP Stats column - shows geolocation progress per filter
@@ -394,8 +402,8 @@ return view.extend({
             // values are line counts (wc -l): a list without a final newline counts one IP less,
             // so one more geo data line than list lines proves nothing
             if (geo > total + 1) {
-                return E('span', { 'title': _('The geo data holds at least %d IPs that are not in the list any more. The next full geolocation drops them.').format(geo - total - 1) },
-                    [ total + ' (' + _('stale geo data') + ')' ]);
+                return E('span', { 'title': _('At least %d geolocated IPs are no longer in the list.').format(geo - total - 1) },
+                    [ _('%d (stale)').format(total) ]);
             }
 
             if (total === 0) {
@@ -422,7 +430,7 @@ return view.extend({
             var invalid = regions.length - radii.length;
             var nodes;
 
-            if (regionIsOption(section_id)) return _('ignored: option, not list');
+            if (regionIsOption(section_id)) return E('span', { 'title': optionNote }, [ _('Ignored') ]);
             if (!regions.length) return '–';
 
             if (invalid) parts.push(_('%d invalid').format(invalid));
@@ -504,7 +512,7 @@ return view.extend({
                 return dom.content(this.status, [ _('Please specify a filter name first.') ]);
 
             this.map.lookupOption('ip_list', section_id)[0].getUIElement(section_id).setValue(ipListPath(name));
-            dom.content(this.status, [ _('The service creates the list file at its next start if it does not exist.') ]);
+            dom.content(this.status, [ _('Geomate creates a missing file at its next start.') ]);
         };
 
         // Upload List button: writes the chosen file as the IP list, an existing list only
