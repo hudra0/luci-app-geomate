@@ -70,6 +70,43 @@ function formatRadius(meters) {
     return _('%s km').format(km >= 10 ? Math.round(km) : Math.round(km * 10) / 10);
 }
 
+// Entries of src_ip, src_port or dest_port, split at white space like the service does. A
+// negated entry reads 'not <value>'; a lone '!' negates the entry after it. 'any' is no
+// restriction (a port option that says only 'any' adds no match to the rule)
+function matchItems(section_id, option) {
+    var items = [], negate = false;
+
+    L.toArray(L.toArray(uci.get('geomate', section_id, option)).join(' ')).forEach(function(v) {
+        if (v === '!') {
+            negate = true;
+        }
+        else if (v !== 'any' || option == 'src_ip') {
+            items.push(negate || v.charAt(0) === '!' ? _('not %s').format(v.replace(/^!/, '')) : v);
+            negate = false;
+        }
+    });
+    return items.join(', ');
+}
+
+// The traffic a filter looks at, as the rule in the service is built from protocol, src_ip,
+// src_port and dest_port: 'UDP from 192.168.2.208 port 3074, 3075'. A missing protocol or
+// option adds no match, so 'Any traffic' is the filter without any
+function matchText(section_id) {
+    var proto = String(uci.get('geomate', section_id, 'protocol') || '').trim().toUpperCase();
+    var ips = matchItems(section_id, 'src_ip');
+    var sport = matchItems(section_id, 'src_port');
+    var dport = matchItems(section_id, 'dest_port');
+    var from = (ips && sport) ? _('from %s port %s').format(ips, sport)
+        : ips ? _('from %s').format(ips)
+        : sport ? _('from port %s').format(sport) : '';
+    var to = dport ? _('to port %s').format(dport) : '';
+
+    if (!from && !to)
+        return proto ? _('%s traffic').format(proto) : _('Any traffic');
+
+    return [ proto || _('Any protocol'), from, to ].filter(Boolean).join(' ');
+}
+
 // The session has uncommitted changes in this section, or in this option of it
 function isPending(sid, option) {
     return L.toArray(pending.geomate).some(function(change) {
@@ -380,6 +417,11 @@ return view.extend({
             if (!words.length) return _('Active');
             return E('span', notes.length ? { 'title': notes.join('\n') } : {}, [ words.join(', ') ]);
         };
+
+        // Match column - the traffic the filter looks at (the options are edited in the dialog)
+        o = s.option(form.DummyValue, '_match', _('Match'));
+        o.modalonly = false;
+        o.textvalue = matchText;
 
         // IP Stats column - shows geolocation progress per filter
         o = s.option(form.DummyValue, '_ip_stats', _('IPs/Located'));
