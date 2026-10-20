@@ -577,6 +577,7 @@
         var drawEndedAt = 0;    // a click right after a drawing ends selects no circle
         var viewFitted = false; // the start view has been fitted to the regions
         var refitUntil = 0;     // until then a resize fits the start view again; user input ends it
+        var focusSid = null;    // filter whose circles the start view fits (fitFilter message)
         var radiusPill = null;  // radius at the resize handle (edit) or at the cursor (draw)
 
         /*
@@ -1011,6 +1012,11 @@
                 map.addLayer(markerClusters);
                 markerClusters.addLayers(markers);
             }
+        }
+
+        // The start view: the circles of the focus filter if it has any, else all regions
+        function fitStartView() {
+            if (!(focusSid && fitFilter(focusSid))) fitAll(true);
         }
 
         // A resize shortly after the start view was fitted (the page still settles, a phone
@@ -1787,7 +1793,8 @@
             renderLegendFilters();
         }
 
-        // Zooms to the circles of a filter (magnifier in the legend); hidden ones show again
+        // Zooms to the circles of a filter (magnifier in the legend); hidden ones show again.
+        // Returns false when the filter has no circle
         function fitFilter(sid) {
             var bounds = null;
             if (hiddenSids[sid]) setFilterVisible(sid, true);
@@ -1796,6 +1803,7 @@
                 bounds = bounds ? bounds.extend(b) : b;
             });
             if (bounds) map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 16 });
+            return !!bounds;
         }
 
         function iconButton(parent, icon, label, key, fn) {
@@ -2423,6 +2431,7 @@
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
+         *   fitFilter         { sid }                          start view: the circles of this filter, once, after setFilters
          *   cancelDraw        -                                Escape outside the map
          *   filterChanged     { sid, name, color, enabled }    e.g. after Enable in a toast
          *   regionSaved       { token, sid, name, color, enabled, region }
@@ -2436,6 +2445,9 @@
             var type = event.data.type, data = event.data.data;
             if (type === 'setFilters') {
                 setFilters(data || {});
+            } else if (type === 'fitFilter' && data && data.sid) {
+                focusSid = String(data.sid);
+                fitStartView();
             } else if (type === 'updateConnections') {
                 updateConnections(data || []);
             } else if (type === 'theme' && data) {

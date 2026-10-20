@@ -4,6 +4,7 @@
 'require uci';
 'require ui';
 'require fs';
+'require dom';
 'require rpc';
 
 var callGetGeolocationStatus = rpc.declare({
@@ -15,6 +16,10 @@ var callGetGeolocationStatus = rpc.declare({
 // Store geolocation status globally for access in render functions
 var geoStats = null;
 
+// Staged changes of this LuCI session (uci changes): loaded with the page and again after every
+// save of the form. The backend sees only what Save & Apply has committed
+var pending = {};
+
 // Format seconds to human readable string
 function formatTime(seconds) {
     if (seconds < 60) return seconds + ' sec';
@@ -22,25 +27,145 @@ function formatTime(seconds) {
     return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'min';
 }
 
+// Suggested IP list path for a filter name (same rule as in view.js)
+function ipListPath(name) {
+    return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
+}
+
+// Radius in meters of a region 'circle:<lat>:<lon>:<radius in meters>', or null when the string
+// is no valid circle (finite numbers, |lat| <= 90, |lon| <= 180, radius >= 1)
+function parseRegion(region) {
+    var p = String(region).split(':');
+
+    if (p.length !== 4 || p[0] !== 'circle' || !p.slice(1).every(function(x) { return /^-?\d+(\.\d+)?$/.test(x); }))
+        return null;
+
+    return (Math.abs(p[1]) <= 90 && Math.abs(p[2]) <= 180 && +p[3] >= 1) ? +p[3] : null;
+}
+
+// Radius for the grid: '436 km', '0.5 km'
+function formatRadius(meters) {
+    var km = meters / 1000;
+    return (km >= 10 ? Math.round(km) : Math.round(km * 10) / 10) + ' km';
+}
+
+// The session has uncommitted changes in this filter section
+function isPending(sid) {
+    return L.toArray(pending.geomate).some(function(change) { return change[1] === sid; });
+}
+
+// The running service reports nft errors for this filter. The error log may hold the name with
+// spaces replaced by underscores
+function hasNftError(name) {
+    return !!geoStats && L.toArray(geoStats.nft_error_filters).some(function(n) {
+        return n === name || n === name.replace(/ /g, '_');
+    });
+}
+
+// A status line under the button of a form.Button option, in opt.status
+function withStatus(opt) {
+    var renderWidget = opt.renderWidget;
+
+    opt.renderWidget = function() {
+        var nodes = renderWidget.apply(this, arguments);
+
+        this.status = E('div', { 'class': 'cbi-value-description' });
+        nodes.appendChild(this.status);
+        return nodes;
+    };
+}
+
+// Filter name in the open modal, as typed
+function formName(map, sid) {
+    return String(map.lookupOption('name', sid)[0].formvalue(sid) || '').trim();
+}
+
+// Path of the IP list that the buttons of this option work on: the file name field, else the
+// name suggested for the filter. Says why not in the option's status line and returns null
+// when that is no IP list file in /etc/geomate.d
+function listPath(opt, sid) {
+    var name = formName(opt.map, sid),
+        path = String(opt.map.lookupOption('ip_list', sid)[0].formvalue(sid) || '').trim() || (name ? ipListPath(name) : ''),
+        error = null;
+
+    if (!/^\/etc\/geomate\.d\/[^\/]+$/.test(path) || path == '/etc/geomate.d/..')
+        error = _('Choose a filter name or a list file in /etc/geomate.d/ first.');
+    // Geo data files and the updater's md5 registries live there too
+    else if (/\.(json|md5)$/i.test(path))
+        error = _('%s is not an IP list file.').format(path);
+
+    dom.content(opt.status, error ? [ error ] : null);
+    return error ? null : path;
+}
+
+// Write the chosen file as the IP list. A new file is written at once; an existing list is
+// replaced only after the user confirmed
+function uploadList(opt, sid, path, file) {
+    var status = opt.status;
+
+    var write = function() {
+        dom.content(status, [ _('Uploading...') ]);
+        return file.text().then(function(text) {
+            return fs.write(path, text);
+        }).then(function() {
+            opt.map.lookupOption('ip_list', sid)[0].getUIElement(sid).setValue(path);
+            dom.content(status, [ _('Uploaded %s to %s.').format(file.name, path) ]);
+        }).catch(function(err) {
+            dom.content(status, [ _('Failed to upload file: %s').format(err.message) ]);
+        });
+    };
+
+    return fs.stat(path).then(function() {
+        dom.content(status, [
+            _('%s already exists. Replace its content with %s?').format(path, file.name), ' ',
+            E('button', { 'class': 'btn cbi-button-negative', 'click': write }, [ _('Overwrite') ]), ' ',
+            E('button', { 'class': 'btn', 'click': function() {
+                dom.content(status, [ _('Upload cancelled, %s was not changed.').format(path) ]);
+            } }, [ _('Keep file') ])
+        ]);
+    }, function(err) {
+        if (err && err.name == 'NotFoundError')
+            return write();
+        dom.content(status, [ _('Cannot check %s: %s').format(path, err.message) ]);
+    });
+}
+
 return view.extend({
     load: function() {
         return Promise.all([
-            callGetGeolocationStatus()
+            callGetGeolocationStatus().catch(function(err) {
+                console.log('Failed to load geolocation status:', err);
+                return null;
+            }),
+            L.resolveDefault(uci.changes(), {})
         ]).then(function(data) {
             geoStats = data[0] || null;
+            pending = data[1] || {};
             return data;
-        }).catch(function(err) {
-            console.log('Failed to load geolocation status:', err);
-            geoStats = null;
-            return [];
         });
     },
 
     render: function() {
-        var m, s, o;
+        var m, s, o, filters;
 
         // Create main configuration map for Geomate (no header - redundant with page title)
         m = new form.Map('geomate', '', '');
+
+        // Saving the form reloads the configuration: fetch the staged changes again, so that the
+        // status column does not call a change active that only waits for Save & Apply
+        var loadMap = m.load, firstLoad = true;
+        m.load = function() {
+            var load = loadMap.apply(this, arguments);
+
+            if (firstLoad) {
+                firstLoad = false;
+                return load;
+            }
+            return Promise.all([ load, L.resolveDefault(uci.changes(), null) ]).then(function(data) {
+                pending = data[1] || pending;
+                return data[0];
+            });
+        };
 
         // **Geolocation Status Section** - Shows cycle and geolocation progress
         s = m.section(form.TypedSection, 'global', _('Geolocation Status'));
@@ -48,62 +173,44 @@ return view.extend({
         s.addremove = false;
 
         o = s.option(form.DummyValue, '_geolocation_status');
-        o.rawhtml = true;
-        o.cfgvalue = function() {
-            if (!geoStats || !geoStats.timestamp) {
-                return '<em>' + _('No geolocation data available. Start the service and wait for the first cycle.') + '</em>';
-            }
+        // Built from nodes, not HTML strings. This widget replaces the rendering of DummyValue, which
+        // takes a string value
+        o.renderWidget = function() {
+            if (!geoStats || !geoStats.timestamp)
+                return E('em', {}, _('No geolocation data available. Start the service and wait for the first cycle.'));
 
-            var html = '<div style="padding: 8px 0;">';
-            
             var opMode = geoStats.operational_mode || 'dynamic';
             var geoMode = geoStats.geolocation_mode || 'frequent';
-            
+            var notRun = function() { return E('em', {}, _('Not yet run')); };
+            var lines = [];
+
+            var line = function(title, text) {
+                lines.push(E('div', { 'style': 'margin-bottom: 4px;' }, [ E('strong', {}, title), ' ', text ]));
+            };
+
             // Cycle info (not shown for static mode)
-            if (opMode !== 'static') {
-                var lastUpdate = geoStats.last_update_ago || 0;
-                var nextCycle = geoStats.next_cycle_in || 0;
-                html += '<div style="margin-bottom: 4px;">';
-                html += '<strong>' + _('Cycle:') + '</strong> ';
-                html += _('Last update') + ' ' + formatTime(lastUpdate) + ' ' + _('ago');
-                html += ', ' + _('next in') + ' ' + formatTime(nextCycle);
-                html += '</div>';
-            }
-            
+            if (opMode !== 'static')
+                line(_('Cycle:'), _('Last update %s ago, next in %s')
+                    .format(formatTime(geoStats.last_update_ago || 0), formatTime(geoStats.next_cycle_in || 0)));
+
             // Frequent geolocation info (only in frequent mode)
             if (geoMode === 'frequent' && geoStats.geolocation) {
                 var geoLastRun = geoStats.geolocation.last_run_ago || 0;
-                var pendingIps = geoStats.geolocation.pending_ips || 0;
-                html += '<div style="margin-bottom: 4px;">';
-                html += '<strong>' + _('Geolocation (frequent):') + '</strong> ';
-                if (geoLastRun > 0 && geoLastRun < 86400) {
-                    html += _('Last') + ' ' + formatTime(geoLastRun) + ' ' + _('ago');
-                    html += ', <strong>' + pendingIps + '</strong> ' + _('IPs pending');
-                } else {
-                    html += '<em>' + _('Not yet run') + '</em>';
-                }
-                html += '</div>';
+                line(_('Geolocation (frequent):'), (geoLastRun > 0 && geoLastRun < 86400)
+                    ? _('Last %s ago, %d IPs pending').format(formatTime(geoLastRun), geoStats.geolocation.pending_ips || 0)
+                    : notRun());
             }
-            
+
             // Daily geolocation info (always shown)
             if (geoStats.geolocation_daily) {
                 var dailyLastRun = geoStats.geolocation_daily.last_run_ago || 0;
                 var dailyNextRun = geoStats.geolocation_daily.next_run_in || 0;
-                html += '<div>';
-                html += '<strong>' + _('Geolocation (daily):') + '</strong> ';
-                if (dailyLastRun > 0 && dailyLastRun < 172800) {
-                    var lastHours = Math.floor(dailyLastRun / 3600);
-                    var nextHours = Math.floor(dailyNextRun / 3600);
-                    html += _('Last') + ' ' + lastHours + 'h ' + _('ago');
-                    html += ', ' + _('next in') + ' ~' + nextHours + 'h';
-                } else {
-                    html += '<em>' + _('Not yet run') + '</em>';
-                }
-                html += '</div>';
+                line(_('Geolocation (daily):'), (dailyLastRun > 0 && dailyLastRun < 172800)
+                    ? _('Last %dh ago, next in ~%dh').format(Math.floor(dailyLastRun / 3600), Math.floor(dailyNextRun / 3600))
+                    : notRun());
             }
-            
-            html += '</div>';
-            return html;
+
+            return E('div', { 'style': 'padding: 8px 0;' }, lines);
         };
 
         // **Global Settings Section**
@@ -192,10 +299,15 @@ return view.extend({
         o.rmempty = false;
 
         // **Geo Filters Section**
-        // Main section for configuring individual geographic filters
+        // Main section for configuring individual geographic filters. The table shows only the
+        // options that fit the page; the others are edited in the dialog of a filter
         s = m.section(form.GridSection, 'geo_filter', _('Geo Filters'));
         s.addremove = true;  // Allow adding and removing filters
         s.anonymous = true;
+        s.modaltitle = function(section_id) {
+            return _('Geo filter: %h').format(uci.get('geomate', section_id, 'name') || _('new'));
+        };
+        filters = s;
 
         // Enable/disable individual filters
         o = s.option(form.Flag, 'enabled', _('Enable'));
@@ -207,30 +319,29 @@ return view.extend({
         o = s.option(form.Value, 'name', _('Name'));
         o.rmempty = false;
 
-        // Status column - shows if filter rules are active or have errors
+        // Status column - what the running service does with the filter. Staged changes are not
+        // active before Save & Apply, and the service sees only what that has committed
         o = s.option(form.DummyValue, '_status', _('Status'));
         o.modalonly = false;
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
-            var enabled = uci.get('geomate', section_id, 'enabled');
-            
-            if (!filterName) return '-';
-            
-            // Disabled filters show neutral status
-            if (enabled !== '1') return '-';
-            
-            // Check if this filter has NFT errors
-            if (geoStats && geoStats.nft_error_filters && geoStats.nft_error_filters.length > 0) {
-                // Filter name in error log might have spaces replaced with underscores
-                var normalizedName = filterName.replace(/ /g, '_');
-                for (var i = 0; i < geoStats.nft_error_filters.length; i++) {
-                    if (geoStats.nft_error_filters[i] === normalizedName || 
-                        geoStats.nft_error_filters[i] === filterName) {
-                        return '✗';
-                    }
-                }
+            var enabled = uci.get('geomate', section_id, 'enabled') === '1';
+            var staged = isPending(section_id);
+            var problems = [];
+
+            if (!filterName || (!enabled && !staged)) return '–';
+
+            if (enabled) {
+                if (hasNftError(filterName)) problems.push(_('nft error'));
+                if (!L.toArray(uci.get('geomate', section_id, 'allowed_region')).length) problems.push(_('no regions'));
+                if (!uci.get('geomate', section_id, 'ip_list')) problems.push(_('no IP list'));
             }
-            return '✓';
+
+            if (staged)
+                return E('span', { 'title': _('Staged changes take effect after Save & Apply. They are lost when you log out.') },
+                    [ _('pending (Save & Apply)') + (problems.length ? ' · ' + problems.join(', ') : '') ]);
+
+            return problems.length ? problems.join(', ') : _('active');
         };
 
         // IP Stats column - shows geolocation progress per filter
@@ -250,12 +361,18 @@ return view.extend({
             var total = stats.total_ips || 0;
             var geo = stats.geolocated || 0;
             
+            // Geo data of IPs that left the list stays until the next full geolocation
+            if (geo > total) {
+                return E('span', { 'title': _('The geo data holds %d IPs that are not in the list any more. The next full geolocation drops them.').format(geo - total) },
+                    [ total + ' ✓ (' + _('stale') + ')' ]);
+            }
+
             if (total === 0) {
                 return '0';
             }
             
             // Show percentage of geolocated IPs
-            var percent = Math.min(100, Math.round((geo / total) * 100));
+            var percent = Math.round((geo / total) * 100);
             
             if (percent >= 100) {
                 return total + ' ✓';  // All geolocated
@@ -264,41 +381,73 @@ return view.extend({
             }
         };
 
+        // Regions column - number and radii of the circles, with a link to the map
+        o = s.option(form.DummyValue, '_regions', _('Regions'));
+        o.modalonly = false;
+        o.textvalue = function(section_id) {
+            var regions = L.toArray(uci.get('geomate', section_id, 'allowed_region'));
+            var radii = regions.map(parseRegion).filter(function(r) { return r !== null; });
+            var parts = radii.map(formatRadius);
+            var invalid = regions.length - radii.length;
+            var nodes;
+
+            if (!regions.length) return '–';
+
+            if (invalid) parts.push(_('%d invalid').format(invalid));
+            nodes = [ (radii.length == 1 ? _('1 circle') : _('%d circles').format(radii.length)) + ' · ' + parts.join(', ') ];
+            if (radii.length)
+                nodes.push(' ', E('a', { 'href': L.url('admin/services/geomate/view') + '#focus=' + encodeURIComponent(section_id) },
+                    [ _('Show on map') ]));
+            return E('span', {}, nodes);
+        };
+
         // Geographic regions that are allowed for this filter
-        o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'));
+        o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'), _('Easier to edit on the map'));
         o.rmempty = true;
+        o.modalonly = true;
+        o.placeholder = 'circle:48.137:11.575:50000';
+        o.validate = function(section_id, value) {
+            return value === '' || parseRegion(value) !== null ||
+                _('Expecting: %s').format(_('circle:<latitude>:<longitude>:<radius in meters>'));
+        };
 
         // Protocol selection (TCP/UDP)
         o = s.option(form.ListValue, 'protocol', _('Protocol'));
         o.value('tcp', 'TCP');
         o.value('udp', 'UDP');
         o.rmempty = false;
+        o.modalonly = true;
 
         // Source IP configuration
         o = s.option(form.Value, 'src_ip', _('Source IP'));
         o.datatype = 'list(neg(ip4addr))';
         o.placeholder = '192.168.1.0/24 or !192.168.1.128/25';
         o.rmempty = true;
+        o.modalonly = true;
 
         // Source port configuration
         o = s.option(form.Value, 'src_port', _('Source Port'));
-		o.datatype = 'list(neg(portrange))';
+        o.datatype = 'list(neg(portrange))';
         o.placeholder = '25200 25300 or 27015-27020';
+        o.modalonly = true;
 
         // Destination port configuration
         o = s.option(form.Value, 'dest_port', _('Destination Port'));
-		o.datatype = 'list(neg(portrange))';
+        o.datatype = 'list(neg(portrange))';
         o.placeholder = '25200 25300 or 27015-27020';
+        o.modalonly = true;
 
         // Whitelist for specific IP addresses
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
         o.datatype = 'list(neg(ip4addr))';
         o.placeholder = '192.168.1.0/24 or !192.168.1.128/25';
         o.rmempty = true;
+        o.modalonly = true;
 
         // Path to the IP list file
         o = s.option(form.Value, 'ip_list', _('IP List File'));
         o.rmempty = false;
+        o.modalonly = true;
 
         // IP expiry days - removes inactive IPs after specified days
         o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
@@ -310,65 +459,63 @@ return view.extend({
         o.rmempty = true;
         o.modalonly = true;
 
-        // Helper function to generate and set the IP list path
-        function setIpListPath(section_id, map) {
-            var name_field = map.lookupOption('name', section_id)[0];
-            var ip_list_field = map.lookupOption('ip_list', section_id)[0];
-            
-            var name = name_field.formvalue(section_id);
-            if (!name) {
-                ui.addNotification(null, E('p', _('Please specify a filter name first.')));
-                return null;
-            }
-
-            var filepath = '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
-            ip_list_field.getUIElement(section_id).setValue(filepath);
-            return filepath;
-        }
-
-        // Create Empty List button
-        o = s.option(form.Button, '_create_empty', _(''));
+        // Create Empty List button: only fills in the file name
+        o = s.option(form.Button, '_create_empty', _('Create IP List'));
         o.inputtitle = _('Create Empty List');
         o.inputstyle = 'apply';
         o.modalonly = true;
-        o.onclick = function(ev) {
-            setIpListPath(this.section.section, this.map);
+        withStatus(o);
+        o.onclick = function(ev, section_id) {
+            var name = formName(this.map, section_id);
+
+            if (!name)
+                return dom.content(this.status, [ _('Please specify a filter name first.') ]);
+
+            this.map.lookupOption('ip_list', section_id)[0].getUIElement(section_id).setValue(ipListPath(name));
+            dom.content(this.status, [ _('The service creates the list file at its next start if it does not exist.') ]);
         };
 
-        // Upload List button
-        o = s.option(form.Button, '_upload', _(''));
+        // Upload List button: writes the chosen file as the IP list, an existing list only
+        // after confirmation
+        o = s.option(form.Button, '_upload', _('Upload IP List'));
         o.inputtitle = _('Upload List');
         o.inputstyle = 'apply';
         o.modalonly = true;
-        o.onclick = function(ev) {
-            var filepath = setIpListPath(this.section.section, this.map);
-            if (!filepath) return;
+        withStatus(o);
+        o.onclick = function(ev, section_id) {
+            var self = this;
 
-            var fileInput = E('input', {
-                'type': 'file',
-                'style': 'display:none',
-                'change': function(ev) {
-                    if (!ev.target.files[0]) return;
+            if (!listPath(this, section_id))
+                return;
 
-                    var reader = new FileReader();
-                    reader.onload = function() {
-                        var content = reader.result;
-                        L.resolveDefault(fs.write(filepath, content), null).then(function(rc) {
-                            if (rc === null)
-                                ui.addNotification(null, E('p', _('Failed to upload file.')));
-                            else
-                                ui.addNotification(null, E('p', _('File uploaded successfully.')));
-                        });
-                    };
-                    reader.readAsText(ev.target.files[0]);
-                }
-            });
+            // One hidden input per dialog, kept in the DOM: a detached input may lose its change event
+            if (!this.fileInput || !this.fileInput.isConnected) {
+                this.fileInput = E('input', { 'type': 'file', 'style': 'display: none', 'change': function(ev) {
+                    var file = ev.target.files[0], path = listPath(self, section_id);
 
-            document.body.appendChild(fileInput);
-            fileInput.click();
-            document.body.removeChild(fileInput);
+                    ev.target.value = '';
+                    if (file && path)
+                        uploadList(self, section_id, path, file);
+                } });
+                this.status.parentNode.appendChild(this.fileInput);
+            }
+            this.fileInput.click();
         };
 
-        return m.render();
+        return m.render().then(function(node) {
+            // '#edit=<section>' (link of the map's region dialog) opens the dialog of that filter
+            var edit = /^#edit=([^&]+)$/.exec(window.location.hash), sid = null;
+
+            if (edit) {
+                try { sid = decodeURIComponent(edit[1]); } catch (e) { sid = null; }
+                window.history.replaceState(null, '', window.location.pathname + window.location.search);
+
+                // After the view has put the form into the page
+                if (sid && (uci.get('geomate', sid) || {})['.type'] === 'geo_filter')
+                    window.setTimeout(function() { filters.renderMoreOptionsModal(sid); }, 0);
+            }
+
+            return node;
+        });
     }
 });
