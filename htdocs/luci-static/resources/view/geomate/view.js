@@ -84,6 +84,14 @@ function changedOptions(a, b) {
     });
 }
 
+// Only the given keys of a filterOptions() result
+function pick(o, keys) {
+    var copy = {};
+
+    keys.forEach(function(k) { copy[k] = o[k]; });
+    return copy;
+}
+
 // An error whose text the map shows as it is (enqueue)
 function failure(text) {
     var err = new Error(text);
@@ -219,11 +227,11 @@ return view.extend({
     handleSaveApply: null,
     handleReset: null,
 
-    knownChanges: '[]', // staged geomate changes the page has told about, as JSON (stagedKey)
+    knownChanges: '[]', // staged geomate changes at the last check, as JSON (stagedKey)
     notice: null,       // notification about staged geomate changes (showNotice)
-    undo: null,         // { id, sid, before } of the last applied change: Undo in the map toast
+    undo: null,         // { id, sid, before, after } of the last applied change: Undo in the map toast
     undoSeq: 0,         // id of the last applied change
-    generation: 0,      // counts the full map updates (pushFilters); older queued actions are dropped
+    generation: 0,      // counts the full map updates (pushFilters); older queued circle actions are dropped
     busy: null,         // promise chain that serializes map actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
@@ -271,9 +279,9 @@ return view.extend({
                 _('Could not load the geomate configuration. Reload the page.')
             ]), 'error');
 
-        // Staged geomate changes, e.g. from the Geo Filters page: the next map change applies them
+        // Staged geomate changes, e.g. from the Geo Filters page: map changes wait for them
         if (!this.readonly && this.knownChanges !== '[]')
-            this.showNotice(true);
+            this.showNotice();
 
         var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
 
@@ -815,30 +823,34 @@ return view.extend({
         }
     },
 
-    // Run map actions one after another: uci.save() reloads the configuration, so a second
-    // action must not read it in between. checkStaged() may stop an action before it changes
-    // anything; its circle then goes back (token). An action queued before the map got all
-    // filters again (pushFilters) is dropped: the map no longer has its circle. A failed action
-    // shows the error, and the map shows the configuration again (resync)
-    enqueue: function(token, fn) {
+    // Run map actions one after another, each on the configuration as committed now (another
+    // tab may have applied changes since): uci.save() reloads it, so a second action must not
+    // read it in between. checkStaged() may stop an action before it changes anything; its
+    // circle then goes back (token), or onRefuse(reason) answers. An action with a circle queued
+    // before the map got all filters again (pushFilters) is dropped: the map no longer has its
+    // circle. A failed action shows the error, and the map shows the configuration again (resync)
+    enqueue: function(token, fn, onRefuse) {
         var self = this, generation = this.generation;
 
         this.busy = Promise.resolve(this.busy).then(function() {
-            if (generation !== self.generation)
-                return;
+            if (self.readonly)
+                return token && self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+            if (token && generation !== self.generation)
+                return self.sendMessageToMap('toast', { text: _('Not applied: the map was reloaded.') });
             return self.checkStaged().then(function(ok) {
-                var reason = _('Not applied. Geomate has unsaved changes from another page.');
+                var reason = _('Apply or revert the unsaved geomate changes first.');
 
-                if (ok)
-                    return fn();
-                if (token)
-                    self.sendMessageToMap('regionRejected', { token: token, reason: reason });
-                else
-                    self.sendMessageToMap('toast', { text: reason });
+                if (!ok) {
+                    if (token)
+                        return self.sendMessageToMap('regionRejected', { token: token, reason: reason });
+                    return onRefuse ? onRefuse(reason) : self.sendMessageToMap('toast', { text: reason });
+                }
+                uci.unload('geomate');
+                return uci.load('geomate').then(function() { return fn(); });
             });
         }).catch(function(err) {
             return self.resync((err && err.plain) ? err.message
-                : _('Could not apply the change: %s').format((err && err.message) || err));
+                : _('Could not apply the change: %s').format((err && err.message) || err), token);
         });
         return this.busy;
     },
@@ -851,11 +863,16 @@ return view.extend({
     },
 
     // Save the in-memory changes in the session, check the reloaded configuration (verify
-    // throws when it lacks the change), then commit
+    // throws when it lacks the change), then commit. checkStaged() runs again first: a dialog
+    // may have stayed open while geomate changes were staged elsewhere
     applyChange: function(verify) {
         var self = this;
 
-        return uci.save().then(function() {
+        return this.checkStaged().then(function(ok) {
+            if (!ok)
+                throw failure(_('Apply or revert the unsaved geomate changes first.'));
+            return uci.save();
+        }).then(function() {
             if (verify)
                 verify();
             return self.commitGeomate();
@@ -864,27 +881,25 @@ return view.extend({
         });
     },
 
-    // Resolves false when the session holds staged geomate changes that the page has not told
-    // about (staged on another page while the map was open): a commit would apply them unseen.
-    // The notice tells about them instead, and the next map change applies them
+    // Resolves false while the session holds staged geomate changes, e.g. from the Geo Filters
+    // page: a commit would apply them too, unseen. The notice offers LuCI's changes dialog
     checkStaged: function() {
         var self = this;
 
         return L.resolveDefault(callUciChanges(), null).then(function(changes) {
-            var key = changes ? stagedKey(changes) : self.knownChanges;
-
-            if (key === '[]')
-                self.hideNotice();
-            if (key === '[]' || key === self.knownChanges)
-                return true;
-            self.knownChanges = key;
-            self.showNotice(true);
-            return false;
+            if (changes)
+                self.knownChanges = stagedKey(changes);
+            if (self.knownChanges !== '[]') {
+                self.showNotice();
+                return false;
+            }
+            self.hideNotice();
+            return true;
         });
     },
 
     // Fetch the staged changes after a commit: LuCI's header indicator counted them at the last
-    // uci.save(), and the notice goes once geomate has none left
+    // uci.save(). The notice shows while geomate has any left
     refreshChanges: function() {
         var self = this;
 
@@ -895,22 +910,19 @@ return view.extend({
             ui.changes.renderChangeIndicator(changes);
             if (self.knownChanges === '[]')
                 self.hideNotice();
+            else
+                self.showNotice();
         });
     },
 
-    /**
-     * One notification about staged geomate changes, with a button to LuCI's changes dialog.
-     * @param {boolean} other - They come from another page, not from a failed map change.
-     */
-    showNotice: function(other) {
+    // One notification about staged geomate changes, with a button to LuCI's changes dialog
+    showNotice: function() {
         var n = this.notice;
 
         if (n && n.parentNode && !n.classList.contains('fade-out'))
             return;
         this.notice = ui.addNotification(null, [
-            E('p', {}, [ other
-                ? _('Geomate has unsaved changes from another page. They are applied with your next map change.')
-                : _('Geomate has unsaved changes. They are applied with your next map change.') ]),
+            E('p', {}, [ _('Apply or revert the unsaved geomate changes before you change the map.') ]),
             E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'showChanges') }, [ _('Show changes') ])
         ], 'info');
     },
@@ -934,17 +946,21 @@ return view.extend({
 
     // After a failed change: drop the in-memory changes, load the configuration as the session
     // holds it and show it on the map, with the error. A change that was saved but not
-    // committed stays staged; the notice says that the next map change applies it
-    resync: function(reason) {
+    // committed stays staged, and the notice shows. Without a configuration the map keeps its
+    // circles and loses its tools, so nothing is applied on top of a missing one
+    resync: function(reason, token) {
         var self = this;
 
         uci.unload('geomate');
         return L.resolveDefault(uci.load('geomate'), null).then(function(loaded) {
-            if (!loaded)
+            if (!loaded) {
+                self.readonly = true;
+                self.sendMessageToMap('setReadonly', { readonly: true });
+                if (token)
+                    self.sendMessageToMap('regionRejected', { token: token, reason: '' });
                 return self.sendMessageToMap('toast', { text: reason + ' ' + _('Reload the page.') });
+            }
             return self.refreshChanges().then(function() {
-                if (self.knownChanges !== '[]')
-                    self.showNotice(false);
                 self.pushFilters();
                 self.sendMessageToMap('toast', { text: reason });
             });
@@ -952,8 +968,8 @@ return view.extend({
     },
 
     /**
-     * 'Applied.' in the map with Undo, which restores the filter as it was before the change.
-     * Only the last change can be undone.
+     * 'Applied.' in the map with Undo, which restores the options the change set. Only the last
+     * change can be undone. Call it after applyChange(): after is the reloaded filter.
      * @param {string} sid - The filter section.
      * @param {Object|null} before - Its options before the change (filterOptions); null: the
      *   change created the filter, Undo deletes it.
@@ -961,46 +977,63 @@ return view.extend({
      * @param {Array} [extra] - Toast buttons before Undo: [{ name, sid, label }].
      */
     showApplied: function(sid, before, text, extra) {
-        this.undo = { id: ++this.undoSeq, sid: sid, before: before };
+        this.undo = { id: ++this.undoSeq, sid: sid, before: before, after: filterOptions(sid) };
+        this.sendUndoToast(text || _('Applied.'), extra);
+    },
+
+    sendUndoToast: function(text, extra) {
         this.sendMessageToMap('toast', {
-            text: text || _('Applied.'),
+            text: text,
             actions: (extra || []).concat([ { name: 'undo', id: this.undo.id, label: _('Undo') } ])
         });
     },
 
-    // Undo in the map toast: write the filter back as it was, apply that, show all filters again
+    // Undo in the map toast: write back the options the change set, apply that, show all
+    // filters again. Not when they have changed since, e.g. in another tab. A refusal by
+    // checkStaged() offers Undo again
     undoChange: function(id) {
         var self = this, u = this.undo;
 
         if (!u || u.id !== id)
             return;
-        this.undo = null;
 
         return this.enqueue(null, function() {
             var now = filterOptions(u.sid),
-                name = (u.before && u.before.name) || (now && now.name) || u.sid;
+                name = (u.before && u.before.name) || (u.after && u.after.name) || u.sid,
+                keys = u.before ? changedOptions(u.after || {}, u.before) : null;
 
             // A change queued before the click has been applied since: Undo would revert it too
             if (self.undoSeq !== u.id)
                 return self.sendMessageToMap('toast', { text: _('Only the last change can be undone.') });
-            if (!now)
+            // Clicked twice: undone already
+            if (self.undo !== u)
+                return;
+            self.undo = null;
+            if (!now || !u.after)
                 throw failure(_('Filter %s not found.').format(name));
+            if (keys ? changedOptions(pick(now, keys), pick(u.after, keys)).length : changedOptions(now, u.after).length)
+                return self.sendMessageToMap('toast', { text: _('Not undone: filter %s has changed since.').format(name) });
 
             if (!u.before)
                 uci.remove('geomate', u.sid);
             else
-                changedOptions(now, u.before).forEach(function(k) {
+                keys.forEach(function(k) {
                     uci.set('geomate', u.sid, k, (u.before[k] != null) ? u.before[k] : null);
                 });
 
             return self.applyChange(function() {
                 var after = filterOptions(u.sid);
-                if (u.before ? (!after || changedOptions(after, u.before).length) : after)
+                if (u.before ? (!after || changedOptions(pick(after, keys), pick(u.before, keys)).length) : after)
                     throw failure(_('Could not undo the change of filter %s.').format(name));
             }).then(function() {
                 self.pushFilters();
                 self.sendMessageToMap('toast', { text: _('Undone.') });
             });
+        }, function(reason) {
+            if (self.undo === u)
+                self.sendUndoToast(reason);
+            else
+                self.sendMessageToMap('toast', { text: reason });
         });
     },
 
@@ -1039,7 +1072,7 @@ return view.extend({
     },
 
     // Send every filter to the map, also disabled ones: at mapReady, after Undo and after a
-    // failed change. The map drops its circles, so map actions queued before are dropped too
+    // failed change. The map drops its circles, so circle actions queued before are dropped too
     pushFilters: function() {
         var self = this;
 
