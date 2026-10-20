@@ -586,8 +586,8 @@ return view.extend({
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
                 if (typeof s.allowed_region == 'string')
-                    self.warnOnce(s['.name'] + ' option', _('Geomate ignores the "option allowed_region" of filter %s. Draw the circle again.')
-                        .format(s.name || s['.name']));
+                    self.warnOnce(s['.name'] + ' option', _('Filter %s has "option allowed_region %s", which the map cannot show and the service start skips. A circle drawn for this filter replaces it.')
+                        .format(s.name || s['.name'], s.allowed_region));
                 return Object.assign(self.filterInfo(s['.name']), { regions: self.regionList(s['.name']) });
             }),
             stagedSids: Object.keys(staged)
@@ -839,7 +839,7 @@ return view.extend({
                     ? _('Adds the circle to filter %s.').format(sec.name)
                     : _('Adds the circle to the disabled filter %s.').format(sec.name) ];
             if (sec && typeof sec.allowed_region == 'string')
-                hintText.push(' ' + _('It replaces the ignored "option allowed_region".'));
+                hintText.push(' ' + _('It replaces "option allowed_region %s".').format(sec.allowed_region));
             dom.content(hint, (!name || (!sec && !FILTER_NAME_RE.test(name))) ? null : hintText);
 
             var owner = name ? listOwner() : null;
