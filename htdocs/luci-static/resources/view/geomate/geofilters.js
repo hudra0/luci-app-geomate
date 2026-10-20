@@ -224,7 +224,7 @@ return view.extend({
                     ? _('Last %s ago, %d IPs queued').format(formatTime(geoLastRun), geoStats.geolocation.pending_ips || 0)
                     : notRun());
             }
-
+            
             // Daily geolocation info (always shown)
             if (geoStats.geolocation_daily) {
                 var dailyLastRun = geoStats.geolocation_daily.last_run_ago || 0;
