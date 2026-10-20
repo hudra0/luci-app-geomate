@@ -918,7 +918,7 @@
             a.querySelector('i').className = 'fa-solid ' + (on ? 'fa-minimize' : 'fa-maximize');
             a.querySelector('.gm-btn-label').textContent = on ? 'Exit fullscreen' : 'Fullscreen';
             a.setAttribute('aria-label', on ? 'Exit fullscreen' : 'Fullscreen');
-            a.title = on ? 'Back to the page (Esc)' : 'Show the map in the whole window';
+            a.title = on ? 'Exit fullscreen (Esc)' : 'Fullscreen';
             setPressed(a, on);
             // The iframe resizes with the view's CSS; Leaflet would notice on its own resize event
             requestAnimationFrame(function() { map.invalidateSize(); });
@@ -1175,7 +1175,7 @@
                 toolbarButton(viewGroup, 'fa-location-dot', 'Set home', 'Save this view as home', setHome);
                 // fa-expand is Fit all already
                 toolbar.fullscreen = toolbarButton(viewGroup, 'fa-maximize', 'Fullscreen',
-                    'Show the map in the whole window', toggleFullscreen);
+                    'Fullscreen', toggleFullscreen);
                 toolbar.fullscreen.setAttribute('aria-pressed', 'false');
                 L.DomEvent.disableClickPropagation(box);
                 L.DomEvent.disableScrollPropagation(box);
@@ -1946,7 +1946,6 @@
                 legend.darkTiles = L.DomUtil.create('input', '', darkSwitch);
                 legend.darkTiles.type = 'checkbox';
                 L.DomUtil.create('span', '', darkSwitch).textContent = 'Dark map tiles';
-                darkSwitch.title = 'Dim and invert the map tiles; stored in this browser';
                 L.DomEvent.on(legend.darkTiles, 'change', function() { setDarkTiles(legend.darkTiles.checked, true); });
 
                 toggle.type = 'button';

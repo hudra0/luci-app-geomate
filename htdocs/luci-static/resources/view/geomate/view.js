@@ -147,7 +147,7 @@ function textOn(color) {
 // Status of a connection for the table: [ sort key, label ]
 function connectionStatus(conn, geo) {
     if (conn.is_allowed_ip)
-        return [ 'whitelist', _('Allowed (Whitelist)') ];
+        return [ 'whitelist', _('Whitelisted') ];
     if (conn.allowed === true)
         return [ 'allowed', _('Allowed') ];
     if (!geo.lat || !geo.lon)
