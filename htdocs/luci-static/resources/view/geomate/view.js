@@ -202,7 +202,7 @@ return view.extend({
         n.version = E('span', { id: 'version-display', style: 'color: #6b7280;' }, [ _('Loading version...') ]);
         n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
 
-        return E('div', { style: 'display: flex; flex-direction: column; margin-left: 8px;' }, [
+        return E('div', { style: 'display: flex; flex-direction: column;' }, [
             // Service status, health checks, loading and stale connections in one row;
             // staged changes: renderActions()
             E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
