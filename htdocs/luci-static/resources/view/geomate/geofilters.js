@@ -70,22 +70,13 @@ function formatRadius(meters) {
     return _('%s km').format(km >= 10 ? Math.round(km) : Math.round(km * 10) / 10);
 }
 
-// Entries of src_ip, src_port or dest_port, split at white space like the service does. A
-// negated entry reads 'not <value>'; a lone '!' negates the entry after it. 'any' is no
-// restriction (a port option that says only 'any' adds no match to the rule)
+// Entries of src_ip, src_port or dest_port as the config has them, split at white space like
+// the service does. A port 'any' is no restriction (an option that says only 'any' adds no
+// match to the rule)
 function matchItems(section_id, option) {
-    var items = [], negate = false;
-
-    L.toArray(L.toArray(uci.get('geomate', section_id, option)).join(' ')).forEach(function(v) {
-        if (v === '!') {
-            negate = true;
-        }
-        else if (v !== 'any' || option == 'src_ip') {
-            items.push(negate || v.charAt(0) === '!' ? _('not %s').format(v.replace(/^!/, '')) : v);
-            negate = false;
-        }
-    });
-    return items.join(', ');
+    return L.toArray(L.toArray(uci.get('geomate', section_id, option)).join(' ')).filter(function(v) {
+        return v !== 'any' || option == 'src_ip';
+    }).join(', ');
 }
 
 // The traffic a filter looks at, as the rule in the service is built from protocol, src_ip,
@@ -421,7 +412,9 @@ return view.extend({
         // Match column - the traffic the filter looks at (the options are edited in the dialog)
         o = s.option(form.DummyValue, '_match', _('Match'));
         o.modalonly = false;
-        o.textvalue = matchText;
+        o.textvalue = function(section_id) {
+            return E('span', {}, [ matchText(section_id) ]);
+        };
 
         // IP Stats column - shows geolocation progress per filter
         o = s.option(form.DummyValue, '_ip_stats', _('IPs/Located'));
