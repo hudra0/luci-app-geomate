@@ -58,6 +58,10 @@ local function find_in_geo_file(filepath, ip)
     return nil
 end
 
+-- Filter names the backend supports in nft set names and geo data file names. A name that
+-- matches contains no '/' and no shell quote
+local FILTER_NAME_PATTERN = "^[%w_ .%-]+$"
+
 -- Geolocate an IP address from the geo data in /etc/geomate.d: first the file of the
 -- filter the IP belongs to (filter_name, optional), then the other files
 local function geolocate_ip(ip, filter_name)
@@ -66,8 +70,8 @@ local function geolocate_ip(ip, filter_name)
     end
 
     local geodata_dir = "/etc/geomate.d"
-    -- Same pattern as filter_set_name(): no '/' can leave the directory
-    local own = (type(filter_name) == "string" and filter_name:match("^[%w_ .%-]+$"))
+    -- No '/' can leave the directory
+    local own = (type(filter_name) == "string" and filter_name:match(FILTER_NAME_PATTERN))
         and (filter_name .. "_geo_data.json") or nil
     local found = own and find_in_geo_file(geodata_dir .. "/" .. own, ip)
 
@@ -169,7 +173,7 @@ end
 -- nft set name prefix of a filter, or nil if the name must not reach a shell command.
 -- The pattern covers what the backend supports in nft set names and file names
 local function filter_set_name(name)
-    if type(name) ~= "string" or not name:match("^[%w_ .%-]+$") then
+    if type(name) ~= "string" or not name:match(FILTER_NAME_PATTERN) then
         return nil
     end
     return "geomate_" .. (name:gsub(' ', '_'))

@@ -14,6 +14,13 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 
+    <script>
+        // Until the view sends the LuCI theme, the browser's color scheme picks the color set,
+        // so the first paint is not white in a dark theme
+        if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+            document.documentElement.setAttribute('data-theme', 'dark');
+    </script>
+
     <style>
         html, body { margin: 0; }
         #map { height: 100vh; width: 100%; }
@@ -22,8 +29,6 @@
          * Colors of the map's own controls. The view sends the LuCI theme (message 'theme'):
          * data-theme on <html> picks the light or dark set below, inline values on <html>
          * replace bg, fg, border, accent, danger and success with the theme's own colors.
-         * Until then the browser's color scheme decides, so the first paint is not white in a
-         * dark theme.
          */
         :root {
             color-scheme: light;
@@ -46,27 +51,6 @@
             --gm-attribution-bg: rgba(255, 255, 255, 0.8);
             --gm-map-bg: #dddddd;
             --gm-font: 600 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-        }
-        @media (prefers-color-scheme: dark) {
-            :root:not([data-theme="light"]) {
-                color-scheme: dark;
-                --gm-bg: #1e1e1e;
-                --gm-fg: #e6e6e6;
-                --gm-hover: #333436;
-                --gm-disabled-bg: #262626;
-                --gm-disabled-fg: #6e7681;
-                --gm-accent: #4c8eda;
-                --gm-muted: #a0a6ad;
-                --gm-border: #5c636a;
-                --gm-danger: #f85149;
-                --gm-success: #3fb950;
-                --gm-pill-bg: rgba(240, 240, 240, 0.92);
-                --gm-pill-fg: #1f2328;
-                --gm-label-bg: rgba(30, 30, 30, 0.85);
-                --gm-label-fg: #e6e6e6;
-                --gm-attribution-bg: rgba(30, 30, 30, 0.8);
-                --gm-map-bg: #2b2b2b;
-            }
         }
         :root[data-theme="dark"] {
             color-scheme: dark;
@@ -2030,13 +2014,18 @@
             createSelectionBar();
 
             // Escape closes the draw menu, ends drawing, the delete question and the editing of
-            // a circle, then fullscreen; registered once
+            // a circle, then closes a marker popup, then fullscreen; registered once, before
+            // Leaflet's keyboard handler, which would close the popup first
+            var popupOpen = false;
+            map.on('popupopen', function() { popupOpen = true; });
+            map.on('popupclose', function() { popupOpen = false; });
             L.DomEvent.on(document, 'keydown', function(e) {
                 if (e.key !== 'Escape') return;
                 if (!drawMenu.hidden) closeDrawMenu(true);
                 else if (mode === 'draw') cancelDraw();
                 else if (selection && selection.armed) renderDeleteButton(false);
                 else if (mode === 'edit') endSelection(false);
+                else if (popupOpen) map.closePopup();
                 else if (fullscreen) toggleFullscreen();
             });
 

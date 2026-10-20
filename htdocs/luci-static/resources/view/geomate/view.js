@@ -659,8 +659,12 @@ return view.extend({
                     self.connectionsAt = Date.now();
                 if (self.connectionsFailed >= CONNECTIONS_STALE_AFTER || failed >= CONNECTIONS_STALE_AFTER)
                     self.updateStatus();
-                if (!list)
+                if (!list) {
+                    // Without any reply the table would keep saying it loads
+                    if (self.connectionsAt == null && self.connectionsFailed == CONNECTIONS_STALE_AFTER && self.connectionsTable)
+                        self.connectionsTable.update([], _('Connections unavailable'));
                     return;
+                }
                 self.connections = list;
                 self.sendMessageToMap('updateConnections', list);
                 self.updateActiveConnectionsList();
