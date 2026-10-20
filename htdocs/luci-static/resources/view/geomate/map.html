@@ -911,13 +911,23 @@
                     fn();
                 }
             });
-            // Space works like on a button; Enter clicks the link anyway
+            // Space works like on a button: it clicks on keyup, so the keyup cannot reach a
+            // menu entry that the click focused (Firefox would pick it). Enter clicks the link anyway
+            var spaceDown = false;
             L.DomEvent.on(a, 'keydown', function(e) {
                 if (e.key === ' ') {
                     L.DomEvent.preventDefault(e);
+                    spaceDown = true;
+                }
+            });
+            L.DomEvent.on(a, 'keyup', function(e) {
+                if (e.key === ' ' && spaceDown) {
+                    L.DomEvent.preventDefault(e);
+                    spaceDown = false;
                     a.click();
                 }
             });
+            L.DomEvent.on(a, 'blur', function() { spaceDown = false; });
             return a;
         }
 
@@ -1246,8 +1256,9 @@
         /**
          * A click on a circle selects the smallest circle under the pointer; another click at
          * the same spot (within 6 px and 2 s) selects the next larger one, after the largest the
-         * smallest again. Not while drawing (the click may end the drawing) or setting home (the
-         * click goes on to the map), and not without write access.
+         * smallest again. The second click of a double-click does not cycle: the map zooms in
+         * instead. Not while drawing (the click may end the drawing) or setting home (the click
+         * goes on to the map), and not without write access.
          */
         function onCircleClick(e) {
             var now = Date.now(), list, pick, i;
@@ -1255,7 +1266,7 @@
             list = circlesAt(e.latlng, e.target);
             if (!list.length) return;
             L.DomEvent.stopPropagation(e);  // no map click, which would end the selection
-            if (now - drawEndedAt < 400) return;
+            if (now - drawEndedAt < 400 || e.originalEvent.detail > 1) return;
             pick = list[0];
             if (lastPick && now - lastPick.time < 2000 && e.containerPoint.distanceTo(lastPick.point) <= 6) {
                 i = list.indexOf(lastPick.layer);
@@ -1263,11 +1274,6 @@
             }
             lastPick = { point: e.containerPoint, time: now, layer: pick };
             selectCircle(pick);
-        }
-
-        // Two clicks that cycle through overlapping circles must not zoom the map in
-        function onCircleDblClick(e) {
-            if (!readonly && mode !== 'draw' && mode !== 'home' && !drawHandler) L.DomEvent.stopPropagation(e);
         }
 
         /*
@@ -1982,7 +1988,7 @@
             layer.gm = gm;
             circles[gm.token] = layer;
             // Before bindTooltip: the label is sized before the tooltip opens on 'add'
-            layer.on({ click: onCircleClick, dblclick: onCircleDblClick, mouseover: onCircleHover, mouseout: onCircleHover, add: onCircleAdd });
+            layer.on({ click: onCircleClick, mouseover: onCircleHover, mouseout: onCircleHover, add: onCircleAdd });
             applyState(layer);
         }
 
