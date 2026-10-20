@@ -727,12 +727,12 @@ return view.extend({
             this.sendTheme(true);
             this.sendMessageToMap('fullscreen', { on: this.fullscreen });
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
-            this.pushFilters();
-            // Once, after the first setFilters; the map's start view then shows this filter
+            // Once, before the first setFilters, which then fits the start view to this filter
             if (this.focusSid) {
                 this.sendMessageToMap('fitFilter', { sid: this.focusSid });
                 this.focusSid = null;
             }
+            this.pushFilters();
             this.sendMessageToMap('updateConnections', this.connections);
             break;
         case 'drawState':

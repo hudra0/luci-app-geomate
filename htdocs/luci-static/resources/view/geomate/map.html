@@ -974,12 +974,6 @@
             }
         }
 
-        // The start view: the saved home view, else all regions
-        function fitStartView() {
-            if (home) map.setView(home.center, home.zoom);
-            else fitAll(true);
-        }
-
         /**
          * Lowest zoom: the smallest at which the world covers the whole map, never below 1.
          * maxBounds keeps the map on one world copy, so a smaller world leaves grey bands beside
@@ -1014,9 +1008,12 @@
             }
         }
 
-        // The start view: the circles of the focus filter if it has any, else all regions
+        // The start view: the circles of the focus filter if it has any, else the saved home
+        // view, else all regions
         function fitStartView() {
-            if (!(focusSid && fitFilter(focusSid))) fitAll(true);
+            if (focusSid && fitFilter(focusSid)) return;
+            if (home) map.setView(home.center, home.zoom);
+            else fitAll(true);
         }
 
         // A resize shortly after the start view was fitted (the page still settles, a phone
@@ -2261,7 +2258,8 @@
             refreshDrawMenu();
             updateToolbar();
 
-            // Start view: the saved home view, else all regions. The iframe may have changed
+            // Start view: the focus filter, else the saved home view, else all regions. Fitted
+            // once (a second fit right after an animated one is lost). The iframe may have changed
             // its size since the map measured it, and may still do so while the page settles
             if (!viewFitted) {
                 viewFitted = true;
@@ -2431,7 +2429,7 @@
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
-         *   fitFilter         { sid }                          start view: the circles of this filter, once, after setFilters
+         *   fitFilter         { sid }                          start view: the circles of this filter, once, before the first setFilters
          *   cancelDraw        -                                Escape outside the map
          *   filterChanged     { sid, name, color, enabled }    e.g. after Enable in a toast
          *   regionSaved       { token, sid, name, color, enabled, region }
@@ -2447,7 +2445,7 @@
                 setFilters(data || {});
             } else if (type === 'fitFilter' && data && data.sid) {
                 focusSid = String(data.sid);
-                fitStartView();
+                if (viewFitted) fitStartView();  // late: the start view has been fitted already
             } else if (type === 'updateConnections') {
                 updateConnections(data || []);
             } else if (type === 'theme' && data) {

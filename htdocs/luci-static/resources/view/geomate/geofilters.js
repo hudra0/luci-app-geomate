@@ -43,6 +43,18 @@ function parseRegion(region) {
     return (Math.abs(p[1]) <= 90 && Math.abs(p[2]) <= 180 && +p[3] >= 1) ? +p[3] : null;
 }
 
+// The regions of a filter as the service reads them. A hand-written 'option allowed_region'
+// (a string) counts as no region: the service start and luci.geomate read only the list
+function regionList(section_id) {
+    var v = uci.get('geomate', section_id, 'allowed_region');
+    return Array.isArray(v) ? v : [];
+}
+
+// Regions written as 'option allowed_region', which the service ignores
+function regionIsOption(section_id) {
+    return typeof uci.get('geomate', section_id, 'allowed_region') == 'string';
+}
+
 // Radius for the grid: '436 km', '0.5 km'
 function formatRadius(meters) {
     var km = meters / 1000;
@@ -332,13 +344,16 @@ return view.extend({
             if (!filterName || (!enabled && !staged)) return '–';
 
             if (enabled) {
+                // The service does not start while Geomate is disabled globally
+                if (uci.get('geomate', 'global', 'enabled') !== '1') problems.push(_('service disabled'));
                 if (hasNftError(filterName)) problems.push(_('nft error'));
-                if (!L.toArray(uci.get('geomate', section_id, 'allowed_region')).length) problems.push(_('no regions'));
+                if (regionIsOption(section_id)) problems.push(_('regions ignored (option, not list)'));
+                else if (!regionList(section_id).some(function(r) { return parseRegion(r) !== null; })) problems.push(_('no regions'));
                 if (!uci.get('geomate', section_id, 'ip_list')) problems.push(_('no IP list'));
             }
 
             if (staged)
-                return E('span', { 'title': _('Staged changes take effect after Save & Apply. They are lost when you log out.') },
+                return E('span', { 'title': _('Staged changes take effect only after Save & Apply; they are lost on logout or session expiry.') },
                     [ _('pending (Save & Apply)') + (problems.length ? ' · ' + problems.join(', ') : '') ]);
 
             return problems.length ? problems.join(', ') : _('active');
@@ -361,10 +376,12 @@ return view.extend({
             var total = stats.total_ips || 0;
             var geo = stats.geolocated || 0;
             
-            // Geo data of IPs that left the list stays until the next full geolocation
-            if (geo > total) {
-                return E('span', { 'title': _('The geo data holds %d IPs that are not in the list any more. The next full geolocation drops them.').format(geo - total) },
-                    [ total + ' ✓ (' + _('stale') + ')' ]);
+            // Geo data of IPs that left the list stays until the next full geolocation. Both
+            // values are line counts (wc -l): a list without a final newline counts one IP less,
+            // so one more geo data line than list lines proves nothing
+            if (geo > total + 1) {
+                return E('span', { 'title': _('The geo data holds at least %d IPs that are not in the list any more. The next full geolocation drops them.').format(geo - total - 1) },
+                    [ total + ' (' + _('stale geo data') + ')' ]);
             }
 
             if (total === 0) {
@@ -385,12 +402,13 @@ return view.extend({
         o = s.option(form.DummyValue, '_regions', _('Regions'));
         o.modalonly = false;
         o.textvalue = function(section_id) {
-            var regions = L.toArray(uci.get('geomate', section_id, 'allowed_region'));
+            var regions = regionList(section_id);
             var radii = regions.map(parseRegion).filter(function(r) { return r !== null; });
             var parts = radii.map(formatRadius);
             var invalid = regions.length - radii.length;
             var nodes;
 
+            if (regionIsOption(section_id)) return _('ignored: option, not list');
             if (!regions.length) return '–';
 
             if (invalid) parts.push(_('%d invalid').format(invalid));
