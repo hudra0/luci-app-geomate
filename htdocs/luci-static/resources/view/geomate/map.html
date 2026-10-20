@@ -432,6 +432,10 @@
         var HOME_KEY = 'geomate-map-home';
         var LEGEND_KEY = 'geomate-map-legend';
         var DEFAULT_COLOR = '#666666';  // circles of a message without a filter color
+        // Space kept free around fitted circles, in pixels. Pixels and the same on every side: a
+        // padding in degrees (LatLngBounds.pad) moves the Mercator centre of the bounds north,
+        // and at the lowest zoom the view stays centred on the padded bounds and cuts the south
+        var FIT_PADDING = [40, 40];
         var home = { center: [51.505, -0.09], zoom: 4 };
         var toolbar = null;     // buttons of the map toolbar
         var modeBar = null;     // strip on top of the map that explains the current mode
@@ -698,7 +702,7 @@
         function fitAll(quiet) {
             var bounds = drawnItems.getBounds();
             if (bounds.isValid()) {
-                map.fitBounds(bounds.pad(0.15), { maxZoom: 10 });
+                map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 10 });
             } else {
                 goHome();
                 if (!quiet) showToast('No regions yet: showing the home view.');
@@ -1382,7 +1386,7 @@
                 var b = layer.getLatLng().toBounds(layer.getRadius() * 2);
                 bounds = bounds ? bounds.extend(b) : b;
             });
-            if (bounds) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+            if (bounds) map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 16 });
         }
 
         function iconButton(parent, icon, label, key, fn) {
