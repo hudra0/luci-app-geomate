@@ -736,8 +736,8 @@ return view.extend({
             }
         });
 
-        var ipPlaceholder = '192.168.1.0/24 or !192.168.1.128/25',
-            portPlaceholder = '25200 25300 or 27015-27020';
+        var ipPlaceholder = _('192.168.1.0/24 or !192.168.1.128/25'),
+            portPlaceholder = _('25200 25300 or 27015-27020');
 
         var fields = {
             enabled: new ui.Checkbox('1', { value_enabled: '1', value_disabled: '0' }),
