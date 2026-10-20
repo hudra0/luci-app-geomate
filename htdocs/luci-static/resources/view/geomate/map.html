@@ -721,6 +721,9 @@
             var size = map.getSize(), onMap = map.hasLayer(markerClusters), markers,
                 z = Math.max(1, Math.ceil(Math.log2(Math.max(size.x, size.y) / 256)));
             if (map.getMinZoom() === z) return;
+            // During a zoom animation Leaflet ignores setZoom(), also the one in setMinZoom():
+            // try again when it ends
+            if (map._animatingZoom) { map.once('zoomend', updateMinZoom); return; }
             // At once, so that setMinZoom() starts no zoom animation the group would miss
             if (map.getZoom() < z) map.setZoom(z, { animate: false });
             if (onMap) {
