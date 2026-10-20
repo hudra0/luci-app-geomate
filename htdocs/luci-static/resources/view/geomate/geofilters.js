@@ -13,6 +13,15 @@ var callGetGeolocationStatus = rpc.declare({
     expect: { status: {} }
 });
 
+// Staged changes of this session. Unlike uci.changes(), a ubus error rejects instead of
+// resolving to {}, which would look like "nothing staged" (same call as in view.js)
+var callUciChanges = rpc.declare({
+    object: 'uci',
+    method: 'changes',
+    expect: { changes: {} },
+    reject: true
+});
+
 // Store geolocation status globally for access in render functions
 var geoStats = null;
 
@@ -58,7 +67,7 @@ function regionIsOption(section_id) {
 // Radius for the grid: '436 km', '0.5 km'
 function formatRadius(meters) {
     var km = meters / 1000;
-    return (km >= 10 ? Math.round(km) : Math.round(km * 10) / 10) + ' km';
+    return _('%s km').format(km >= 10 ? Math.round(km) : Math.round(km * 10) / 10);
 }
 
 // The session has uncommitted changes in this section, or in this option of it
@@ -152,7 +161,7 @@ return view.extend({
                 console.log('Failed to load geolocation status:', err);
                 return null;
             }),
-            L.resolveDefault(uci.changes(), {})
+            L.resolveDefault(callUciChanges(), {})
         ]).then(function(data) {
             geoStats = data[0] || null;
             pending = data[1] || {};
@@ -176,7 +185,7 @@ return view.extend({
                 firstLoad = false;
                 return load;
             }
-            return Promise.all([ load, L.resolveDefault(uci.changes(), null) ]).then(function(data) {
+            return Promise.all([ load, L.resolveDefault(callUciChanges(), null) ]).then(function(data) {
                 pending = data[1] || pending;
                 return data[0];
             });
@@ -444,26 +453,26 @@ return view.extend({
         // Source IP configuration
         o = s.option(form.Value, 'src_ip', _('Source IP'));
         o.datatype = 'list(neg(ip4addr))';
-        o.placeholder = '192.168.1.0/24 or !192.168.1.128/25';
+        o.placeholder = _('192.168.1.0/24 or !192.168.1.128/25');
         o.rmempty = true;
         o.modalonly = true;
 
         // Source port configuration
         o = s.option(form.Value, 'src_port', _('Source Port'));
         o.datatype = 'list(neg(portrange))';
-        o.placeholder = '25200 25300 or 27015-27020';
+        o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
 
         // Destination port configuration
         o = s.option(form.Value, 'dest_port', _('Destination Port'));
         o.datatype = 'list(neg(portrange))';
-        o.placeholder = '25200 25300 or 27015-27020';
+        o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
 
         // Whitelist for specific IP addresses
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
         o.datatype = 'list(neg(ip4addr))';
-        o.placeholder = '192.168.1.0/24 or !192.168.1.128/25';
+        o.placeholder = _('192.168.1.0/24 or !192.168.1.128/25');
         o.rmempty = true;
         o.modalonly = true;
 
