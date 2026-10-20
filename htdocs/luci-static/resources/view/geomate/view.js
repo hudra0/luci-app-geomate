@@ -99,6 +99,11 @@ function failure(text) {
     return err;
 }
 
+// A map action whose filter id names another filter now (movedFilter)
+function filtersChanged() {
+    return failure(_('Not applied: the filters were changed in the meantime.'));
+}
+
 // The Enable button of a map toast (toastAction enableFilter)
 function enableAction(sid) {
     return { name: 'enableFilter', sid: sid, label: _('Enable') };
@@ -234,9 +239,10 @@ return view.extend({
 
     knownChanges: '[]', // staged geomate changes at the last check, as JSON (stagedKey)
     notice: null,       // notification about staged geomate changes (showNotice)
-    undo: null,         // { id, sid, before, after } of the last applied change: Undo in the map toast
+    undo: null,         // { id, sid, before, after, extra } of the last applied change: Undo in the map toast
     undoSeq: 0,         // id of the last applied change
     generation: 0,      // counts the full map updates (pushFilters); older queued circle actions are dropped
+    sidNames: {},       // filter name per section id as the map knows it (pushFilters, ackRegion)
     busy: null,         // promise chain that serializes map actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
@@ -807,7 +813,7 @@ return view.extend({
             this.setFullscreen(d.on);
             break;
         case 'regionDrawn':
-            this.enqueue(d.token, function() { return self.addDrawnRegion(d.token, d.region, d.sid); });
+            this.enqueue(d.token, d.sid, function() { return self.addDrawnRegion(d.token, d.region, d.sid); });
             break;
         case 'toastAction':
             if (d.name == 'enableFilter')
@@ -816,10 +822,10 @@ return view.extend({
                 this.undoChange(d.id);
             break;
         case 'regionEdited':
-            this.enqueue(d.token, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
+            this.enqueue(d.token, d.sid, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
             break;
         case 'regionDeleted':
-            this.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
+            this.enqueue(d.token, d.sid, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
             break;
         case 'regionInvalid':
             this.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
@@ -833,8 +839,9 @@ return view.extend({
     // read it in between. checkStaged() may stop an action before it changes anything; its
     // circle then goes back (token), or onRefuse(reason) answers. An action with a circle queued
     // before the map got all filters again (pushFilters) is dropped: the map no longer has its
-    // circle. A failed action shows the error, and the map shows the configuration again (resync)
-    enqueue: function(token, fn, onRefuse) {
+    // circle. So is an action whose filter id sid names another filter now (movedFilter). A
+    // failed action shows the error, and the map shows the configuration again (resync)
+    enqueue: function(token, sid, fn, onRefuse) {
         var self = this, generation = this.generation;
 
         this.busy = Promise.resolve(this.busy).then(function() {
@@ -843,14 +850,19 @@ return view.extend({
             if (token && generation !== self.generation)
                 return self.sendMessageToMap('toast', { text: _('Not applied: the map was reloaded.') });
             return self.checkStaged().then(function(ok) {
-                var reason = _('Apply or revert the unsaved geomate changes first.');
+                var reason = (ok === null) ? _('Could not check for unsaved changes.')
+                    : _('Apply or revert the unsaved geomate changes first.');
 
                 if (!ok) {
                     if (token)
                         return self.sendMessageToMap('regionRejected', { token: token, reason: reason });
                     return onRefuse ? onRefuse(reason) : self.sendMessageToMap('toast', { text: reason });
                 }
-                return self.loadConfig().then(function() { return fn(); });
+                return self.loadConfig().then(function() {
+                    if (self.movedFilter(sid))
+                        throw filtersChanged();
+                    return fn();
+                });
             });
         }).catch(function(err) {
             return self.resync((err && err.plain) ? err.message
@@ -860,11 +872,18 @@ return view.extend({
     },
 
     // Drop the in-memory configuration and load it as the session holds it now: at the start of
-    // each map action, and again after a dialog, which may have stayed open while another tab
-    // applied changes
+    // each map action, again after a dialog, which may have stayed open while another tab
+    // applied changes, and in resync
     loadConfig: function() {
         uci.unload('geomate');
         return uci.load('geomate');
+    },
+
+    // The map's section id sid names another filter than when the map got it: geo_filter
+    // sections are anonymous, so deleting one (e.g. in another tab) shifts the ids of all filters
+    // after it. An id that is gone does not count: the actions handle a deleted filter themselves
+    movedFilter: function(sid) {
+        return isGeoFilter(sid) && this.sidNames[sid] !== (uci.get('geomate', sid, 'name') || '');
     },
 
     // The one call that makes map changes active: commit the geomate configuration of this
@@ -881,6 +900,8 @@ return view.extend({
         var self = this;
 
         return this.checkStaged().then(function(ok) {
+            if (ok === null)
+                throw failure(_('Could not check for unsaved changes.'));
             if (!ok)
                 throw failure(_('Apply or revert the unsaved geomate changes first.'));
             return uci.save();
@@ -894,13 +915,15 @@ return view.extend({
     },
 
     // Resolves false while the session holds staged geomate changes, e.g. from the Geo Filters
-    // page: a commit would apply them too, unseen. The notice offers LuCI's changes dialog
+    // page: a commit would apply them too, unseen. The notice offers LuCI's changes dialog.
+    // null: the check failed, which must not count as "nothing staged"
     checkStaged: function() {
         var self = this;
 
         return L.resolveDefault(callUciChanges(), null).then(function(changes) {
-            if (changes)
-                self.knownChanges = stagedKey(changes);
+            if (!changes)
+                return null;
+            self.knownChanges = stagedKey(changes);
             if (self.knownChanges !== '[]') {
                 self.showNotice();
                 return false;
@@ -963,8 +986,7 @@ return view.extend({
     resync: function(reason, token) {
         var self = this;
 
-        uci.unload('geomate');
-        return L.resolveDefault(uci.load('geomate'), null).then(function(loaded) {
+        return L.resolveDefault(this.loadConfig(), null).then(function(loaded) {
             if (!loaded) {
                 self.readonly = true;
                 self.sendMessageToMap('setReadonly', { readonly: true });
@@ -1013,7 +1035,7 @@ return view.extend({
         if (!u || u.id !== id)
             return;
 
-        return this.enqueue(null, function() {
+        return this.enqueue(null, u.sid, function() {
             var now = filterOptions(u.sid),
                 name = (u.before && u.before.name) || (u.after && u.after.name) || u.sid,
                 keys = u.before ? changedOptions(u.after || {}, u.before) : null;
@@ -1090,8 +1112,10 @@ return view.extend({
         var self = this;
 
         this.generation++;
+        this.sidNames = {};
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
+                self.sidNames[s['.name']] = s.name || '';
                 if (typeof s.allowed_region == 'string')
                     self.warnOnce(s['.name'] + ' option', _('Filter %s has "option allowed_region %s", which the map cannot show and the service start skips. A circle drawn for this filter replaces it.')
                         .format(s.name || s['.name'], s.allowed_region));
@@ -1136,7 +1160,7 @@ return view.extend({
     enableFilter: function(sid) {
         var self = this, u = this.undo;
 
-        return this.enqueue(null, function() {
+        return this.enqueue(null, sid, function() {
             if (!isGeoFilter(sid) || uci.get('geomate', sid, 'enabled') === '1')
                 return;
             // A filter without a region blocks all its traffic in strict mode: the Geo Filters page decides that
@@ -1166,9 +1190,12 @@ return view.extend({
             throw failure(_('Could not save the circle of filter %s.').format(this.filterName(sid)));
     },
 
-    // Confirm an applied circle to the map
+    // Confirm an applied circle to the map, which learns a new filter's id this way
     ackRegion: function(token, sid, region) {
-        this.sendMessageToMap('regionSaved', Object.assign(this.filterInfo(sid), { token: token, region: region }));
+        var info = this.filterInfo(sid);
+
+        this.sidNames[sid] = info.name;
+        this.sendMessageToMap('regionSaved', Object.assign(info, { token: token, region: region }));
     },
 
     rejectRegion: function(token, sid, reason) {
@@ -1201,7 +1228,8 @@ return view.extend({
     // that dialog the configuration is loaded again, and the list and Undo's copy come from it
     removeRegion: function(token, sid, oldRegion) {
         var self = this,
-            list = this.regionList(sid);
+            list = this.regionList(sid),
+            effect = (list.length > 1) ? null : this.lastRegionEffect(sid);
 
         if (list.indexOf(oldRegion) < 0)
             return this.rejectRegion(token, sid);
@@ -1211,8 +1239,10 @@ return view.extend({
         })).then(function(choice) {
             if (!choice)
                 return self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+            if (self.movedFilter(sid))
+                throw filtersChanged();
 
-            var before = filterOptions(sid), index;
+            var before = filterOptions(sid), index, text = null;
 
             list = self.regionList(sid);
             index = list.indexOf(oldRegion);
@@ -1220,8 +1250,13 @@ return view.extend({
                 return self.rejectRegion(token, sid);
             list.splice(index, 1);
             // A circle added in the meantime: no longer the last one, the filter stays as it is
+            if (list.length && choice == 'disable')
+                text = _('Applied. Filter %s has another circle now and stays enabled.').format(self.filterName(sid));
             if (list.length)
                 choice = 'keep';
+            // The dialog showed another effect, e.g. the filter was enabled in the meantime
+            else if (choice == 'keep' && self.lastRegionEffect(sid) !== effect)
+                throw filtersChanged();
 
             uci.set('geomate', sid, 'allowed_region', list.length ? list : null);
             if (choice == 'disable')
@@ -1236,25 +1271,28 @@ return view.extend({
                 // The legend and the draw menu show the filter as disabled now
                 if (choice == 'disable')
                     self.sendMessageToMap('filterChanged', self.filterInfo(sid));
-                self.showApplied(sid, before);
+                self.showApplied(sid, before, text);
             });
         });
+    },
+
+    // What deleting the last circle of a filter means while it stays as it is, with %s for its name
+    lastRegionEffect: function(sid) {
+        var monitor = (uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor',
+            strict = uci.get('geomate', 'global', 'strict_mode') === '1';
+
+        if (uci.get('geomate', sid, 'enabled') !== '1')
+            return _('Filter %s is disabled and will have no circles.');
+        if (strict && !monitor)
+            return _('Strict mode is on, so filter %s will block every server except its allowed IPs.');
+        return _('Without circles, filter %s blocks no servers.');
     },
 
     // Resolves with 'disable', 'keep' or null (cancelled)
     confirmLastRegion: function(sid) {
         var name = this.filterName(sid),
             enabled = uci.get('geomate', sid, 'enabled') === '1',
-            monitor = (uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor',
-            strict = uci.get('geomate', 'global', 'strict_mode') === '1',
-            effect;
-
-        if (!enabled)
-            effect = _('Filter %s is disabled and will have no circles.');
-        else if (strict && !monitor)
-            effect = _('Strict mode is on, so filter %s will block every server except its allowed IPs.');
-        else
-            effect = _('Without circles, filter %s blocks no servers.');
+            effect = this.lastRegionEffect(sid);
 
         return new Promise(function(resolve) {
             var button = function(cls, label, choice) {
@@ -1573,13 +1611,13 @@ return view.extend({
     // Apply a drawn region from the modal. An existing filter only gets the options the user
     // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox.
     // The caller has loaded the configuration again after the dialog, sec is the dialog's copy:
-    // the filter may be gone now, or a filter of the new name may exist (names match without
-    // regard to case, as in the dialog)
+    // its id may name another filter or none now (movedFilter), or a filter of the new name may
+    // exist (names match without regard to case, as in the dialog)
     saveRegion: function(token, region, name, sec, values, initial) {
         var self = this, sid, before = null;
 
-        if (sec && !isGeoFilter(sec['.name']))
-            throw failure(_('Not applied: filter %s was deleted in the meantime.').format(name));
+        if (sec && uci.get('geomate', sec['.name'], 'name') !== sec.name)
+            throw filtersChanged();
         if (!sec && uci.sections('geomate', 'geo_filter').some(function(s) {
             return String(s.name || '').toLowerCase() === name.toLowerCase();
         }))
