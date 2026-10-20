@@ -519,7 +519,7 @@ return view.extend({
                 self.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
                 break;
             case 'regionInvalid':
-                self.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid region "%s". It is not shown on the map.')
+                self.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
                     .format(self.filterName(d.sid), d.region));
                 break;
             }
@@ -531,7 +531,7 @@ return view.extend({
     enqueue: function(token, fn) {
         var self = this;
         this.busy = Promise.resolve(this.busy).then(fn).catch(function(err) {
-            var reason = _('Failed to stage the change: %s. Reload the page.').format((err && err.message) || err);
+            var reason = _('Change failed: %s. Reload the page.').format((err && err.message) || err);
             ui.addNotification(null, E('p', {}, [ reason ]), 'error');
             self.sendMessageToMap('regionRejected', { token: token, reason: reason });
             // A failed uci.save() keeps its changes in memory; drop them so a later save does not stage them
@@ -586,25 +586,22 @@ return view.extend({
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
                 if (typeof s.allowed_region == 'string')
-                    self.warnOnce(s['.name'] + ' option', _('Filter %s has a region written as "option allowed_region" (%s) instead of "list allowed_region". geomate ignores it at service start; only the periodic harvest applies it (to all geolocated IPs of the filter, after new IPs arrive) until the next restart, and the map does not show it. Redraw it on the map or fix it on the Geo Filters page; a region drawn for this filter replaces it.')
-                        .format(s.name || s['.name'], s.allowed_region));
+                    self.warnOnce(s['.name'] + ' option', _('Geomate ignores the "option allowed_region" of filter %s. Draw the circle again.')
+                        .format(s.name || s['.name']));
                 return Object.assign(self.filterInfo(s['.name']), { regions: self.regionList(s['.name']) });
             }),
             stagedSids: Object.keys(staged)
         });
     },
 
-    // Stage the in-memory changes in the LuCI session and say what that means. The note is a
-    // toast inside the map: a LuCI notification would push the page and the map toolbar down
+    // Stage the in-memory changes in the LuCI session. LuCI's Unsaved Changes indicator in the
+    // header counts them
     stage: function() {
         var self = this;
         return uci.save().then(function() {
             return L.resolveDefault(uci.changes(), {});
         }).then(function(changes) {
             self.pending = changes || {};
-            self.sendMessageToMap('toast', {
-                text: _('Change staged. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.')
-            });
         });
     },
 
@@ -613,7 +610,7 @@ return view.extend({
     },
 
     rejectRegion: function(token, sid, reason) {
-        reason = reason || _('Region of filter %s not found in the configuration. Reload the page.').format(this.filterName(sid));
+        reason = reason || _('Circle of filter %s not found. Reload the page.').format(this.filterName(sid));
         ui.addNotification(null, E('p', {}, [ reason ]), 'warning');
         this.sendMessageToMap('regionRejected', { token: token, reason: reason });
     },
@@ -624,7 +621,7 @@ return view.extend({
             index = list.indexOf(oldRegion);
 
         if (!validRegion(region))
-            return this.rejectRegion(token, sid, _('Region %s is not a valid circle (radius at least 1 m).').format(region));
+            return this.rejectRegion(token, sid, _('Invalid circle %s').format(region));
         if (index < 0)
             return this.rejectRegion(token, sid);
 
@@ -667,28 +664,26 @@ return view.extend({
             effect;
 
         if (!enabled)
-            effect = _('Filter %s is disabled and keeps no region.');
-        else if (monitor)
-            effect = _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set. Geomate runs in monitor mode and blocks no traffic.');
-        else if (strict)
-            effect = _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set. Strict mode is on, so the filter blocks all its traffic except its allowed IPs.');
+            effect = _('Filter %s is disabled and will have no circles.');
+        else if (strict && !monitor)
+            effect = _('Strict mode is on, so filter %s will block every server except its allowed IPs.');
         else
-            effect = _('Without a region, filter %s puts no geolocated IP into its allowed or blocked set, so it blocks no game server (strict mode is off).');
+            effect = _('Without circles, filter %s blocks no servers.');
 
         return new Promise(function(resolve) {
             var button = function(cls, label, choice) {
                 return E('button', { 'class': 'btn ' + cls, 'click': function() { ui.hideModal(); resolve(choice); } }, [ label ]);
             };
             var preferred = enabled
-                ? button('cbi-button-negative', _('Delete and disable filter'), 'disable')
-                : button('cbi-button-negative', _('Delete region'), 'keep');
+                ? button('cbi-button-negative', _('Delete and disable'), 'disable')
+                : button('cbi-button-negative', _('Delete'), 'keep');
             // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
             var buttons = [ button('', _('Cancel'), null), ' ' ];
             if (enabled)
-                buttons.push(button('cbi-button-action', _('Delete, keep filter enabled'), 'keep'), ' ');
+                buttons.push(button('cbi-button-action', _('Delete'), 'keep'), ' ');
             buttons.push(preferred);
 
-            ui.showModal(_('Delete the last region of %h?').format(name), [
+            ui.showModal(_('Delete the last circle of %h?').format(name), [
                 E('p', {}, [ effect.format(name) ]),
                 E('div', { 'class': 'right' }, buttons)
             ]);
@@ -707,7 +702,7 @@ return view.extend({
             sid = null;
 
         if (!validRegion(region))
-            return Promise.reject(new Error(_('Invalid region %s').format(region)));
+            return Promise.reject(new Error(_('Invalid circle %s').format(region)));
 
         sections.forEach(function(s) {
             choices[s['.name']] = (s.enabled === '1') ? s.name : _('%s (disabled)').format(s.name);
@@ -839,17 +834,17 @@ return view.extend({
             fields.ip_list.node.querySelector('input').placeholder = suggestedList();
             // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
             var hintText = [ !sec
-                ? _('A new filter %s will be created.').format(name)
+                ? _('Creates the filter %s.').format(name)
                 : (sec.enabled === '1')
-                    ? _('The region will be added to filter %s.').format(sec.name)
-                    : _('The region will be added to filter %s, which is disabled.').format(sec.name) ];
+                    ? _('Adds the circle to filter %s.').format(sec.name)
+                    : _('Adds the circle to the disabled filter %s.').format(sec.name) ];
             if (sec && typeof sec.allowed_region == 'string')
-                hintText.push(' ' + _('It replaces the hand-written "option allowed_region" (%s).').format(sec.allowed_region));
+                hintText.push(' ' + _('It replaces the ignored "option allowed_region".'));
             dom.content(hint, (!name || (!sec && !FILTER_NAME_RE.test(name))) ? null : hintText);
 
             var owner = name ? listOwner() : null;
-            dom.content(listHint, owner ? [ _('%s is already the IP list of filter %s; both filters would share it.')
-                .format(value('ip_list') || suggestedList(), owner.name || owner['.name']) ] : null);
+            dom.content(listHint, owner ? [ _('Filter %s already uses this IP list.')
+                .format(owner.name || owner['.name']) ] : null);
         };
 
         var writeList = function(path, file) {
@@ -879,11 +874,11 @@ return view.extend({
 
             fs.stat(path).then(function() {
                 dom.content(status, [
-                    _('%s already exists. Replace its content with %s?').format(path, file.name), ' ',
-                    E('button', { 'class': 'btn cbi-button-negative', 'click': function() { writeList(path, file); } }, [ _('Overwrite') ]), ' ',
+                    _('%s already exists. Replace it with %s?').format(path, file.name), ' ',
+                    E('button', { 'class': 'btn cbi-button-negative', 'click': function() { writeList(path, file); } }, [ _('Replace') ]), ' ',
                     E('button', { 'class': 'btn', 'click': function() {
-                        dom.content(status, [ _('Upload cancelled, %s was not changed.').format(path) ]);
-                    } }, [ _('Keep file') ])
+                        dom.content(status, [ _('Upload cancelled.') ]);
+                    } }, [ _('Cancel') ])
                 ]);
             }, function(err) {
                 if (err && err.name == 'NotFoundError')
@@ -919,7 +914,7 @@ return view.extend({
                         if (!currentName())
                             return dom.content(status, [ _('Please specify a filter name first.') ]);
                         fields.ip_list.setValue(suggestedList());
-                        dom.content(status, [ _('The service creates the list file at its next start if it does not exist.') ]);
+                        dom.content(status, [ _('Geomate creates a missing file at its next start.') ]);
                         update();
                     } }, [ _('Create Empty List') ]), ' ',
                     E('button', { 'class': 'btn cbi-button-action', 'click': function() { fileInput.click(); } }, [ _('Upload IP List') ]),
@@ -947,7 +942,7 @@ return view.extend({
                     nameW.triggerValidation();
 
                 if (!picked)
-                    dom.content(hint, [ _('Choose a filter or "New filter…".') ]);
+                    dom.content(hint, [ _('Choose a filter.') ]);
 
                 // The hidden name field of an earlier 'New filter…' pick does not count
                 if (!picked || (isNew() && !nameW.isValid()) || !name ||
@@ -966,10 +961,10 @@ return view.extend({
                 }));
             };
 
-            ui.showModal(_('New region'), [
+            ui.showModal(_('New circle'), [
                 E('div', { 'class': 'cbi-map' }, [ E('div', { 'class': 'cbi-section' }, [ body ]) ]),
                 E('p', {}, [
-                    _('All options of all filters:'), ' ',
+                    _('More options:'), ' ',
                     E('a', { 'href': L.url('admin/services/geomate/geofilters') }, [ _('Geo Filters') ])
                 ]),
                 E('div', { 'class': 'right' }, [
@@ -1018,7 +1013,7 @@ return view.extend({
                     return s.name === name && L.toArray(s.allowed_region).indexOf(region) > -1;
                 });
                 if (!found)
-                    throw new Error(_('The region was staged but its new filter %s was not found').format(name));
+                    throw new Error(_('Filter %s not found after saving').format(name));
                 sid = found['.name'];
             }
             self.ackRegion(token, sid, region);

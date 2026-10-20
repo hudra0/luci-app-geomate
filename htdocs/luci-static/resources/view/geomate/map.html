@@ -561,7 +561,7 @@
 
             if (gm.pending) {
                 layer.setStyle({ color: '#666666', fillColor: '#666666', fillOpacity: 0.1, dashArray: '6 6' });
-                label.textContent = 'New region';
+                label.textContent = 'New circle';
             } else {
                 // Disabled filters: dashed and faint
                 layer.setStyle({
@@ -659,7 +659,7 @@
             var layer = event.layer;
             // A click without a drag gives a circle that UCI cannot store (radius 0 m)
             if (Math.round(layer.getRadius()) < 1) {
-                showToast('Drag to set a radius. No region was added.');
+                showToast('Drag to draw a circle.');
                 return;
             }
             wrapCenter(layer);
