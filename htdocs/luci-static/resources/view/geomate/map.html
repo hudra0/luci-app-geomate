@@ -18,8 +18,15 @@
         html, body { margin: 0; }
         #map { height: 100vh; width: 100%; }
 
-        /* Colors of the map's own controls; the theme handover (phase 3) overrides them */
+        /*
+         * Colors of the map's own controls. The view sends the LuCI theme (message 'theme'):
+         * data-theme on <html> picks the light or dark set below, inline values on <html>
+         * replace bg, fg, border, accent, danger and success with the theme's own colors.
+         * Until then the browser's color scheme decides, so the first paint is not white in a
+         * dark theme.
+         */
         :root {
+            color-scheme: light;
             --gm-bg: #ffffff;
             --gm-fg: #1f2328;
             --gm-hover: #eef1f4;
@@ -31,10 +38,87 @@
             --gm-border: #8c959f;
             --gm-danger: #cf222e;
             --gm-danger-fg: #ffffff;
+            --gm-success: #1a7f37;
             --gm-pill-bg: rgba(31, 35, 40, 0.9);
             --gm-pill-fg: #ffffff;
+            --gm-label-bg: rgba(255, 255, 255, 0.88);
+            --gm-label-fg: #1f2328;
+            --gm-attribution-bg: rgba(255, 255, 255, 0.8);
+            --gm-map-bg: #dddddd;
             --gm-font: 600 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
         }
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) {
+                color-scheme: dark;
+                --gm-bg: #1e1e1e;
+                --gm-fg: #e6e6e6;
+                --gm-hover: #333436;
+                --gm-disabled-bg: #262626;
+                --gm-disabled-fg: #6e7681;
+                --gm-accent: #4c8eda;
+                --gm-muted: #a0a6ad;
+                --gm-border: #5c636a;
+                --gm-danger: #f85149;
+                --gm-success: #3fb950;
+                --gm-pill-bg: rgba(240, 240, 240, 0.92);
+                --gm-pill-fg: #1f2328;
+                --gm-label-bg: rgba(30, 30, 30, 0.85);
+                --gm-label-fg: #e6e6e6;
+                --gm-attribution-bg: rgba(30, 30, 30, 0.8);
+                --gm-map-bg: #2b2b2b;
+            }
+        }
+        :root[data-theme="dark"] {
+            color-scheme: dark;
+            --gm-bg: #1e1e1e;
+            --gm-fg: #e6e6e6;
+            --gm-hover: #333436;
+            --gm-disabled-bg: #262626;
+            --gm-disabled-fg: #6e7681;
+            --gm-accent: #4c8eda;
+            --gm-muted: #a0a6ad;
+            --gm-border: #5c636a;
+            --gm-danger: #f85149;
+            --gm-success: #3fb950;
+            --gm-pill-bg: rgba(240, 240, 240, 0.92);
+            --gm-pill-fg: #1f2328;
+            --gm-label-bg: rgba(30, 30, 30, 0.85);
+            --gm-label-fg: #e6e6e6;
+            --gm-attribution-bg: rgba(30, 30, 30, 0.8);
+            --gm-map-bg: #2b2b2b;
+        }
+
+        /* Leaflet's own parts in the theme colors: zoom buttons, tooltips with their four
+           arrows, popups, attribution, the area without tiles */
+        .leaflet-container { background: var(--gm-map-bg); }
+        .leaflet-bar a { color: var(--gm-fg); background-color: var(--gm-bg); border-bottom-color: var(--gm-border); }
+        .leaflet-bar a:hover, .leaflet-bar a:focus { color: var(--gm-fg); background-color: var(--gm-hover); }
+        .leaflet-bar a.leaflet-disabled { color: var(--gm-disabled-fg); background-color: var(--gm-disabled-bg); }
+        .leaflet-tooltip { color: var(--gm-fg); background-color: var(--gm-bg); border-color: var(--gm-bg); }
+        .leaflet-tooltip-top:before { border-top-color: var(--gm-bg); }
+        .leaflet-tooltip-bottom:before { border-bottom-color: var(--gm-bg); }
+        .leaflet-tooltip-left:before { border-left-color: var(--gm-bg); }
+        .leaflet-tooltip-right:before { border-right-color: var(--gm-bg); }
+        .leaflet-popup-content-wrapper, .leaflet-popup-tip { color: var(--gm-fg); background: var(--gm-bg); }
+        .leaflet-container a.leaflet-popup-close-button { color: var(--gm-muted); }
+        .leaflet-container a.leaflet-popup-close-button:hover,
+        .leaflet-container a.leaflet-popup-close-button:focus { color: var(--gm-fg); }
+        .leaflet-container .leaflet-control-attribution { color: var(--gm-muted); background: var(--gm-attribution-bg); }
+        .leaflet-container .leaflet-control-attribution a { color: var(--gm-accent); }
+
+        /* Dimmed dark tiles: a switch in the legend, off by default */
+        html.gm-dark-tiles .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9) saturate(0.6); }
+
+        /* Connection marker popups: IP, status, filter, country, city, ISP */
+        .gm-popup { min-width: 160px; font: 400 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+        .gm-popup-ip { font-weight: 700; font-variant-numeric: tabular-nums; }
+        .gm-popup-status { margin: 2px 0 6px; font-weight: 600; }
+        .gm-popup-status--allowed { color: var(--gm-success); }
+        .gm-popup-status--blocked { color: var(--gm-danger); }
+        .gm-popup-status--ip { color: var(--gm-accent); }
+        .gm-popup-fields { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; margin: 0; }
+        .gm-popup-fields dt { color: var(--gm-muted); }
+        .gm-popup-fields dd { margin: 0; overflow-wrap: anywhere; }
 
         /* Map toolbar: labelled buttons in two groups (drawing, view) */
         .gm-toolbar { display: flex; flex-direction: column; gap: 10px; }
@@ -164,11 +248,11 @@
             font: inherit;
             color: inherit;
             background: transparent;
-            border: 1px solid rgba(255, 255, 255, 0.8);
+            border: 1px solid currentColor;
             border-radius: 4px;
             cursor: pointer;
         }
-        .gm-mode-bar button:hover { background: rgba(255, 255, 255, 0.18); }
+        .gm-mode-bar button:hover { background: rgba(127, 127, 127, 0.25); }
         .gm-mode-bar button:focus-visible { outline: 2px solid var(--gm-accent-fg); outline-offset: 2px; }
         @media (pointer: coarse) {
             .gm-mode-bar button { min-height: 40px; }
@@ -210,6 +294,10 @@
         .leaflet-marker-icon.gm-handle:active .gm-handle-dot { transform: scale(1.1); }
         .leaflet-marker-icon.gm-handle:focus { outline: none; }
         .leaflet-marker-icon.gm-handle:focus-visible .gm-handle-dot { outline: 2px solid var(--gm-accent); outline-offset: 2px; }
+        /* Touch screens: 36 px handles (HANDLE_SIZE) with a bigger glyph and ring */
+        @media (pointer: coarse) {
+            .gm-handle-dot { font-size: 15px; border-width: 4px; }
+        }
 
         /* Radius next to the resize handle while editing and next to the cursor while drawing */
         .leaflet-tooltip.gm-radius-label {
@@ -223,6 +311,9 @@
             box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
         }
         .leaflet-tooltip-right.gm-radius-label::before { border-right-color: var(--gm-pill-bg); }
+        @media (pointer: coarse) {
+            .leaflet-tooltip.gm-radius-label { padding: 5px 11px; font-size: 15px; }
+        }
 
         /* Permanent circle labels with the filter name; the tooltip box itself stays invisible */
         .leaflet-tooltip.gm-label { padding: 0; background: none; border: 0; box-shadow: none; }
@@ -232,9 +323,9 @@
             gap: 5px;
             padding: 2px 7px;
             font: 600 12px/1.25 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-            color: #1f2328;
+            color: var(--gm-label-fg);
             white-space: nowrap;
-            background: rgba(255, 255, 255, 0.88);
+            background: var(--gm-label-bg);
             border-left: 3px solid;
             border-radius: 3px;
             box-shadow: 0 0 2px rgba(0, 0, 0, 0.3);
@@ -299,6 +390,13 @@
         .gm-bar-btn--danger-solid, .gm-bar-btn--danger-solid:hover { color: var(--gm-danger-fg); background: var(--gm-danger); border-color: var(--gm-danger); }
         @media (pointer: coarse) {
             .gm-bar-btn, .gm-sel-radius input { min-height: 40px; }
+        }
+        /* Phones: the buttons get a row of their own below filter, radius and centre */
+        @media (max-width: 479px) {
+            .gm-sel-bar { gap: 6px 10px; padding: 6px 8px; }
+            .gm-sel-actions { flex-basis: 100%; margin-left: 0; }
+            .gm-sel-actions > .gm-bar-btn { flex: 1 1 auto; }
+            .gm-sel-center { font-size: 12px; }
         }
 
         .custom-div-icon i {
@@ -419,6 +517,8 @@
         .gm-icon-btn:hover { background: var(--gm-hover); border-color: var(--gm-border); }
         .gm-icon-btn:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: 0; }
         .gm-icon-btn[disabled] { color: var(--gm-disabled-fg); background: transparent; border-color: transparent; cursor: not-allowed; }
+        .gm-legend-switch { display: flex; align-items: center; gap: 8px; margin: 4px 0; cursor: pointer; }
+        .gm-legend-switch input { width: 16px; height: 16px; margin: 0; accent-color: var(--gm-accent); }
         @media (pointer: coarse) {
             .gm-legend-toggle { min-height: 44px; }
             .gm-icon-btn { width: 40px; height: 40px; }
@@ -434,8 +534,8 @@
             z-index: 1002;
             max-width: 80%;
             padding: 6px 12px;
-            background: white;
-            color: #333;
+            background: var(--gm-bg);
+            color: var(--gm-fg);
             border-radius: 4px;
             box-shadow: 0 1px 5px rgba(0,0,0,0.4);
             font: 13px/1.4 sans-serif;
@@ -472,11 +572,13 @@
         var readonly = true;    // until the parent says otherwise (setReadonly)
         var HOME_KEY = 'geomate-map-home';
         var LEGEND_KEY = 'geomate-map-legend';
+        var DARK_TILES_KEY = 'geomate-map-dark-tiles';
         var DEFAULT_COLOR = '#666666';  // circles of a message without a filter color
         // Space kept free around fitted circles, in pixels. Pixels and the same on every side: a
         // padding in degrees (LatLngBounds.pad) moves the Mercator centre of the bounds north,
         // and at the lowest zoom the view stays centred on the padded bounds and cuts the south
         var FIT_PADDING = [40, 40];
+        var fullscreen = false; // the view shows the map in the whole window
         var DEFAULT_VIEW = { center: [51.505, -0.09], zoom: 4 };   // without home view and circles
         var home = null;        // home view saved in this browser: { center, zoom }, or null
         var toolbar = null;     // buttons of the map toolbar
@@ -527,10 +629,14 @@
          * on desktop browsers too, and L.Edit.SimpleShape then takes the touch icons: set all four
          * before the first circle exists.
          */
+        // Touch screens get 36 px handles: CSS cannot resize them, Leaflet positions the icon by iconSize.
+        // Not tested on a touch device yet
+        var HANDLE_SIZE = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ? 36 : 28;
+
         function handleIcon(kind, glyph, title) {
             return L.divIcon({
                 className: 'gm-handle gm-handle--' + kind,
-                iconSize: [28, 28],
+                iconSize: [HANDLE_SIZE, HANDLE_SIZE],
                 html: '<span class="gm-handle-dot" title="' + title + '"><i class="fa-solid ' + glyph + '" aria-hidden="true"></i></span>'
             });
         }
@@ -562,6 +668,14 @@
             className: 'custom-div-icon'
         });
 
+        // Marker icon and popup status per kind of connection (connectionKind)
+        var CONNECTION_KINDS = {
+            ip: { icon: allowedIPIcon, status: 'Whitelisted' },
+            allowed: { icon: allowedConnectionIcon, status: 'Allowed' },
+            blocked: { icon: blockedDivIcon, status: 'Blocked' }
+        };
+
+        // dst -> marker of a connection shown on the map; marker.gm = { kind, key }
         var connectionMarkers = {};
 
         // Initialize MarkerCluster group with customized iconCreateFunction
@@ -654,54 +768,99 @@
             });
         }
 
-        // Popup content as text nodes: filter names never run as markup
-        function popupContent(lines) {
-            var div = document.createElement('div');
-            lines.forEach(function(line, i) {
-                if (i) div.appendChild(document.createElement('br'));
-                div.appendChild(document.createTextNode(line));
-            });
-            return div;
+        // Whitelisted IPs (allowed_ip) arrive with is_allowed_ip
+        function connectionKind(conn) {
+            return conn.is_allowed_ip ? 'ip' : conn.allowed ? 'allowed' : 'blocked';
+        }
+
+        // A text field of the geo lookup, or '' when luci.geomate sent none (older backend or cache)
+        function geoText(geo, key) {
+            return (typeof geo[key] == 'string') ? geo[key] : '';
         }
 
         /**
-         * Updates the map with the latest connection data.
+         * Popup of a connection marker, built from elements and text nodes: filter names and
+         * provider strings never run as markup. Country, city and ISP only when known.
+         * @param {Object} conn - The connection.
+         * @param {string} kind - connectionKind(conn).
+         */
+        function connectionPopup(conn, kind) {
+            var geo = conn.geo, box = L.DomUtil.create('div', 'gm-popup'), fields,
+                country = geoText(geo, 'country'), code = geoText(geo, 'countryCode'),
+                isp = geoText(geo, 'isp'), org = geoText(geo, 'org');
+
+            L.DomUtil.create('div', 'gm-popup-ip', box).textContent = conn.dst;
+            L.DomUtil.create('div', 'gm-popup-status gm-popup-status--' + kind, box).textContent = CONNECTION_KINDS[kind].status;
+            fields = L.DomUtil.create('dl', 'gm-popup-fields', box);
+            [
+                ['Filter', String(conn.filter_name || '')],
+                ['Country', country && code ? country + ' (' + code + ')' : country || code],
+                ['City', geoText(geo, 'city')],
+                ['ISP', isp],
+                ['Org', org !== isp ? org : '']
+            ].forEach(function(f) {
+                if (!f[1]) return;
+                L.DomUtil.create('dt', '', fields).textContent = f[0];
+                L.DomUtil.create('dd', '', fields).textContent = f[1];
+            });
+            return box;
+        }
+
+        /**
+         * Updates the connection markers: new connections get a marker, gone ones lose it, a
+         * changed status changes the icon. Markers are kept between polls, so an open popup
+         * stays open.
          * @param {Array} connections - An array of connection objects.
          */
         function updateConnections(connections) {
-            // Remove old connection markers from the cluster group
-            markerClusters.clearLayers();
-            connectionMarkers = {};
+            var seen = {}, added = [], removed = [], restyled = [];
 
             connections.forEach(function(conn) {
-                if (!conn || !conn.geo) {
+                var geo = conn && conn.geo, ip = conn && conn.dst, kind, key, marker, lat, lon;
+                // A failed lookup arrives as an empty array: no position, no marker
+                if (!geo || typeof ip != 'string' || seen[ip]) return;
+                lat = Number(geo.lat);
+                lon = Number(geo.lon);
+                if (!lat || !lon || !Number.isFinite(lat) || !Number.isFinite(lon) || Array.isArray(geo.lat) || Array.isArray(geo.lon))
+                    return;
+
+                seen[ip] = true;
+                kind = connectionKind(conn);
+                key = JSON.stringify([kind, conn.filter_name, geo.country, geo.countryCode, geo.city, geo.isp, geo.org]);
+                marker = connectionMarkers[ip];
+
+                if (!marker) {
+                    marker = L.marker([lat, lon], { icon: CONNECTION_KINDS[kind].icon });
+                    marker.gm = { kind: kind, key: key };
+                    marker.bindPopup(connectionPopup(conn, kind));
+                    connectionMarkers[ip] = marker;
+                    added.push(marker);
                     return;
                 }
-
-                var geo = conn.geo;
-                var ip = conn.dst;
-                var allowed = conn.allowed;
-                var filterName = conn.filter_name;
-                var isAllowedIP = conn.is_allowed_ip;
-
-                if (geo.lat && geo.lon && !Array.isArray(geo.lat) && !Array.isArray(geo.lon)) {
-                    var marker;
-                    // Whitelisted IPs (allowed_ip) arrive here with is_allowed_ip
-                    if (isAllowedIP) {
-                        marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
-                        marker.bindPopup(popupContent(['Allowed IP: ' + ip, 'Filter: ' + filterName]));
-                    } else if (allowed) {
-                        marker = L.marker([geo.lat, geo.lon], { icon: allowedConnectionIcon });
-                        marker.bindPopup(popupContent(['IP: ' + ip, 'Status: Allowed', 'Filter: ' + filterName]));
-                    } else {
-                        marker = L.marker([geo.lat, geo.lon], { icon: blockedDivIcon });
-                        marker.bindPopup(popupContent(['IP: ' + ip, 'Status: Blocked', 'Filter: ' + filterName]));
-                    }
-
-                    markerClusters.addLayer(marker);
-                    connectionMarkers[ip] = marker;
+                if (!marker.getLatLng().equals([lat, lon])) marker.setLatLng([lat, lon]);
+                if (marker.gm.kind !== kind) {
+                    marker.gm.kind = kind;
+                    marker.setIcon(CONNECTION_KINDS[kind].icon);
+                    restyled.push(marker);
+                }
+                // An open popup takes the new content in place
+                if (marker.gm.key !== key) {
+                    marker.gm.key = key;
+                    marker.setPopupContent(connectionPopup(conn, kind));
                 }
             });
+
+            Object.keys(connectionMarkers).forEach(function(ip) {
+                if (!seen[ip]) {
+                    removed.push(connectionMarkers[ip]);
+                    delete connectionMarkers[ip];
+                }
+            });
+
+            if (removed.length) markerClusters.removeLayers(removed);
+            if (added.length) markerClusters.addLayers(added);
+            // Cluster colors count the icons of their markers
+            if (restyled.length) markerClusters.refreshClusters(restyled);
         }
 
         /**
@@ -718,6 +877,66 @@
                 endSelection(false);
             }
             updateToolbar();
+        }
+
+        // Theme colors from the view; each must be a valid CSS color, else the default stays
+        var THEME_PROPS = {
+            bg: '--gm-bg', fg: '--gm-fg', border: '--gm-border', accent: '--gm-accent', accentFg: '--gm-accent-fg',
+            danger: '--gm-danger', dangerFg: '--gm-danger-fg', success: '--gm-success'
+        };
+
+        /**
+         * Follows the LuCI theme: the light or dark defaults, then the theme's own colors.
+         * @param {Object} theme - { dark, bg, fg, border, accent, accentFg, danger, dangerFg, success }
+         */
+        function setTheme(theme) {
+            var root = document.documentElement;
+            root.setAttribute('data-theme', theme.dark ? 'dark' : 'light');
+            Object.keys(THEME_PROPS).forEach(function(key) {
+                var v = theme[key];
+                if (typeof v == 'string' && window.CSS && CSS.supports('color', v))
+                    root.style.setProperty(THEME_PROPS[key], v);
+                else
+                    root.style.removeProperty(THEME_PROPS[key]);
+            });
+        }
+
+        /**
+         * Dimmed dark tiles (switch in the legend), in every theme.
+         * @param {boolean} on - Dark tiles on.
+         * @param {boolean} [remember] - Store the choice in this browser.
+         */
+        function setDarkTiles(on, remember) {
+            L.DomUtil[on ? 'addClass' : 'removeClass'](document.documentElement, 'gm-dark-tiles');
+            if (legend && legend.darkTiles) legend.darkTiles.checked = on;
+            if (remember) {
+                try { localStorage.setItem(DARK_TILES_KEY, on ? '1' : '0'); } catch (e) {}
+            }
+        }
+
+        function storedDarkTiles() {
+            try { return localStorage.getItem(DARK_TILES_KEY) === '1'; } catch (e) { return false; }
+        }
+
+        // Fullscreen belongs to the view, which sizes the iframe: the button and Escape ask for it
+        function toggleFullscreen() {
+            post('fullscreen', { on: !fullscreen });
+        }
+
+        /**
+         * The view changed the fullscreen state: button state, and the map takes its new size.
+         * @param {boolean} on - The map covers the window.
+         */
+        function setFullscreenState(on) {
+            var a = toolbar.fullscreen;
+            fullscreen = on;
+            a.querySelector('i').className = 'fa-solid ' + (on ? 'fa-minimize' : 'fa-maximize');
+            a.querySelector('.gm-btn-label').textContent = on ? 'Exit fullscreen' : 'Fullscreen';
+            a.setAttribute('aria-label', on ? 'Exit fullscreen' : 'Fullscreen');
+            a.title = on ? 'Back to the page (Esc)' : 'Show the map in the whole window';
+            setPressed(a, on);
+            // The iframe resizes with the view's CSS; Leaflet would notice on its own resize event
+            requestAnimationFrame(function() { map.invalidateSize(); });
         }
 
         // Saved home view: { center: [lat, lng], zoom }, or null; the older map stored only
@@ -969,6 +1188,10 @@
                 toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all circles', function() { fitAll(false); });
                 toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome);
                 toolbarButton(viewGroup, 'fa-location-dot', 'Set home', 'Save this view as home', setHome);
+                // fa-expand is Fit all already
+                toolbar.fullscreen = toolbarButton(viewGroup, 'fa-maximize', 'Fullscreen',
+                    'Show the map in the whole window', toggleFullscreen);
+                toolbar.fullscreen.setAttribute('aria-pressed', 'false');
                 L.DomEvent.disableClickPropagation(box);
                 L.DomEvent.disableScrollPropagation(box);
                 return box;
@@ -1185,7 +1408,7 @@
          */
         function showPill(latlng, text) {
             if (!radiusPill)
-                radiusPill = L.tooltip({ permanent: true, direction: 'right', offset: [20, 0], className: 'gm-radius-label', opacity: 1 });
+                radiusPill = L.tooltip({ permanent: true, direction: 'right', offset: [HANDLE_SIZE / 2 + 6, 0], className: 'gm-radius-label', opacity: 1 });
             radiusPill.setLatLng(latlng);
             radiusPill.setContent(text);
             if (!map.hasLayer(radiusPill)) radiusPill.addTo(map);
@@ -1733,6 +1956,14 @@
                     L.DomUtil.create('span', 'gm-legend-cluster', legendItem(body, c[1])).style.background = c[0];
                 });
 
+                L.DomUtil.create('h3', '', body).textContent = 'Map';
+                var darkSwitch = L.DomUtil.create('label', 'gm-legend-switch', body);
+                legend.darkTiles = L.DomUtil.create('input', '', darkSwitch);
+                legend.darkTiles.type = 'checkbox';
+                L.DomUtil.create('span', '', darkSwitch).textContent = 'Dark map tiles';
+                darkSwitch.title = 'Dim and invert the map tiles; stored in this browser';
+                L.DomEvent.on(legend.darkTiles, 'change', function() { setDarkTiles(legend.darkTiles.checked, true); });
+
                 toggle.type = 'button';
                 toggle.setAttribute('aria-controls', body.id);
                 L.DomUtil.create('i', 'fa-solid fa-circle-info', toggle).setAttribute('aria-hidden', 'true');
@@ -1755,6 +1986,7 @@
          */
         function initMap() {
             home = loadHome();
+            setDarkTiles(storedDarkTiles(), false);
 
             map = L.map('map', {
                 center: (home || DEFAULT_VIEW).center,
@@ -1798,13 +2030,14 @@
             createSelectionBar();
 
             // Escape closes the draw menu, ends drawing, the delete question and the editing of
-            // a circle; registered once
+            // a circle, then fullscreen; registered once
             L.DomEvent.on(document, 'keydown', function(e) {
                 if (e.key !== 'Escape') return;
                 if (!drawMenu.hidden) closeDrawMenu(true);
                 else if (mode === 'draw') cancelDraw();
                 else if (selection && selection.armed) renderDeleteButton(false);
                 else if (mode === 'edit') endSelection(false);
+                else if (fullscreen) toggleFullscreen();
             });
 
             drawnItems = new L.FeatureGroup();
@@ -1828,6 +2061,7 @@
             // Legend: filters with eye and magnifier, circle states, markers
             new GmLegend().addTo(map);
             setLegendOpen(legendStartsOpen(), false);
+            legend.darkTiles.checked = L.DomUtil.hasClass(document.documentElement, 'gm-dark-tiles');
             renderLegendFilters();
 
             // Notify parent frame that the map is ready
@@ -2194,7 +2428,10 @@
          *   regionDeleted     { token, sid, oldRegion }
          *   regionInvalid     { sid, region }
          *   toastAction       { name, sid }                    button in a toast, e.g. enableFilter
+         *   fullscreen        { on }                           fullscreen button or Escape asks for it
          * parent -> map:
+         *   theme             { dark, bg, fg, border, accent, accentFg, danger, dangerFg, success }
+         *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
          *   cancelDraw        -                                Escape outside the map
@@ -2212,6 +2449,10 @@
                 setFilters(data || {});
             } else if (type === 'updateConnections') {
                 updateConnections(data || []);
+            } else if (type === 'theme' && data) {
+                setTheme(data);
+            } else if (type === 'fullscreen' && data) {
+                setFullscreenState(data.on === true);
             } else if (type === 'setReadonly') {
                 setReadonly(!data || data.readonly !== false);
             } else if (type === 'cancelDraw') {
