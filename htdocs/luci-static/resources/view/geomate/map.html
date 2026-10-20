@@ -1969,7 +1969,6 @@
          *   selectFilter      { sid, name, color, enabled, isNew } or null: what Draw circle draws for
          *   startDraw         like selectFilter, then draw     ("Draw circle" above the map)
          *   cancelDraw        -
-         *   fitAll            -
          *   filterChanged     { sid, name, color, enabled }    e.g. after "Enable filter"
          *   regionSaved       { token, sid, name, color, enabled, region }
          *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
@@ -1992,8 +1991,6 @@
                 startDraw(data || null);
             } else if (type === 'cancelDraw') {
                 cancelDraw();
-            } else if (type === 'fitAll') {
-                fitAll(false);
             } else if (type === 'filterChanged' && data && data.sid) {
                 updateFilter(data.sid, { name: data.name, color: data.color, enabled: !!data.enabled, staged: true });
             } else if (type === 'toast' && data && data.text) {

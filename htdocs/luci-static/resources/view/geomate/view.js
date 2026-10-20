@@ -46,13 +46,11 @@ var NEW_FILTER = '+new';
 // localStorage key of the filter last chosen above the map: { sid, name } or { isNew: true }
 var PICK_KEY = 'geomate-map-filter';
 
-function filterColor(index, name) {
-    if (index < PALETTE.length)
-        return PALETTE[index];
-    var hash = 0;
-    for (var i = 0; i < name.length; i++)
-        hash = (name.charCodeAt(i) + ((hash << 5) - hash)) | 0;
-    return PALETTE[Math.abs(hash) % PALETTE.length];
+// Color of the filter at this position among the geo_filter sections; from the ninth filter on
+// the palette repeats. The position alone decides: a new filter's circle is drawn in its color
+// before the filter has a name
+function filterColor(index) {
+    return PALETTE[index % PALETTE.length];
 }
 
 function isEmpty(v) {
@@ -125,6 +123,7 @@ return view.extend({
     status: null,       // last getStatus result, null when it failed
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
+    writable: false,    // the user may change and apply configurations (L.hasViewPermission)
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
     nodes: null,        // nodes that the polls update in place
@@ -152,7 +151,8 @@ return view.extend({
 
         this.pending = data[1] || {};
         // hasViewPermission() is what the footer uses without a form.Map to disable its buttons
-        this.readonly = !L.hasViewPermission() || !configLoaded;
+        this.writable = L.hasViewPermission();
+        this.readonly = !this.writable || !configLoaded;
         this.nodes = {};
 
         if (!configLoaded)
@@ -217,7 +217,8 @@ return view.extend({
     },
 
     // Action bar above the map in LuCI button classes, so it follows the theme:
-    // filter picker, Draw circle, Fit all, Active connections and the staged changes chip
+    // filter picker, Draw circle, Active connections and the staged changes chip. Fit all is in
+    // the map toolbar
     renderActions: function() {
         var n = this.nodes;
 
@@ -245,11 +246,6 @@ return view.extend({
             'aria-pressed': 'false',
             'click': L.bind(this.handleDraw, this)
         }, [ _('Draw circle') ]);
-        n.fit = E('button', {
-            'class': 'btn cbi-button cbi-button-action',
-            'title': _('Zoom the map to all regions'),
-            'click': L.bind(function() { this.sendMessageToMap('fitAll'); }, this)
-        }, [ _('Fit all') ]);
         n.toggle = E('button', {
             'class': 'btn cbi-button cbi-button-neutral',
             'aria-pressed': 'false',
@@ -267,7 +263,7 @@ return view.extend({
         ]);
 
         return E('div', { 'class': 'cbi-section-actions gm-map-actions' }, [
-            style, n.editTools, n.fit, n.toggle, E('span', { 'class': 'gm-spacer' }), n.chip
+            style, n.editTools, n.toggle, E('span', { 'class': 'gm-spacer' }), n.chip
         ]);
     },
 
@@ -328,7 +324,7 @@ return view.extend({
         if (v === NEW_FILTER)
             return { sid: null, name: '', isNew: true, enabled: true,
                 // The color the new section gets: it is appended after the existing ones
-                color: filterColor(uci.sections('geomate', 'geo_filter').length, '') };
+                color: filterColor(uci.sections('geomate', 'geo_filter').length) };
         if (!v || (uci.get('geomate', v) || {})['.type'] !== 'geo_filter')
             return null;
         return Object.assign(this.filterInfo(v), { isNew: false });
@@ -380,11 +376,13 @@ return view.extend({
             : !t ? _('Choose a filter first')
             : t.isNew ? _('Draw a circle, then name the new filter')
             : _('Draw a circle for filter %s').format(t.name);
-        n.fit.disabled = !this.mapReady;
 
+        // Also without write access or a loaded configuration: the count stays true. Applying
+        // needs write access, like the footer's Save & Apply
         count = L.toArray((this.pending || {}).geomate).length;
         others = this.otherStagedConfigs();
-        n.chip.style.display = (count && !this.readonly) ? '' : 'none';
+        n.chip.style.display = count ? '' : 'none';
+        n.chip.disabled = !this.writable;
         n.chip.textContent = (count == 1)
             ? _('1 change pending · Save & Apply')
             : _('%d changes pending · Save & Apply').format(count);
@@ -728,7 +726,7 @@ return view.extend({
         return {
             sid: sid,
             name: name,
-            color: filterColor(Math.max(index, 0), name),
+            color: filterColor(Math.max(index, 0)),
             enabled: index > -1 && sections[index].enabled === '1'
         };
     },
