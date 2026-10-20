@@ -31,8 +31,6 @@
             --gm-border: #8c959f;
             --gm-danger: #cf222e;
             --gm-danger-fg: #ffffff;
-            --gm-chip-bg: #f0b429;
-            --gm-chip-fg: #1f2328;
             --gm-pill-bg: rgba(31, 35, 40, 0.9);
             --gm-pill-fg: #ffffff;
             --gm-font: 600 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
@@ -59,7 +57,8 @@
             background: var(--gm-bg);
         }
         .gm-btn i { width: 16px; font-size: 15px; text-align: center; }
-        .gm-btn--draw i { color: var(--gm-target, var(--gm-accent)); }
+        .gm-btn--draw i { color: var(--gm-accent); }
+        .gm-btn i.gm-btn-caret { width: auto; margin-left: -2px; font-size: 11px; color: inherit; }
         .leaflet-bar a.gm-btn:hover { background: var(--gm-hover); color: var(--gm-fg); }
         .leaflet-bar a.gm-btn:focus { outline: none; }
         .leaflet-bar a.gm-btn:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: -3px; }
@@ -82,6 +81,56 @@
         @media (max-width: 639px) and (pointer: coarse) {
             .leaflet-bar a.gm-btn,
             .leaflet-touch .leaflet-bar a.gm-btn { width: 44px; }
+        }
+
+        /* Narrow maps: no caret either, the Draw circle button stays square */
+        @media (max-width: 639px) {
+            .gm-btn i.gm-btn-caret { display: none; }
+        }
+
+        /* Menu of the Draw circle button: the filters to draw for, then New filter. Next to the
+           button, or below it on narrow maps; above the controls and the legend */
+        .gm-draw-menu {
+            position: absolute;
+            z-index: 1002;
+            box-sizing: border-box;
+            min-width: 180px;
+            max-width: calc(100% - 16px);
+            overflow-y: auto;
+            padding: 4px 0;
+            font: var(--gm-font);
+            color: var(--gm-fg);
+            background: var(--gm-bg);
+            border-radius: 4px;
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4);
+        }
+        .gm-draw-menu[hidden] { display: none; }
+        .gm-menu-title { padding: 6px 12px 4px; font-weight: 400; color: var(--gm-muted); }
+        .gm-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-sizing: border-box;
+            width: 100%;
+            min-height: 34px;
+            padding: 4px 12px;
+            font: inherit;
+            text-align: left;
+            color: inherit;
+            background: transparent;
+            border: 0;
+            cursor: pointer;
+        }
+        .gm-menu-item:hover, .gm-menu-item:focus { background: var(--gm-hover); outline: none; }
+        .gm-menu-item:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: -2px; }
+        .gm-menu-dot { flex: none; width: 12px; height: 12px; border-radius: 50%; }
+        i.gm-menu-dot { font-size: 12px; line-height: 12px; text-align: center; color: var(--gm-accent); }
+        .gm-menu-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .gm-menu-item--disabled .gm-menu-dot, .gm-menu-item--disabled .gm-menu-name { opacity: 0.5; }
+        .gm-menu-note { flex: none; margin-left: auto; font-weight: 400; color: var(--gm-muted); }
+        .gm-menu-sep { height: 1px; margin: 4px 0; background: var(--gm-border); opacity: 0.4; }
+        @media (pointer: coarse) {
+            .gm-menu-item { min-height: 44px; }
         }
 
         /* Mode bar: a fixed strip on top of the map while drawing, setting home or editing */
@@ -175,7 +224,7 @@
         }
         .leaflet-tooltip-right.gm-radius-label::before { border-right-color: var(--gm-pill-bg); }
 
-        /* Permanent circle labels "BF6 · 683 km"; the tooltip box itself stays invisible */
+        /* Permanent circle labels with the filter name; the tooltip box itself stays invisible */
         .leaflet-tooltip.gm-label { padding: 0; background: none; border: 0; box-shadow: none; }
         .gm-label-box {
             display: inline-flex;
@@ -190,16 +239,8 @@
             border-radius: 3px;
             box-shadow: 0 0 2px rgba(0, 0, 0, 0.3);
         }
-        .gm-chip {
-            padding: 0 6px;
-            font: 700 10px/16px system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            color: var(--gm-chip-fg);
-            background: var(--gm-chip-bg);
-            border-radius: 999px;
-        }
-        .gm-label-box[hidden], .gm-chip[hidden] { display: none; }
+        .gm-label-box--disabled { opacity: 0.6; }
+        .gm-label-box[hidden] { display: none; }
 
         /* Selection bar: a fixed strip below the map while a circle is selected */
         .gm-sel-bar {
@@ -351,14 +392,14 @@
             border-radius: 50%;
             background: rgba(87, 96, 106, 0.22);
         }
-        .gm-legend-ring--disabled { border-width: 2px; border-style: dashed; background: rgba(87, 96, 106, 0.06); opacity: 0.8; }
-        .gm-legend-ring--pending { border-style: dashed; }
+        .gm-legend-ring--disabled { border-width: 2px; background: rgba(87, 96, 106, 0.05); opacity: 0.5; }
+        .gm-legend-ring--unsaved { border-style: dashed; }
         .gm-legend-ring--selected { border-width: 4px; background: rgba(87, 96, 106, 0.15); box-shadow: 0 0 4px rgba(0, 0, 0, 0.55); }
         .gm-legend-filters { margin: 0; padding: 0; list-style: none; }
         .gm-legend-filter { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
         .gm-legend-filter--hidden .gm-legend-fname { opacity: 0.5; }
         .gm-legend-dot { box-sizing: border-box; flex: none; width: 14px; height: 14px; border: 2px solid; border-radius: 50%; }
-        .gm-legend-dot--disabled { border-style: dashed; background: transparent !important; }
+        .gm-legend-dot--disabled { opacity: 0.45; }
         .gm-legend-fname { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; }
         .gm-legend-name { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
         .gm-legend-meta { display: flex; align-items: center; gap: 5px; color: var(--gm-muted); }
@@ -442,9 +483,9 @@
         var selBar = null;      // nodes of the strip below the map while a circle is selected
         var legend = null;      // nodes of the legend that change
         var mode = null;        // null, 'draw', 'home' or 'edit'
-        var drawTarget = null;  // filter Draw circle draws for (selectFilter); null disables Draw
+        var drawMenu = null;    // menu of the Draw circle button (createDrawMenu)
         var drawHandler = null; // the running L.Draw.Circle
-        var drawingFor = null;  // drawTarget when the running drawing started
+        var drawingFor = null;  // filter of the running drawing: { sid, name, color, enabled } or { isNew, color }
         var drawEndedAt = 0;    // a click right after a drawing ends selects no circle
         var viewFitted = false; // the start view has been fitted to the regions
         var refitUntil = 0;     // until then a resize fits the start view again; user input ends it
@@ -474,6 +515,7 @@
          * a new circle waits for the parent; deleting: its delete waits for the parent.
          */
         var circles = {}; // token -> layer, kept until the parent has answered for it
+        var lastPick = null;    // { point, time, layer } of the last click that selected a circle
         // Tokens differ between iframe loads, so a late answer never hits a circle of a new map
         var tokenPrefix = Math.random().toString(36).slice(2, 10) + '-';
         var toastTimer = null;
@@ -670,6 +712,7 @@
             readonly = value;
             L.DomUtil[readonly ? 'addClass' : 'removeClass'](map.getContainer(), 'gm-readonly');
             if (readonly) {
+                closeDrawMenu(false);
                 cancelDraw();
                 endSelection(false);
             }
@@ -835,17 +878,16 @@
             return true;
         }
 
-        // State, titles and visibility of the toolbar buttons
+        // State, titles and visibility of the toolbar buttons. Draw circle waits for the filter list
         function updateToolbar() {
-            var a = toolbar.draw, disabled = !drawTarget;
+            var a = toolbar.draw, disabled = !filters;
 
             toolbar.drawGroup.style.display = readonly ? 'none' : '';
             L.DomUtil[disabled ? 'addClass' : 'removeClass'](a, 'leaflet-disabled');
             a.setAttribute('aria-disabled', disabled ? 'true' : 'false');
-            a.style.setProperty('--gm-target', drawTarget && drawTarget.color || '');
-            a.title = !drawTarget ? 'Choose a filter above the map to draw a circle' :
-                mode === 'draw' ? 'Stop drawing (Esc)' :
-                'Draw a circle for ' + targetName(drawTarget);
+            a.setAttribute('aria-expanded', (drawMenu && !drawMenu.hidden) ? 'true' : 'false');
+            a.title = disabled ? 'The filters are not loaded yet' :
+                mode === 'draw' ? 'Stop drawing (Esc)' : 'Draw a circle for a filter';
             setPressed(a, mode === 'draw');
             setPressed(toolbar.setHome, mode === 'home');
         }
@@ -889,8 +931,9 @@
                 // Only the buttons whose state changes are kept
                 toolbar = {
                     drawGroup: drawGroup,
-                    draw: toolbarButton(drawGroup, 'fa-circle-plus', 'Draw circle', '', toggleDraw, 'gm-btn--draw')
+                    draw: toolbarButton(drawGroup, 'fa-circle-plus', 'Draw circle', '', onDrawButton, 'gm-btn--draw')
                 };
+                L.DomUtil.create('i', 'fa-solid fa-caret-down gm-btn-caret', toolbar.draw).setAttribute('aria-hidden', 'true');
                 toolbarButton(viewGroup, 'fa-expand', 'Fit all', 'Zoom to all regions', function() { fitAll(false); });
                 toolbarButton(viewGroup, 'fa-house', 'Home', 'Go to the home view', goHome);
                 toolbar.setHome = toolbarButton(viewGroup, 'fa-location-dot', 'Set home',
@@ -909,23 +952,152 @@
             }
         });
 
+        /*
+         * Menu of the Draw circle button: every named filter in config order (color, name,
+         * disabled ones dimmed), then New filter…. Picking an entry starts drawing at once.
+         * It opens on a click, Enter or Space, the arrow keys move between the entries, and it
+         * closes on Escape, a press outside it, the focus leaving the map, a pick or a drawing.
+         */
+        function createDrawMenu() {
+            drawMenu = L.DomUtil.create('div', 'gm-draw-menu', map.getContainer());
+            drawMenu.id = 'gm-draw-menu';
+            drawMenu.hidden = true;
+            drawMenu.setAttribute('role', 'menu');
+            drawMenu.setAttribute('aria-label', 'Draw a circle for');
+            toolbar.draw.setAttribute('aria-haspopup', 'menu');
+            toolbar.draw.setAttribute('aria-controls', drawMenu.id);
+            L.DomEvent.on(drawMenu, 'keydown', onDrawMenuKey);
+            L.DomEvent.disableClickPropagation(drawMenu);
+            L.DomEvent.disableScrollPropagation(drawMenu);
+            document.addEventListener('pointerdown', function(e) {
+                if (!drawMenu.hidden && !drawMenu.contains(e.target) && !toolbar.draw.contains(e.target))
+                    closeDrawMenu(false);
+            }, true);
+            window.addEventListener('blur', function() { closeDrawMenu(false); });
+        }
+
+        function drawMenuItems() {
+            return Array.prototype.slice.call(drawMenu.querySelectorAll('[role="menuitem"]'));
+        }
+
         /**
-         * Starts drawing a circle for a filter.
-         * @param {Object} [target] - { sid, name, color, isNew } from startDraw; default drawTarget.
+         * One entry of the draw menu.
+         * @param {string} label - Filter name or "New filter…".
+         * @param {string|null} color - Filter color; null shows a plus.
+         * @param {boolean} disabled - A disabled filter: dimmed and marked.
+         * @param {Function} fn - Runs after the menu has closed.
+         */
+        function drawMenuItem(label, color, disabled, fn) {
+            var b = L.DomUtil.create('button', 'gm-menu-item' + (disabled ? ' gm-menu-item--disabled' : ''), drawMenu), mark;
+            b.type = 'button';
+            b.tabIndex = -1;
+            b.setAttribute('role', 'menuitem');
+            mark = L.DomUtil.create(color ? 'span' : 'i', color ? 'gm-menu-dot' : 'gm-menu-dot fa-solid fa-plus', b);
+            mark.setAttribute('aria-hidden', 'true');
+            if (color) mark.style.background = color;
+            L.DomUtil.create('span', 'gm-menu-name', b).textContent = label;
+            if (disabled) L.DomUtil.create('span', 'gm-menu-note', b).textContent = '(disabled)';
+            onTap(b, function() {
+                closeDrawMenu(false);
+                fn();
+            });
+        }
+
+        // Fills the menu from the filter list and shows it
+        function openDrawMenu() {
+            var named = (filters || []).filter(function(f) { return f.name; });
+
+            drawMenu.textContent = '';
+            L.DomUtil.create('div', 'gm-menu-title', drawMenu).textContent = 'Draw a circle for';
+            drawMenu.firstChild.setAttribute('aria-hidden', 'true');
+            named.forEach(function(f) {
+                drawMenuItem(f.name, f.color || DEFAULT_COLOR, !f.enabled, function() {
+                    startDraw({ sid: f.sid, name: f.name, color: f.color, enabled: f.enabled });
+                });
+            });
+            if (named.length) L.DomUtil.create('div', 'gm-menu-sep', drawMenu).setAttribute('role', 'separator');
+            drawMenuItem('New filter…', null, false, function() {
+                startDraw({ isNew: true, color: DEFAULT_COLOR });
+            });
+            drawMenu.hidden = false;
+            placeDrawMenu();
+            updateToolbar();
+        }
+
+        // A changed filter list while the menu is open: new entries, the focus stays in place
+        function refreshDrawMenu() {
+            var i;
+            if (!drawMenu || drawMenu.hidden) return;
+            i = drawMenuItems().indexOf(document.activeElement);
+            openDrawMenu();
+            if (i > -1) (drawMenuItems()[i] || drawMenuItems()[0]).focus({ preventScroll: true });
+        }
+
+        /**
+         * Hides the menu.
+         * @param {boolean} focusButton - Give the focus back to Draw circle (Escape, Tab).
+         */
+        function closeDrawMenu(focusButton) {
+            if (!drawMenu || drawMenu.hidden) return;
+            drawMenu.hidden = true;
+            updateToolbar();
+            if (focusButton) toolbar.draw.focus({ preventScroll: true });
+        }
+
+        // Right of the Draw circle button, or below it when the map is too narrow; inside the map
+        function placeDrawMenu() {
+            var c, b, w, left, top;
+            // Measured at the left edge, where the width is not cut by the space to the right
+            drawMenu.style.left = drawMenu.style.top = '0px';
+            c = map.getContainer().getBoundingClientRect();
+            b = toolbar.draw.getBoundingClientRect();
+            w = drawMenu.offsetWidth;
+            left = b.right - c.left + 6;
+            top = b.top - c.top;
+            if (left + w > c.width - 8) {
+                left = b.left - c.left;
+                top = b.bottom - c.top + 6;
+            }
+            drawMenu.style.left = Math.max(8, Math.min(left, c.width - w - 8)) + 'px';
+            drawMenu.style.top = top + 'px';
+            drawMenu.style.maxHeight = Math.max(100, c.height - top - 8) + 'px';
+        }
+
+        function onDrawMenuKey(e) {
+            var items = drawMenuItems(), i = items.indexOf(document.activeElement), next;
+            if (e.key === 'ArrowDown') next = items[(i + 1) % items.length];
+            else if (e.key === 'ArrowUp') next = items[i > 0 ? i - 1 : items.length - 1];
+            else if (e.key === 'Home') next = items[0];
+            else if (e.key === 'End') next = items[items.length - 1];
+            else if (e.key === 'Tab') return closeDrawMenu(true);  // Tab goes on from the button
+            else if (e.key !== 'Escape') return;
+            // Not on to the map, whose keyboard handler pans with the arrow keys
+            L.DomEvent.stop(e);
+            if (next) next.focus();
+            else closeDrawMenu(true);
+        }
+
+        // Draw circle opens the menu; while a circle is drawn, it stops the drawing
+        function onDrawButton() {
+            if (mode === 'draw') return cancelDraw();
+            if (!drawMenu.hidden) return closeDrawMenu(false);
+            if (blockedByEdit()) return;
+            openDrawMenu();
+            drawMenuItems()[0].focus({ preventScroll: true });
+        }
+
+        /**
+         * Starts drawing a circle (draw menu).
+         * @param {Object} target - { sid, name, color, enabled } of a filter, or { isNew: true, color }.
          */
         function startDraw(target) {
-            if (readonly) return;
-            if (target) selectFilter(target);
-            if (!drawTarget) {
-                showToast('Choose a filter above the map first.');
-                return;
-            }
+            if (readonly || !target) return;
             if (blockedByEdit()) return;
             if (mode === 'home') stopSetHome();
             if (drawHandler) return;
 
-            var color = drawTarget.color || DEFAULT_COLOR;
-            drawingFor = drawTarget;
+            var color = target.color || DEFAULT_COLOR;
+            drawingFor = target;
             drawHandler = new GmDrawCircle(map, {
                 shapeOptions: { color: color, fillColor: color, weight: 2, opacity: 1, dashArray: '6,6', fillOpacity: 0.12 },
                 showRadius: true
@@ -941,15 +1113,8 @@
             if (drawHandler) drawHandler.disable();
         }
 
-        function toggleDraw() {
-            if (mode === 'draw') {
-                cancelDraw();
-            } else {
-                startDraw();
-            }
-        }
-
         function onDrawStart() {
+            closeDrawMenu(false);
             mode = 'draw';
             showModeBar('Drawing a circle for ' + targetName(drawingFor) + ': click and drag · Esc cancels',
                 [['Cancel', cancelDraw]], drawingFor.color);
@@ -971,18 +1136,6 @@
             holdLegend(false);
             updateToolbar();
             post('drawState', { drawing: false });
-        }
-
-        /**
-         * Sets the filter Draw circle draws for. A different filter ends a running drawing.
-         * @param {Object|null} target - { sid, name, color, enabled, isNew } or null.
-         */
-        function selectFilter(target) {
-            var next = target && (target.sid || target.isNew) ? target : null;
-            var same = next && drawTarget && next.sid === drawTarget.sid && !!next.isNew === !!drawTarget.isNew;
-            drawTarget = next;
-            if (!same) cancelDraw();
-            updateToolbar();
         }
 
         function toggleSetHome() {
@@ -1074,17 +1227,66 @@
         }
 
         /**
-         * A click on a circle selects it for editing. Not while drawing (the click may end the
-         * drawing) or setting home (the click goes on to the map), not without write access,
-         * and not for a circle that waits for the parent.
+         * Circles on the map that contain a point and can be selected (none that waits for the
+         * parent), the smallest first. The clicked circle counts even when the distance misses
+         * its drawn edge by a rounding error.
+         * @param {Object} latlng - The point.
+         * @param {Object} clicked - The circle the click hit.
+         */
+        function circlesAt(latlng, clicked) {
+            var list = [];
+            drawnItems.eachLayer(function(layer) {
+                var gm = layer.gm;
+                if (!gm || gm.pending || gm.deleting) return;
+                if (layer === clicked || map.distance(layer.getLatLng(), latlng) <= layer.getRadius()) list.push(layer);
+            });
+            return list.sort(function(a, b) { return a.getRadius() - b.getRadius(); });
+        }
+
+        /**
+         * A click on a circle selects the smallest circle under the pointer; another click at
+         * the same spot (within 6 px and 2 s) selects the next larger one, after the largest the
+         * smallest again. Not while drawing (the click may end the drawing) or setting home (the
+         * click goes on to the map), and not without write access.
          */
         function onCircleClick(e) {
-            var layer = e.target, gm = layer.gm;
-            if (readonly || mode === 'draw' || mode === 'home' || drawHandler || !gm || gm.pending || gm.deleting)
-                return;
+            var now = Date.now(), list, pick, i;
+            if (readonly || mode === 'draw' || mode === 'home' || drawHandler) return;
+            list = circlesAt(e.latlng, e.target);
+            if (!list.length) return;
             L.DomEvent.stopPropagation(e);  // no map click, which would end the selection
-            if (Date.now() - drawEndedAt < 400) return;
-            selectCircle(layer);
+            if (now - drawEndedAt < 400) return;
+            pick = list[0];
+            if (lastPick && now - lastPick.time < 2000 && e.containerPoint.distanceTo(lastPick.point) <= 6) {
+                i = list.indexOf(lastPick.layer);
+                if (i > -1) pick = list[(i + 1) % list.length];
+            }
+            lastPick = { point: e.containerPoint, time: now, layer: pick };
+            selectCircle(pick);
+        }
+
+        // Two clicks that cycle through overlapping circles must not zoom the map in
+        function onCircleDblClick(e) {
+            if (!readonly && mode !== 'draw' && mode !== 'home' && !drawHandler) L.DomEvent.stopPropagation(e);
+        }
+
+        /*
+         * Stacking order of the circles: disabled filters at the back, larger circles behind
+         * smaller ones, the selected circle in front. Paths move only when the order changes;
+         * a moved path loses the keyboard focus, which it gets back.
+         */
+        function sortCircles() {
+            var list = [], focused = document.activeElement, i;
+            var rank = function(layer) { return layer.gm.selected ? 2 : (layer.gm.enabled || layer.gm.pending) ? 1 : 0; };
+
+            drawnItems.eachLayer(function(layer) { if (layer.gm && layer.getElement()) list.push(layer); });
+            list.sort(function(a, b) { return (rank(a) - rank(b)) || (b.getRadius() - a.getRadius()); });
+            for (i = 1; i < list.length; i++)
+                if (list[i - 1].getElement().compareDocumentPosition(list[i].getElement()) & Node.DOCUMENT_POSITION_PRECEDING) break;
+            if (i >= list.length) return;
+
+            list.forEach(function(layer) { layer.bringToFront(); });
+            if (focused && focused !== document.activeElement && focused.focus) focused.focus({ preventScroll: true });
         }
 
         /**
@@ -1117,7 +1319,7 @@
             gm.selected = true;
             // The handles and the dot in the selection bar take the filter color from the container
             map.getContainer().style.setProperty('--gm-handle-color', color);
-            layer.bringToFront();
+            sortCircles();
             // Per circle: L.Edit.Circle hangs on every L.Circle. Without the edit toolbar,
             // options.editing and options.original are unset, so the circle keeps its style
             layer.editing.enable();
@@ -1178,6 +1380,7 @@
                 reportEdit(layer);
             }
             applyState(layer);
+            sortCircles();
             mode = null;
             hideModeBar();
             hideSelectionBar();
@@ -1375,6 +1578,8 @@
                     drawnItems.removeLayer(layer);
                 }
             });
+            // Shown circles come back on top of the others
+            if (visible) sortCircles();
             renderLegendFilters();
         }
 
@@ -1419,7 +1624,7 @@
             filters.forEach(function(f) {
                 var li = L.DomUtil.create('li', 'gm-legend-filter', ul),
                     n = counts[f.sid] || 0, hidden = !!hiddenSids[f.sid], name = f.name || f.sid,
-                    color = f.color || DEFAULT_COLOR, dot, text, meta, chip, eye, fit;
+                    color = f.color || DEFAULT_COLOR, dot, text, meta, eye, fit;
 
                 if (hidden) L.DomUtil.addClass(li, 'gm-legend-filter--hidden');
                 dot = L.DomUtil.create('span', 'gm-legend-dot' + (f.enabled ? '' : ' gm-legend-dot--disabled'), li);
@@ -1430,11 +1635,6 @@
                 meta = L.DomUtil.create('span', 'gm-legend-meta', text);
                 L.DomUtil.create('span', '', meta).textContent =
                     (n === 1 ? '1 circle' : n + ' circles') + (f.enabled ? '' : ' (disabled)');
-                if (f.staged) {
-                    chip = L.DomUtil.create('span', 'gm-chip', meta);
-                    chip.textContent = 'pending';
-                    chip.title = 'Staged: active after Save & Apply, lost on logout or session expiry';
-                }
                 eye = iconButton(li, hidden ? 'fa-eye-slash' : 'fa-eye',
                     (hidden ? 'Show the circles of ' : 'Hide the circles of ') + name, f.sid + ' eye',
                     function() { setFilterVisible(f.sid, hidden); });
@@ -1511,10 +1711,12 @@
                 [
                     ['enabled', 'Enabled filter'],
                     ['disabled', 'Disabled filter: filters nothing'],
-                    ['pending', 'Pending: staged, active after Save & Apply'],
+                    ['unsaved', 'Unsaved', 'Changed in this session: active after Save & Apply, lost on logout'],
                     ['selected', 'Selected for editing']
                 ].forEach(function(s) {
-                    L.DomUtil.create('span', 'gm-legend-ring gm-legend-ring--' + s[0], legendItem(body, s[1]));
+                    var swatch = legendItem(body, s[1]);
+                    L.DomUtil.create('span', 'gm-legend-ring gm-legend-ring--' + s[0], swatch);
+                    if (s[2]) swatch.parentNode.title = s[2];
                 });
 
                 L.DomUtil.create('h3', '', body).textContent = 'Connections';
@@ -1579,8 +1781,9 @@
             updateMinZoom();
             map.addLayer(markerClusters);
 
-            // Map toolbar: Draw circle, Fit all, Home, Set home
+            // Map toolbar: Draw circle (with its menu), Fit all, Home, Set home
             new GmToolbar().addTo(map);
+            createDrawMenu();
             updateToolbar();
 
             modeBar = L.DomUtil.create('div', 'gm-mode-bar', map.getContainer());
@@ -1591,6 +1794,7 @@
             // The bar wraps on narrow maps
             map.on('resize', layoutBars);
             map.on('resize', onMapResize);
+            map.on('resize', function() { if (!drawMenu.hidden) placeDrawMenu(); });
             // Any input on the map keeps its view from now on: no more start view fitting
             ['pointerdown', 'mousedown', 'touchstart', 'wheel', 'keydown'].forEach(function(type) {
                 map.getContainer().addEventListener(type, function() { refitUntil = 0; }, { capture: true, passive: true });
@@ -1598,10 +1802,12 @@
 
             createSelectionBar();
 
-            // Escape ends drawing, Set home, the delete question and the editing of a circle; registered once
+            // Escape closes the draw menu, ends drawing, Set home, the delete question and the
+            // editing of a circle; registered once
             L.DomEvent.on(document, 'keydown', function(e) {
                 if (e.key !== 'Escape') return;
-                if (mode === 'draw') cancelDraw();
+                if (!drawMenu.hidden) closeDrawMenu(true);
+                else if (mode === 'draw') cancelDraw();
                 else if (mode === 'home') stopSetHome();
                 else if (selection && selection.armed) renderDeleteButton(false);
                 else if (mode === 'edit') endSelection(false);
@@ -1671,9 +1877,10 @@
         }
 
         /**
-         * Sets style, classes and label of a circle from its layer.gm state: enabled, disabled
-         * (dashed, pale, desaturated), pending (staged; dashed with a chip), new (waits for the
-         * parent), deleting, selected (thicker, shadow) and hover (one pixel thicker).
+         * Sets style, classes and label of a circle from its layer.gm state: enabled; disabled
+         * (faded: thin, pale, desaturated); unsaved, i.e. its filter has staged changes (dashed,
+         * also when disabled); new (waits for the parent); deleting; selected (thicker, shadow)
+         * and hover (one pixel thicker).
          * @param {Object} layer - The circle layer.
          */
         function applyState(layer) {
@@ -1684,12 +1891,11 @@
                 style = { weight: 3, opacity: 1, fillOpacity: 0.1, dashArray: '6,6' };
             } else if (gm.deleting) {
                 style = { weight: 2, opacity: 0.5, fillOpacity: 0.04, dashArray: '2,6' };
-            } else if (!gm.enabled) {
-                style = { weight: 2, opacity: 0.8, fillOpacity: 0.06, dashArray: '4,8' };
             } else {
-                style = { weight: 3, opacity: 1, fillOpacity: 0.22, dashArray: gm.staged ? '10,6' : null };
+                style = gm.enabled ? { weight: 3, opacity: 1, fillOpacity: 0.22 } : { weight: 1.5, opacity: 0.45, fillOpacity: 0.05 };
+                style.dashArray = gm.staged ? '10,6' : null;
             }
-            if (gm.selected) L.extend(style, { weight: 4, opacity: 1, fillOpacity: 0.15, dashArray: '8,6' });
+            if (gm.selected) L.extend(style, { weight: 4, opacity: 1, fillOpacity: 0.15 });
             else if (gm.hover) style.weight += 1;
             style.color = style.fillColor = color;
 
@@ -1711,36 +1917,32 @@
             set('gm-circle', true);
             set('gm-circle--new', !!gm.pending);
             set('gm-circle--disabled', !gm.pending && !gm.enabled);
-            set('gm-circle--pending', !gm.pending && !!gm.staged);
+            set('gm-circle--unsaved', !gm.pending && !!gm.staged);
             set('gm-circle--deleting', !!gm.deleting);
             set('gm-circle--selected', !!gm.selected);
         }
 
         /**
-         * Permanent label in the centre: "BF6 · 683 km", "(disabled)", a chip for pending,
-         * new and deleting circles. The label element is built once and changed in place.
+         * Permanent label in the centre: the filter name only, dimmed for a disabled filter. The
+         * legend explains the circle states; the selection bar and the pill show the radius.
+         * The label element is built once and changed in place.
          * @param {Object} layer - The circle layer.
          */
         function updateLabel(layer) {
-            var gm = layer.gm, lb = gm.label, text, chip, changed;
+            var gm = layer.gm, lb = gm.label, text, changed;
 
             if (!lb) {
                 lb = gm.label = { box: document.createElement('span') };
                 lb.box.className = 'gm-label-box';
-                lb.text = L.DomUtil.create('span', '', lb.box);
-                lb.chip = L.DomUtil.create('span', 'gm-chip', lb.box);
                 layer.bindTooltip(lb.box, { permanent: true, direction: 'center', className: 'gm-label', opacity: 1 });
             }
 
-            text = (gm.pending ? (gm.name || 'New circle') : (gm.name || gm.sid)) + ' · ' + formatDistance(layer.getRadius()) +
-                (!gm.pending && !gm.enabled ? ' (disabled)' : '');
-            chip = gm.deleting ? 'deleting' : gm.pending ? 'new' : gm.staged ? 'pending' : '';
-            changed = lb.text.textContent !== text || lb.chip.textContent !== chip;
+            text = gm.pending ? (gm.name || 'New filter') : (gm.name || gm.sid);
+            changed = lb.box.textContent !== text;
 
             lb.box.style.borderLeftColor = gm.color || DEFAULT_COLOR;
-            lb.text.textContent = text;
-            lb.chip.textContent = chip;
-            lb.chip.hidden = !chip;
+            lb.box.textContent = text;
+            L.DomUtil[!gm.pending && !gm.enabled ? 'addClass' : 'removeClass'](lb.box, 'gm-label-box--disabled');
             showLabel(layer, changed);
         }
 
@@ -1780,7 +1982,7 @@
             layer.gm = gm;
             circles[gm.token] = layer;
             // Before bindTooltip: the label is sized before the tooltip opens on 'add'
-            layer.on({ click: onCircleClick, mouseover: onCircleHover, mouseout: onCircleHover, add: onCircleAdd });
+            layer.on({ click: onCircleClick, dblclick: onCircleDblClick, mouseover: onCircleHover, mouseout: onCircleHover, add: onCircleAdd });
             applyState(layer);
         }
 
@@ -1832,6 +2034,11 @@
             });
             renderLegendFilters();
 
+            sortCircles();
+            // Draw circle waits for the filter list
+            refreshDrawMenu();
+            updateToolbar();
+
             // Start view: all regions, or the home view without any. The iframe may have changed
             // its size since the map measured it, and may still do so while the page settles
             if (!viewFitted) {
@@ -1868,7 +2075,10 @@
                 map.getContainer().style.setProperty('--gm-handle-color', selection.layer.gm.color || DEFAULT_COLOR);
                 selBar.name.textContent = filterLabel(selection.layer.gm);
             }
+            // An enabled or disabled filter moves its circles in the stacking order
+            sortCircles();
             renderLegendFilters();
+            refreshDrawMenu();
         }
 
         function forget(token) {
@@ -1902,6 +2112,7 @@
                 pending: true
             });
             drawnItems.addLayer(layer);
+            sortCircles();
             // sid null: a new filter, the parent asks for its name
             post('regionDrawn', { token: layer.gm.token, region: layer.gm.region, sid: target.isNew ? null : (target.sid || null) });
         }
@@ -1974,6 +2185,7 @@
                         layer.setLatLng([c.lat, c.lng]);
                         layer.setRadius(c.radius);
                         applyState(layer);
+                        sortCircles();
                     }
                 }
             }
@@ -1986,7 +2198,7 @@
          * map -> parent:
          *   mapReady          -
          *   drawState         { drawing }                      a drawing started or ended
-         *   regionDrawn       { token, region, sid }           sid null: for a new filter
+         *   regionDrawn       { token, region, sid }           sid null: "New filter…" in the draw menu
          *   regionEdited      { token, sid, oldRegion, region }
          *   regionDeleted     { token, sid, oldRegion }
          *   regionInvalid     { sid, region }
@@ -1994,10 +2206,8 @@
          * parent -> map:
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
-         *   selectFilter      { sid, name, color, enabled, isNew } or null: what Draw circle draws for
-         *   startDraw         like selectFilter, then draw     ("Draw circle" above the map)
-         *   cancelDraw        -
-         *   filterChanged     { sid, name, color, enabled }    e.g. after "Enable filter"
+         *   cancelDraw        -                                Escape outside the map
+         *   filterChanged     { sid, name, color, enabled }    e.g. after Enable in a toast
          *   regionSaved       { token, sid, name, color, enabled, region }
          *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
          *   toast             { text, action: { label, name, sid } }
@@ -2013,10 +2223,6 @@
                 updateConnections(data || []);
             } else if (type === 'setReadonly') {
                 setReadonly(!data || data.readonly !== false);
-            } else if (type === 'selectFilter') {
-                selectFilter(data || null);
-            } else if (type === 'startDraw') {
-                startDraw(data || null);
             } else if (type === 'cancelDraw') {
                 cancelDraw();
             } else if (type === 'filterChanged' && data && data.sid) {

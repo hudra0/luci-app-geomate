@@ -40,15 +40,11 @@ var FILTER_NAME_RE = /^[\w .-]+$/;
 // Filter colors by section order, readable on the OSM tiles
 var PALETTE = ['#0072B2', '#E69F00', '#CC79A7', '#009E73', '#D55E00', '#56B4E9', '#7F4FBF', '#8C6D31'];
 
-// Key of 'New filter…' in the filter pickers; no UCI section id contains '+'
+// Key of 'New filter…' in the filter select of the new region dialog; no UCI section id contains '+'
 var NEW_FILTER = '+new';
 
-// localStorage key of the filter last chosen above the map: { sid, name } or { isNew: true }
-var PICK_KEY = 'geomate-map-filter';
-
 // Color of the filter at this position among the geo_filter sections; from the ninth filter on
-// the palette repeats. The position alone decides: a new filter's circle is drawn in its color
-// before the filter has a name
+// the palette repeats. The position alone decides, the name does not
 function filterColor(index) {
     return PALETTE[index % PALETTE.length];
 }
@@ -128,13 +124,10 @@ return view.extend({
     status: null,       // last getStatus result, null when it failed
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
-    writable: false,    // the user may change and apply configurations (L.hasViewPermission)
-    applying: false,    // Save & Apply waits for a running region action (handleSaveApply)
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
     nodes: null,        // nodes that the polls update in place
     pollFns: null,      // bound poll functions; poll.add() and poll.remove() match them by identity
-    picker: null,       // ui.Select above the map: the filter that "Draw circle" draws for
     drawing: false,     // the map is drawing a circle (drawState)
     connectionsBusy: null,  // running getGeomateConnections request
     statusBusy: null,       // running status request
@@ -157,8 +150,7 @@ return view.extend({
 
         this.pending = data[1] || {};
         // hasViewPermission() is what the footer uses without a form.Map to disable its buttons
-        this.writable = L.hasViewPermission();
-        this.readonly = !this.writable || !configLoaded;
+        this.readonly = !L.hasViewPermission() || !configLoaded;
         this.nodes = {};
 
         if (!configLoaded)
@@ -174,7 +166,6 @@ return view.extend({
             if (ev.key === 'Escape' && this.drawing)
                 this.sendMessageToMap('cancelDraw');
         }, this));
-        this.renderPicker(this.storedPick());
         this.updateStatus();
         this.startPolls();
 
@@ -203,8 +194,8 @@ return view.extend({
         n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
 
         return E('div', { style: 'display: flex; flex-direction: column;' }, [
-            // Service status, health checks, loading and stale connections in one row;
-            // staged changes: renderActions()
+            // Service status, health checks, loading and stale connections in one row. Staged
+            // changes: LuCI's own Unsaved Changes indicator in the header
             E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
                 E('div', { style: 'display: flex; align-items: center;' }, [ n.indicator, n.state ]),
                 n.health,
@@ -222,77 +213,29 @@ return view.extend({
         ]);
     },
 
-    // Action bar above the map in LuCI button classes, so it follows the theme: filter picker,
-    // Enable filter, Draw circle, Active connections and the staged changes chip. Fit all is in
-    // the map toolbar
+    // Row above the map with the connections toggle, in LuCI button classes so it follows the
+    // theme. Circles are drawn from the map toolbar
     renderActions: function() {
         var n = this.nodes;
 
         var style = E('style', {}, `
-            /* No side margin: the bar and the map below it share the edges of the page content */
+            /* No side margin: the row and the map below it share the edges of the page content */
             .gm-map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px; text-align: left; }
             .gm-map-actions .btn { margin: 0; white-space: nowrap; }
-            .gm-map-actions .gm-picker { display: inline-flex; align-items: center; gap: 6px; }
-            .gm-map-actions .gm-picker select { width: auto; min-width: 12em; max-width: 22em; margin: 0; }
-            .gm-map-actions .gm-spacer { flex: 1 1 0; }
-            .gm-map-actions .gm-pending-chip { border-radius: 999px; }
-            .gm-map-actions .btn[disabled] { cursor: not-allowed; }
         `);
 
-        n.picker = E('span');
-        n.enable = E('button', {
-            'class': 'btn cbi-button cbi-button-positive',
-            'title': _('Enable the chosen filter. The change is staged: it takes effect only after Save & Apply and is lost on logout or session expiry.'),
-            'click': ui.createHandlerFn(this, function() {
-                var t = this.pickTarget();
-                return t && t.sid ? this.enableFilter(t.sid) : null;
-            })
-        }, [ _('Enable filter') ]);
-        n.draw = E('button', {
-            'class': 'btn cbi-button cbi-button-add',
-            'aria-pressed': 'false',
-            'click': L.bind(this.handleDraw, this)
-        }, [ _('Draw circle') ]);
         n.toggle = E('button', {
             'class': 'btn cbi-button cbi-button-neutral',
             'aria-pressed': 'false',
             'title': _('Show or hide the table of active connections below the map'),
             'click': L.bind(this.toggleConnections, this)
         }, [ _('Active connections') ]);
-        n.chip = E('button', {
-            'class': 'btn cbi-button cbi-button-apply gm-pending-chip',
-            'style': 'display: none',
-            'click': ui.createHandlerFn(this, 'handleSaveApply', null, '0')
-        });
-        // Only for users who may change regions
-        n.editTools = E('span', { 'class': 'gm-picker', 'style': this.readonly ? 'display: none' : '' }, [
-            E('label', {}, [ _('Filter') ]), n.picker, n.enable, n.draw
-        ]);
 
-        return E('div', { 'class': 'cbi-section-actions gm-map-actions' }, [
-            style, n.editTools, n.toggle, E('span', { 'class': 'gm-spacer' }), n.chip
-        ]);
+        return E('div', { 'class': 'cbi-section-actions gm-map-actions' }, [ style, n.toggle ]);
     },
 
-    // (Re)build the filter picker, e.g. after a new filter or a changed enabled flag.
-    // value: a section id, NEW_FILTER or '' (nothing chosen)
-    renderPicker: function(value) {
-        var f = this.filterChoices(_('Choose a filter…'));
-
-        if (!f.choices.hasOwnProperty(value) || value === '')
-            value = f.sections.length ? '' : NEW_FILTER;
-
-        this.picker = new ui.Select(value, f.choices, { sort: f.sort });
-
-        var node = this.picker.render();
-        node.querySelector('select').setAttribute('aria-label', _('Filter for new circles'));
-        node.addEventListener('widget-change', L.bind(this.handlePick, this));
-        dom.content(this.nodes.picker, node);
-        this.handlePick();
-    },
-
-    // Choices of a filter select: placeholder (''), every named filter in config order, then
-    // 'New filter…'. Returns { sections, choices, sort } for ui.Select
+    // Choices of the filter select in the new region dialog: placeholder (''), every named
+    // filter in config order, then 'New filter…'. Returns { sections, choices, sort } for ui.Select
     filterChoices: function(placeholder) {
         var sections = uci.sections('geomate', 'geo_filter').filter(function(s) { return s.name; }),
             choices = { '': placeholder };
@@ -307,95 +250,6 @@ return view.extend({
             choices: choices,
             sort: [ '' ].concat(sections.map(function(s) { return s['.name']; }), [ NEW_FILTER ])
         };
-    },
-
-    // The remembered choice as a picker value; a section id only while it still has that name
-    storedPick: function() {
-        var pick = null, byName;
-
-        try { pick = JSON.parse(window.localStorage.getItem(PICK_KEY)); } catch (e) {}
-        if (!pick || typeof pick != 'object')
-            return '';
-        if (pick.isNew)
-            return NEW_FILTER;
-        if (pick.sid && uci.get('geomate', pick.sid, 'name') === pick.name)
-            return pick.sid;
-        byName = uci.sections('geomate', 'geo_filter').find(function(s) { return s.name && s.name === pick.name; });
-        return byName ? byName['.name'] : '';
-    },
-
-    // Filter the next circle goes to: filterInfo() plus isNew, or null when none is chosen
-    pickTarget: function() {
-        var v = this.picker ? this.picker.getValue() : '';
-
-        if (v === NEW_FILTER)
-            return { sid: null, name: '', isNew: true, enabled: true,
-                // The color the new section gets: it is appended after the existing ones
-                color: filterColor(uci.sections('geomate', 'geo_filter').length) };
-        if (!isGeoFilter(v))
-            return null;
-        return Object.assign(this.filterInfo(v), { isNew: false });
-    },
-
-    handlePick: function() {
-        var t = this.pickTarget();
-
-        try {
-            if (t)
-                window.localStorage.setItem(PICK_KEY, JSON.stringify(t.isNew ? { isNew: true } : { sid: t.sid, name: t.name }));
-            else
-                window.localStorage.removeItem(PICK_KEY);
-        } catch (e) {}
-
-        this.sendMessageToMap('selectFilter', t);
-        this.updateActions();
-    },
-
-    // Draw circle starts drawing in the map; while the map draws, the same button cancels
-    handleDraw: function() {
-        var t = this.pickTarget();
-
-        if (this.drawing)
-            return this.sendMessageToMap('cancelDraw');
-        if (!t || this.readonly)
-            return;
-        // Escape reaches the map's own handler only while the map has the keyboard focus;
-        // preventScroll: the 80vh map is often only partly visible, the page must not jump
-        this.nodes.frame.focus({ preventScroll: true });
-        this.sendMessageToMap('startDraw', t);
-    },
-
-    // Enabled state, labels and titles of the action bar
-    updateActions: function() {
-        var n = this.nodes, t = this.pickTarget(), count, others;
-
-        if (!n || !n.draw)
-            return;
-
-        n.editTools.style.display = this.readonly ? 'none' : '';
-        // Only with a region: without one an enabled filter blocks all its traffic in strict mode
-        n.enable.style.display = (t && !t.isNew && !t.enabled && this.regionList(t.sid).length) ? '' : 'none';
-
-        n.draw.disabled = !this.mapReady || (!t && !this.drawing);
-        n.draw.setAttribute('aria-pressed', this.drawing ? 'true' : 'false');
-        n.draw.textContent = this.drawing ? _('Cancel drawing') : _('Draw circle');
-        n.draw.title = this.drawing ? _('Stop drawing (Esc)')
-            : !t ? _('Choose a filter first')
-            : t.isNew ? _('Draw a circle, then name the new filter')
-            : _('Draw a circle for filter %s').format(t.name);
-
-        // Also without write access or a loaded configuration: the count stays true. Applying
-        // needs write access, like the footer's Save & Apply. Polls must not enable the chip
-        // while an apply waits (ui.createHandlerFn disabled it)
-        count = L.toArray((this.pending || {}).geomate).length;
-        others = this.otherStagedConfigs();
-        n.chip.style.display = count ? '' : 'none';
-        n.chip.disabled = !this.writable || this.applying;
-        n.chip.textContent = (count == 1)
-            ? _('1 change pending · Save & Apply')
-            : _('%d changes pending · Save & Apply').format(count);
-        n.chip.title = _('Not active yet. Staged changes take effect only after Save & Apply and are lost on logout or session expiry.') +
-            (others.length ? ' ' + _('Save & Apply also applies the staged changes of %s.').format(others.join(', ')) : '');
     },
 
     // Configurations other than geomate with staged changes in this session. Save & Apply and
@@ -556,9 +410,6 @@ return view.extend({
         n.stale.textContent = !stale ? '' : this.connectionsAt
             ? _('Connections not updated since %s').format(new Date(this.connectionsAt).toLocaleTimeString())
             : _('Connections unavailable');
-
-        // The staged changes chip
-        this.updateActions();
     },
 
     // Polls are added once, after the first render, as bound functions: poll.add() skips only a
@@ -678,13 +529,10 @@ return view.extend({
             this.drawing = false;
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
             this.pushFilters();
-            this.sendMessageToMap('selectFilter', this.pickTarget());
             this.sendMessageToMap('updateConnections', this.connections);
-            this.updateActions();
             break;
         case 'drawState':
             this.drawing = !!d.drawing;
-            this.updateActions();
             break;
         case 'regionDrawn':
             this.enqueue(d.token, function() { return self.addDrawnRegion(d.token, d.region, d.sid); });
@@ -774,9 +622,10 @@ return view.extend({
         });
     },
 
-    // Stage the in-memory changes in the LuCI session and say what that means. The note is a
-    // toast inside the map: a LuCI notification would push the page and the map toolbar down.
-    // toast: { text, action: { name, sid, label } } to replace the default note
+    // Stage the in-memory changes in the LuCI session. LuCI's Unsaved Changes indicator in the
+    // header counts them, the map dashes the circles of the changed filters. toast: { text,
+    // action: { name, sid, label } }, an optional note inside the map (a LuCI notification would
+    // push the page and the map toolbar down)
     stage: function(toast) {
         var self = this;
         return uci.save().then(function() {
@@ -784,20 +633,16 @@ return view.extend({
         }).then(function(changes) {
             if (changes)
                 self.pending = changes;
-            self.updateStatus();
-            // Names and enabled flags may have changed
-            self.renderPicker(self.picker ? self.picker.getValue() : '');
-            self.sendMessageToMap('toast', toast || {
-                text: _('Change staged. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.')
-            });
+            if (toast)
+                self.sendMessageToMap('toast', toast);
         });
     },
 
-    // A circle was drawn in the map for the filter picked above it (sid), or for a new filter
+    // A circle was drawn for a filter chosen in the map's draw menu (sid), or for a new filter
     // (sid null). An existing filter gets the region without a dialog
     addDrawnRegion: function(token, region, sid) {
         if (!isGeoFilter(sid))
-            // A filter that disappeared since it was picked: the dialog's filter list decides
+            // A filter that disappeared since the map got the filter list: the dialog's list decides
             return this.openFilterModal(token, region, sid ? '' : NEW_FILTER);
         if (!validRegion(region))
             return Promise.reject(new Error(_('Invalid circle %s').format(region)));
@@ -805,25 +650,28 @@ return view.extend({
         var name = this.filterName(sid),
             list = this.regionList(sid),
             handWritten = uci.get('geomate', sid, 'allowed_region'),
-            toast;
+            disabled = uci.get('geomate', sid, 'enabled') !== '1',
+            notes = [];
 
         if (list.indexOf(region) < 0)
             list.push(region);
         uci.set('geomate', sid, 'allowed_region', list);
 
-        // Drawing never enables a filter; a disabled one gets a one-click offer
-        toast = (uci.get('geomate', sid, 'enabled') === '1')
-            ? { text: _('Region added to filter %s. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.').format(name) }
-            : { text: _('Region added to filter %s, which is disabled: the region filters nothing until the filter is enabled. Staged changes take effect only after Save & Apply and are lost on logout or session expiry.').format(name),
-                action: { name: 'enableFilter', sid: sid, label: _('Enable filter') } };
+        // Drawing never enables a filter; a disabled one gets a one-click offer. An enabled filter
+        // needs no note: the dashed circle and LuCI's Unsaved Changes show the change
+        if (disabled)
+            notes.push(_('Filter %s is disabled, so the new circle has no effect yet.').format(name));
         // The dialog path says this before saving; here the region is already staged
         if (typeof handWritten == 'string')
-            toast.text += ' ' + _('It replaced the hand-written "option allowed_region" (%s).').format(handWritten);
+            notes.push(_('The circle replaced the hand-written "option allowed_region" (%s).').format(handWritten));
 
-        return this.stage(toast).then(this.ackRegion.bind(this, token, sid, region));
+        return this.stage(!notes.length ? null : {
+            text: notes.join(' '),
+            action: disabled ? { name: 'enableFilter', sid: sid, label: _('Enable') } : null
+        }).then(this.ackRegion.bind(this, token, sid, region));
     },
 
-    // Stage enabled=1 for a filter, from the action bar or the toast after drawing
+    // Stage enabled=1 for a filter, from the toast after drawing
     enableFilter: function(sid) {
         var self = this;
 
@@ -837,9 +685,7 @@ return view.extend({
                 });
 
             uci.set('geomate', sid, 'enabled', '1');
-            return self.stage({
-                text: _('Filter %s enabled. It takes effect only after Save & Apply; staged changes are lost on logout or session expiry.').format(self.filterName(sid))
-            }).then(function() {
+            return self.stage().then(function() {
                 self.sendMessageToMap('filterChanged', self.filterInfo(sid));
             });
         });
@@ -898,7 +744,7 @@ return view.extend({
                 if (self.regionList(sid).length !== list.length)
                     return self.rejectRegion(token, sid, _('Could not delete the circle of filter %s. Reload the page.').format(self.filterName(sid)));
                 self.sendMessageToMap('regionRemoved', { token: token });
-                // The legend and the draw target show the filter as disabled now
+                // The legend and the draw menu show the filter as disabled now
                 if (choice == 'disable')
                     self.sendMessageToMap('filterChanged', self.filterInfo(sid));
             });
@@ -1209,10 +1055,6 @@ return view.extend({
                 ui.hideModal();
                 resolve(Promise.resolve().then(function() {
                     return self.saveRegion(token, region, name, sec, values, initial);
-                }).then(function(savedSid) {
-                    // 'New filter…' above the map moves on to the filter the region went to
-                    if (self.picker && self.picker.getValue() === NEW_FILTER)
-                        self.renderPicker(savedSid);
                 }));
             };
 
@@ -1272,21 +1114,13 @@ return view.extend({
                 sid = found['.name'];
             }
             self.ackRegion(token, sid, region);
-            return sid;
         });
     },
 
     // Region actions stage at once; apply what the session has staged after the running one
     handleSaveApply: function(ev, mode) {
-        var self = this;
-
-        this.applying = true;
-        this.updateActions();
         return Promise.resolve(this.busy).then(function() {
             ui.changes.apply(mode == '0');
-        }).finally(function() {
-            self.applying = false;
-            self.updateActions();
         });
     },
 
