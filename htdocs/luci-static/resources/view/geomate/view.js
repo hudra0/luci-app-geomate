@@ -1028,13 +1028,22 @@ return view.extend({
             if (changes)
                 self.pending = changes;
 
-            if (!L.toArray((self.pending || {}).geomate).length) {
+            var pending = self.pending || {},
+                others = Object.keys(pending).filter(function(config) {
+                    return config != 'geomate' && L.toArray(pending[config]).length;
+                });
+
+            if (!L.toArray(pending.geomate).length) {
                 ui.addNotification(null, E('p', {}, [ _('Geomate has no unsaved changes.') ]), 'info');
                 return;
             }
 
-            ui.showModal(_('Unsaved changes'), [
-                E('p', {}, [ _('Discard all unsaved changes and reload the page?') ]),
+            // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
+            var body = [ E('p', {}, [ _('Discard all unsaved changes and reload the page?') ]) ];
+            if (others.length)
+                body.push(E('p', {}, [ _('This also discards the unsaved changes of %s.').format(others.join(', ')) ]));
+
+            ui.showModal(_('Unsaved changes'), body.concat([
                 E('div', { 'class': 'right' }, [
                     E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
                     E('button', { 'class': 'btn cbi-button-negative', 'click': ui.createHandlerFn(self, function() {
@@ -1042,7 +1051,7 @@ return view.extend({
                         ui.changes.revert();
                     }) }, [ _('Reset') ])
                 ])
-            ]);
+            ]));
         });
     },
 
