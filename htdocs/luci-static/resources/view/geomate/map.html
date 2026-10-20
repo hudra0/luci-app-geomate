@@ -706,15 +706,20 @@
         }
 
         /**
-         * Lowest zoom: 2, where the world is 1024 px wide. A map narrower than 640 px shows less
-         * than 225 degrees of longitude there, too little for Fit all with regions in America and
-         * Europe (fitBounds stops at the lowest zoom): it may go to 1.
+         * Lowest zoom: the smallest at which the world covers the whole map, never below 1.
+         * maxBounds keeps the map on one world copy, so a smaller world leaves grey bands beside
+         * it. The world is a square of 256 px at zoom 0 and doubles with every level (1024 px at
+         * zoom 2, 2048 px at zoom 3). The height counts too: a map higher than wide (fullscreen
+         * on an upright phone, a portrait monitor) would show bands above and below the world.
+         * fitBounds stops at the lowest zoom; a map at least as wide as high still shows more
+         * than half of the world's longitude there.
          * The marker cluster group builds its zoom levels from the map's lowest zoom when it is
          * first added and keeps them; below that level it shows its empty top cluster as a "0"
          * icon. So the group is rebuilt with its markers whenever the lowest zoom changes.
          */
         function updateMinZoom() {
-            var z = map.getSize().x < 640 ? 1 : 2, onMap = map.hasLayer(markerClusters), markers;
+            var size = map.getSize(), onMap = map.hasLayer(markerClusters), markers,
+                z = Math.max(1, Math.ceil(Math.log2(Math.max(size.x, size.y) / 256)));
             if (map.getMinZoom() === z) return;
             // At once, so that setMinZoom() starts no zoom animation the group would miss
             if (map.getZoom() < z) map.setZoom(z, { animate: false });

@@ -229,7 +229,8 @@ return view.extend({
         var n = this.nodes;
 
         var style = E('style', {}, `
-            .gm-map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px 8px; text-align: left; }
+            /* No side margin: the bar and the map below it share the edges of the page content */
+            .gm-map-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px; text-align: left; }
             .gm-map-actions .btn { margin: 0; white-space: nowrap; }
             .gm-map-actions .gm-picker { display: inline-flex; align-items: center; gap: 6px; }
             .gm-map-actions .gm-picker select { width: auto; min-width: 12em; max-width: 22em; margin: 0; }
