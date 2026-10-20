@@ -605,7 +605,11 @@ return view.extend({
         });
     },
 
+    // uci.save() resolves even when the session refused a change or the section is gone (deleted
+    // in another tab), then reloads the configuration: confirm only a region that it holds
     ackRegion: function(token, sid, region) {
+        if (this.regionList(sid).indexOf(region) < 0)
+            return this.rejectRegion(token, sid, _('Could not save the circle of filter %s. Reload the page.').format(this.filterName(sid)));
         this.sendMessageToMap('regionSaved', Object.assign(this.filterInfo(sid), { token: token, region: region }));
     },
 
@@ -650,6 +654,9 @@ return view.extend({
                 uci.set('geomate', sid, 'enabled', '0');
 
             return self.stage().then(function() {
+                // As in ackRegion: the reloaded list must have lost the circle
+                if (self.regionList(sid).length !== list.length)
+                    return self.rejectRegion(token, sid, _('Could not delete the circle of filter %s. Reload the page.').format(self.filterName(sid)));
                 self.sendMessageToMap('regionRemoved', { token: token });
             });
         });
