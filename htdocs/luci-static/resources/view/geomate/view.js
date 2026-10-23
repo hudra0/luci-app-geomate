@@ -232,7 +232,7 @@ var CONNECTIONS_INTERVAL = 5,
     CONNECTIONS_STALE_AFTER = 3;
 
 // check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
-// IP. The browser keeps the last result ({ stdout, code, at, ui }) and shows it again on page load
+// IP. The browser keeps the last result ({ stdout, stderr, code, at, ui }) and shows it again on page load
 // and in the hourly poll: a success for VERSION_INTERVAL, a failure for VERSION_RETRY seconds
 var VERSION_CACHE_KEY = 'geomate-version-check',
     VERSION_RETRY = 600;
@@ -253,7 +253,8 @@ function versionFields(text) {
  * Versions and update state from a check_version result. The output has a 'Backend versions:'
  * block before 'Frontend versions:'; when GitHub fails it stops after the backend's channel and
  * current version. The frontend version then comes from this file (stamped by the updater).
- * @param {object} entry - { stdout, code } of check_version.
+ * The errors, 'HTTP error 403' among them, are on stderr.
+ * @param {object} entry - { stdout, stderr, code } of check_version.
  * @returns {object} { backend, frontend, state: 'current'|'update'|'failed', update: 'both'|'backend'|'frontend'|null, limited }
  */
 function versionState(entry) {
@@ -274,7 +275,7 @@ function versionState(entry) {
         frontend: f,
         update: (newer(b) && newer(f)) ? 'both' : newer(b) ? 'backend' : newer(f) ? 'frontend' : null,
         state: (newer(b) || newer(f)) ? 'update' : (entry.code === 0 || (b.latest && f.latest)) ? 'current' : 'failed',
-        limited: /HTTP error 403|rate limit/i.test(out)
+        limited: /HTTP error 403|rate limit/i.test(out + '\n' + (entry.stderr || ''))
     };
 }
 
@@ -314,7 +315,8 @@ return view.extend({
     status: null,       // last getStatus result, null when it failed
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
-    problems: [],       // problems shown in the status row: 'service' and check keys (updateStatus)
+    problems: [],       // problems of the last status poll: 'process' and check keys (updateStatus)
+    confirmed: [],      // problems seen on two polls in a row; a new one opens the details
     versionInfo: null,  // last versionState() result, null before the first check
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
@@ -432,8 +434,8 @@ return view.extend({
             #geomate-status .gm-primary { color: var(--gm-primary); }
             #geomate-status .gm-arrow { display: inline-block; transition: transform 0.15s; }
             #geomate-status[open] .gm-arrow { transform: rotate(180deg); }
-            /* The warning colors of Bootstrap and Material are too light for text on white: icons
-               and dots carry the state colors, the text keeps the theme's color */
+            /* The warning colors of Bootstrap and Material are too light for text on white: warning
+               icons and dots carry the color, the text keeps the theme's color. Errors are text */
             #geomate-status .gm-icon--ok { color: var(--gm-success); }
             #geomate-status .gm-icon--warning { color: var(--gm-warning); }
             #geomate-status .gm-icon--error { color: var(--gm-danger); }
@@ -465,6 +467,8 @@ return view.extend({
         n.detailService = E('span');
         n.detailMode = E('span');
         n.detailChecks = E('div', { 'class': 'gm-contents' });
+        n.checkRows = {};   // { icon, text, cells } per check key (updateStatus)
+        n.checkKeys = null; // keys of the rows in detailChecks
         n.detailBackend = E('span');
         n.detailFrontend = E('span');
         n.detailUpdate = E('span');
@@ -729,16 +733,18 @@ return view.extend({
             n.connections.scrollIntoView({ behavior: 'smooth' });
     },
 
-    // Show the last status and health check in the status row. A new problem (service not
-    // running, a check with an error or warning) opens the details once; they never close on
-    // their own
-    updateStatus: function() {
+    // Show the last status and health check in the status row; polled: with a new status reply.
+    // A problem (service stopped although enabled, a check with an error or warning) seen on two
+    // polls in a row opens the details once, so a restart or one failed reply does not; they
+    // never close on their own
+    updateStatus: function(polled) {
         var n = this.nodes,
             st = this.status,
             checks = this.health && this.health.checks,
             running = !!(st && st.running),
             pid = running && st.pid,
-            problems = (st && !running) ? [ 'service' ] : [];
+            loading = !!(st ? st.loading : (this.health && this.health.loading)),
+            problems = (st && !running && st.config_enabled !== false) ? [ 'process' ] : [];
 
         if (!n)
             return;
@@ -749,7 +755,7 @@ return view.extend({
         n.state.className = 'gm-status ' + (st ? (running ? 'gm-status--running' : 'gm-status--stopped') : 'gm-status--neutral gm-muted');
         n.state.title = pid ? _('PID %d').format(pid) : '';
         n.detailService.textContent = pid ? _('Running (PID %d)').format(pid) : state;
-        n.loading.hidden = !(st ? st.loading : (this.health && this.health.loading));
+        n.loading.hidden = !loading;
 
         // Operational mode of the committed configuration, the one the service runs with
         var modes = {
@@ -774,26 +780,39 @@ return view.extend({
             [ 'nft_errors', _('nft errors') ]
         ].filter(function(c) { return checks[c[0]]; }).map(function(c) {
             var status = CHECK_ICONS[checks[c[0]].status] ? checks[c[0]].status : 'ok';
-            return { key: c[0], label: c[1], status: status, message: String(checks[c[0]].message || '') };
+            return { key: c[0], label: c[1], status: status, message: ' ' + String(checks[c[0]].message || '') };
         });
         var failing = function(status) {
             return shown.filter(function(c) { return c.status == status; });
         };
         var errors = failing('error'), warnings = failing('warning'),
-            worst = errors.length ? 'error' : warnings.length ? 'warning' : null,
-            bad = errors.length ? errors : warnings;
+            labels = (errors.length ? errors : warnings).map(function(c) { return c.label; }).join(', ');
 
-        n.health.title = shown.map(function(c) { return c.label + ': ' + c.message; }).join('\n');
-        dom.content(n.health, !shown.length ? null : worst ? [
-            E('span', { 'class': 'gm-icon--' + worst }, [ CHECK_ICONS[worst] ]),
-            ' ' + bad.map(function(c) { return c.label; }).join(', ')
-        ] : E('span', { 'class': 'gm-muted' }, [ CHECK_ICONS.ok + ' ' + _('All checks passed') ]));
-        dom.content(n.detailChecks, shown.reduce(function(cells, c) {
-            return cells.concat([
-                E('span', { 'class': 'gm-muted' }, [ c.label ]),
-                E('span', {}, [ E('span', { 'class': 'gm-icon--' + c.status }, [ CHECK_ICONS[c.status] ]), ' ' + c.message ])
-            ]);
-        }, []));
+        n.health.title = shown.map(function(c) { return c.label + ':' + c.message; }).join('\n');
+        dom.content(n.health, !shown.length ? null
+            : errors.length ? E('span', { 'class': 'gm-icon--error' }, [ CHECK_ICONS.error + ' ' + labels ])
+            : warnings.length ? [ E('span', { 'class': 'gm-icon--warning' }, [ CHECK_ICONS.warning ]), ' ' + labels ]
+            : E('span', { 'class': 'gm-muted' }, [ CHECK_ICONS.ok + ' ' + _('All checks passed') ]));
+
+        // The check rows change in place, so a selected message stays selected
+        shown.forEach(function(c) {
+            var r = n.checkRows[c.key];
+
+            if (!r) {
+                r = n.checkRows[c.key] = { icon: E('span'), text: document.createTextNode('') };
+                r.cells = [ E('span', { 'class': 'gm-muted' }, [ c.label ]), E('span', {}, [ r.icon, r.text ]) ];
+            }
+            r.icon.className = 'gm-icon--' + c.status;
+            if (r.icon.textContent !== CHECK_ICONS[c.status])
+                r.icon.textContent = CHECK_ICONS[c.status];
+            if (r.text.data !== c.message)
+                r.text.data = c.message;
+        });
+        var keys = shown.map(function(c) { return c.key; }).join(' ');
+        if (keys !== n.checkKeys) {
+            n.checkKeys = keys;
+            dom.content(n.detailChecks, shown.reduce(function(cells, c) { return cells.concat(n.checkRows[c.key].cells); }, []));
+        }
         problems = problems.concat(errors.concat(warnings).map(function(c) { return c.key; }));
 
         // A single failed request keeps the last list silently; a lasting failure becomes visible
@@ -803,9 +822,15 @@ return view.extend({
             ? _('Connections not updated since %s').format(new Date(this.connectionsAt).toLocaleTimeString())
             : _('Connections unavailable');
 
-        if (problems.some(function(p) { return this.problems.indexOf(p) < 0; }, this))
+        // A failed reply tells nothing, and the service builds its table while it loads
+        if (!polled || !st || !checks || loading)
+            return;
+        var last = this.problems,
+            confirmed = problems.filter(function(p) { return last.indexOf(p) >= 0; });
+        if (confirmed.some(function(p) { return this.confirmed.indexOf(p) < 0; }, this))
             n.statusRow.open = true;
         this.problems = problems;
+        this.confirmed = confirmed;
     },
 
     // Show the versions and the update state of versionInfo; before the first result the
@@ -909,7 +934,7 @@ return view.extend({
                 self.status = r[0];
                 self.health = r[1];
                 self.statusLoaded = true;
-                self.updateStatus();
+                self.updateStatus(true);
             }).finally(function() {
                 self.statusBusy = null;
             });
@@ -1905,15 +1930,20 @@ return view.extend({
         this.versionBusy = new Promise(function(resolve) {
             window.setTimeout(resolve, 500);
         }).then(function() {
-            return fs.exec('/etc/init.d/geomate', ['check_version']);
+            // -i: past the backend's own 10-minute cache of the GitHub answer as well
+            return fs.exec('/etc/init.d/geomate', (force === true) ? [ 'check_version', '-i' ] : [ 'check_version' ]);
         }).then(function(result) {
-            var entry = { stdout: result.stdout || '', code: result.code, at: Date.now(), ui: UI_VERSION };
+            var entry = { stdout: result.stdout || '', stderr: result.stderr || '', code: result.code, at: Date.now(), ui: UI_VERSION };
 
             storeVersionCheck(entry);
             self.versionInfo = versionState(entry);
         }).catch(function(error) {
-            // The command did not run (e.g. no permission): nothing to cache
-            self.versionInfo = Object.assign(versionState({}), { state: 'failed', error: errorText(error) });
+            // No answer: a timeout means GitHub was slow, anything else that the command did
+            // not run (e.g. no permission). Nothing to cache; known versions stay
+            var known = self.versionInfo || versionState({}),
+                timeout = (error && error.name == 'TimeoutError') || /timed out/i.test(errorText(error));
+
+            self.versionInfo = Object.assign({}, known, { state: 'failed', update: null, limited: false, error: timeout ? null : errorText(error) });
         }).finally(function() {
             self.versionBusy = null;
             self.showVersions();
