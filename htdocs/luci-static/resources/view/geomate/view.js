@@ -432,8 +432,9 @@ return view.extend({
             #geomate-status .gm-spacer { flex: 1 1 0; }
             #geomate-status .gm-muted, #geomate-status .gm-icon--info { opacity: 0.65; }
             #geomate-status .gm-primary { color: var(--gm-primary); }
-            #geomate-status .gm-arrow { display: inline-block; transition: transform 0.15s; }
-            #geomate-status[open] .gm-arrow { transform: rotate(180deg); }
+            /* Arrow of a summary toggle: here and in the connections header */
+            .gm-arrow { display: inline-block; transition: transform 0.15s; }
+            details[open] > summary .gm-arrow { transform: rotate(180deg); }
             /* The warning colors of Bootstrap and Material are too light for text on white: warning
                icons and dots carry the color, the text keeps the theme's color. Errors are text */
             #geomate-status .gm-icon--ok { color: var(--gm-success); }
@@ -672,20 +673,22 @@ return view.extend({
         this.sendMessageToMap('fullscreen', { on: on });
     },
 
-    // Section below the map: a header "Active connections (n)" with a Show/Hide button, and the
-    // table, collapsed until shown
+    // Section below the map: a <details> whose summary is the "Active connections (n)" heading
+    // with a Show/Hide label, and the table, collapsed until shown
     renderConnections: function() {
         var n = this.nodes;
 
         var style = E('style', {}, `
             /* No side margin, whatever the theme gives a section: the same edges as the map */
             #active-connections-container { margin: 12px 0 0; }
-            #active-connections-container .gm-connections-head { display: flex; flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 8px; }
-            /* A theme may give h3 width: 100%, which pushed the button to a second row */
-            #active-connections-container .gm-connections-head h3 { flex: 1 1 0; min-width: 0; width: auto; margin: 0; }
-            #active-connections-container .gm-connections-head .btn { flex: none; margin: 0; }
+            #active-connections-container > summary { display: block; list-style: none; cursor: pointer; }
+            #active-connections-container > summary::-webkit-details-marker { display: none; }
+            /* The heading keeps the theme's look; a theme may give h3 width: 100% */
+            #active-connections-container h3 { display: flex; align-items: center; gap: 8px; min-width: 0; width: auto; margin: 0; }
+            #active-connections-container .gm-connections-title { flex: 1 1 auto; min-width: 0; }
+            /* Themes that uppercase headings leave the label as it is */
+            #active-connections-container .gm-connections-toggle { flex: none; font-size: 13px; font-weight: normal; opacity: 0.7; white-space: nowrap; text-transform: none; letter-spacing: normal; }
             #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
-            #active-connections-container .gm-connections-wrap[hidden] { display: none; }
             #active-connections-container .table { margin: 0; }
             /* Pills and theme colors: renderStatus */
             .gm-status--allowed { --gm-status-color: var(--gm-success); }
@@ -701,33 +704,34 @@ return view.extend({
             E('em', {}, [ _('Loading connections…') ])
         );
 
-        n.connectionsTitle = E('h3', {}, [ _('Active connections') ]);
-        n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ]);
-        n.connectionsWrap.hidden = true;
-        n.toggle = E('button', {
-            'class': 'btn cbi-button cbi-button-neutral',
-            'aria-expanded': 'false',
-            'aria-controls': 'gm-connections-wrap',
-            'click': L.bind(this.toggleConnections, this)
-        }, [ _('Show') ]);
+        // updateActiveConnectionsList() sets the count in the title span
+        n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
+        n.connectionsToggle = E('span', {}, [ _('Show') ]);
 
-        n.connections = E('div', { 'class': 'cbi-section', 'id': 'active-connections-container' }, [
+        n.connections = E('details', {
+            'class': 'cbi-section',
+            'id': 'active-connections-container',
+            'toggle': L.bind(this.toggleConnections, this)
+        }, [
             style,
-            E('div', { 'class': 'gm-connections-head' }, [ n.connectionsTitle, n.toggle ]),
-            n.connectionsWrap
+            E('summary', {}, [
+                E('h3', {}, [
+                    n.connectionsTitle,
+                    E('span', { 'class': 'gm-connections-toggle' }, [ n.connectionsToggle, ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
+                ])
+            ]),
+            E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ])
         ]);
 
         return n.connections;
     },
 
-    // Show or hide the connections table; the map gets smaller while it is shown
+    // After the connections section opened or closed: the map gets smaller while the table is shown
     toggleConnections: function() {
         var n = this.nodes,
-            show = n.connectionsWrap.hidden;
+            show = n.connections.open;
 
-        n.connectionsWrap.hidden = !show;
-        n.toggle.textContent = show ? _('Hide') : _('Show');
-        n.toggle.setAttribute('aria-expanded', show ? 'true' : 'false');
+        n.connectionsToggle.textContent = show ? _('Hide') : _('Show');
         n.frame.classList.toggle('gm-map-frame--short', show);
         if (show)
             n.connections.scrollIntoView({ behavior: 'smooth' });
