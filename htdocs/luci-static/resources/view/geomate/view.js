@@ -114,6 +114,12 @@ function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
 }
 
+// mousedown handler of the <summary> bars: a click toggles the details without focusing the bar,
+// so Chromium draws no focus ring that lingers until the focus moves on
+function noFocus(ev) {
+    ev.preventDefault();
+}
+
 // The message of an error without the stack trace, which L.raise() appends to RPC errors
 function errorText(err) {
     return String((err && err.message) || err).split('\n')[0];
@@ -429,6 +435,9 @@ return view.extend({
             #geomate-status [hidden] { display: none; }
             #geomate-status > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; list-style: none; cursor: pointer; }
             #geomate-status > summary::-webkit-details-marker { display: none; }
+            /* A mouse click leaves no focus ring (see noFocus); the keyboard ring uses the theme color */
+            #geomate-status > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: 2px; }
+            #geomate-status > summary:focus:not(:focus-visible) { outline: none; }
             #geomate-status .gm-spacer { flex: 1 1 0; }
             #geomate-status .gm-muted, #geomate-status .gm-icon--info { opacity: 0.65; }
             #geomate-status .gm-primary { color: var(--gm-primary); }
@@ -479,7 +488,7 @@ return view.extend({
         }, [ _('Check again') ]);
 
         n.statusRow = E('details', { 'id': 'geomate-status' }, [
-            E('summary', {}, [
+            E('summary', { 'mousedown': noFocus }, [
                 n.state, n.mode, n.health, n.loading, n.stale,
                 E('span', { 'class': 'gm-spacer' }),
                 n.version, n.update,
@@ -683,6 +692,8 @@ return view.extend({
             #active-connections-container { margin: 12px 0 0; }
             #active-connections-container > summary { display: block; list-style: none; cursor: pointer; }
             #active-connections-container > summary::-webkit-details-marker { display: none; }
+            #active-connections-container > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: 2px; }
+            #active-connections-container > summary:focus:not(:focus-visible) { outline: none; }
             /* The heading keeps the theme's look; a theme may give h3 width: 100% */
             #active-connections-container h3 { display: flex; align-items: center; gap: 8px; min-width: 0; width: auto; margin: 0; }
             #active-connections-container .gm-connections-title { flex: 1 1 auto; min-width: 0; }
@@ -714,7 +725,7 @@ return view.extend({
             'toggle': L.bind(this.toggleConnections, this)
         }, [
             style,
-            E('summary', {}, [
+            E('summary', { 'mousedown': noFocus }, [
                 E('h3', {}, [
                     n.connectionsTitle,
                     E('span', { 'class': 'gm-connections-toggle' }, [ n.connectionsToggle, ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
