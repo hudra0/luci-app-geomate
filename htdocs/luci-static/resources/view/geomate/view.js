@@ -436,7 +436,7 @@ return view.extend({
             #geomate-status > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; list-style: none; cursor: pointer; }
             #geomate-status > summary::-webkit-details-marker { display: none; }
             /* A mouse click leaves no focus ring (see noFocus); the keyboard ring uses the theme color */
-            #geomate-status > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: 2px; }
+            #geomate-status > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: -2px; }
             #geomate-status > summary:focus:not(:focus-visible) { outline: none; }
             #geomate-status .gm-spacer { flex: 1 1 0; }
             #geomate-status .gm-muted, #geomate-status .gm-icon--info { opacity: 0.65; }
@@ -692,7 +692,7 @@ return view.extend({
             #active-connections-container { margin: 12px 0 0; }
             #active-connections-container > summary { display: block; list-style: none; cursor: pointer; }
             #active-connections-container > summary::-webkit-details-marker { display: none; }
-            #active-connections-container > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: 2px; }
+            #active-connections-container > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: -2px; }
             #active-connections-container > summary:focus:not(:focus-visible) { outline: none; }
             /* The heading keeps the theme's look; a theme may give h3 width: 100% */
             #active-connections-container h3 { display: flex; align-items: center; gap: 8px; min-width: 0; width: auto; margin: 0; }
