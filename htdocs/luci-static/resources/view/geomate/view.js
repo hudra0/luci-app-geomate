@@ -704,7 +704,9 @@ return view.extend({
             /* Themes that uppercase headings leave the label as it is */
             #active-connections-container .gm-connections-toggle { flex: none; font-size: 13px; font-weight: normal; opacity: 0.7; white-space: nowrap; text-transform: none; letter-spacing: normal; }
             #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
-            #active-connections-container .table { margin: 0; }
+            /* Argon and Material set overflow-y: hidden on .table, which would make the table the
+               scroll box of the sticky title cells below and let them scroll away with the rows */
+            #active-connections-container .table { margin: 0; overflow: visible; }
             /* The column titles stay visible while the table scrolls: sticky cells, a sticky row
                is unreliable. Opaque fill in the theme's color: updateStickyHeader() */
             #active-connections-container .table-titles > .th,
