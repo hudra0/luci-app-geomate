@@ -2101,7 +2101,7 @@
          * Sets style, classes and label of a circle from its layer.gm state: enabled; disabled
          * (faded: thin, pale, desaturated); applying, i.e. a change waits for the parent's answer
          * (dashed, also when disabled); new (waits for the parent); deleting; selected (thicker,
-         * shadow) and hover (one pixel thicker).
+         * shadow) and hover (one pixel thicker, the label also on a small circle).
          * @param {Object} layer - The circle layer.
          */
         function applyState(layer) {
@@ -2165,15 +2165,16 @@
         }
 
         /**
-         * Hides the label of a circle that is small on screen (radius below 30 px), selected
-         * (its centre holds the move handle) or not on the map.
+         * Hides the label of a circle that is small on screen (radius below 30 px) unless the
+         * pointer is over it, selected (its centre holds the move handle) or not on the map.
+         * Hover reaches here through applyState(); showing the label centers it again.
          * @param {Object} layer - The circle layer.
          * @param {boolean} [changed] - The text changed: center the label again.
          */
         function showLabel(layer, changed) {
             var lb = layer.gm.label, tooltip = layer.getTooltip(), hide;
             if (!lb) return;
-            hide = !!layer.gm.selected || !layer._map || screenRadius(layer) < 30;
+            hide = !!layer.gm.selected || !layer._map || (screenRadius(layer) < 30 && !layer.gm.hover);
             if (lb.box.hidden === hide && !changed) return;
             lb.box.hidden = hide;
             // The tooltip centers itself by its size, which the text and hiding change
