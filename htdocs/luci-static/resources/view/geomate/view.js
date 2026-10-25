@@ -634,10 +634,14 @@ return view.extend({
     // (Argon fades backgrounds) end before the second look
     watchTheme: function() {
         var self = this, timer = null;
-        var update = function() {
+        var look = function() {
             self.sendTheme(false);
+            self.updateStickyHeader();
+        };
+        var update = function() {
+            look();
             window.clearTimeout(timer);
-            timer = window.setTimeout(function() { self.sendTheme(false); }, 400);
+            timer = window.setTimeout(look, 400);
         };
         var mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
 
@@ -701,6 +705,12 @@ return view.extend({
             #active-connections-container .gm-connections-toggle { flex: none; font-size: 13px; font-weight: normal; opacity: 0.7; white-space: nowrap; text-transform: none; letter-spacing: normal; }
             #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
             #active-connections-container .table { margin: 0; }
+            /* The column titles stay visible while the table scrolls: sticky cells, a sticky row
+               is unreliable. Opaque fill in the theme's color: updateStickyHeader() */
+            #active-connections-container .table-titles > .th,
+            #active-connections-container thead th { position: sticky; top: 0; z-index: 1; }
+            #active-connections-container .gm-sticky-fill .table-titles > .th,
+            #active-connections-container .gm-sticky-fill thead th { background-color: var(--gm-sticky-bg); }
             /* Pills and theme colors: renderStatus */
             .gm-status--allowed { --gm-status-color: var(--gm-success); }
             .gm-status--blocked { --gm-status-color: var(--gm-danger); }
@@ -731,10 +741,33 @@ return view.extend({
                     E('span', { 'class': 'gm-connections-toggle' }, [ n.connectionsToggle, ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
                 ])
             ]),
-            E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ])
+            n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ])
         ]);
 
         return n.connections;
+    },
+
+    // Fill of the sticky column titles: the first opaque background from a title cell up. Argon
+    // paints the cells, Bootstrap the title row, other themes only the section or the page; a
+    // transparent sticky cell would show the scrolled rows through it. Called when the table is
+    // shown and when the theme changes
+    updateStickyHeader: function() {
+        var wrap = this.nodes && this.nodes.connectionsWrap,
+            cell = wrap && wrap.querySelector('.table-titles > .th, thead th'),
+            el, c = null;
+
+        if (!cell || !cell.isConnected)
+            return;
+        // Read the theme's colors, not the last fill
+        wrap.classList.remove('gm-sticky-fill');
+        for (el = cell; el && !c; el = el.parentElement) {
+            c = parseRgb(window.getComputedStyle(el).backgroundColor);
+            if (c && c.a < 1)
+                c = null;
+        }
+        // Without any background the browser paints the page white
+        wrap.style.setProperty('--gm-sticky-bg', c ? rgbString(c) : THEME_FALLBACKS.light.bg);
+        wrap.classList.add('gm-sticky-fill');
     },
 
     // After the connections section opened or closed: the map gets smaller while the table is shown
@@ -744,8 +777,10 @@ return view.extend({
 
         n.connectionsToggle.textContent = show ? _('Hide') : _('Show');
         n.frame.classList.toggle('gm-map-frame--short', show);
-        if (show)
+        if (show) {
+            this.updateStickyHeader();
             n.connections.scrollIntoView({ behavior: 'smooth' });
+        }
     },
 
     // Show the last status and health check in the status row; polled: with a new status reply.
