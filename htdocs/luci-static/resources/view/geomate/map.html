@@ -476,7 +476,6 @@
             background: rgba(87, 96, 106, 0.22);
         }
         .gm-legend-ring--disabled { border-width: 2px; background: rgba(87, 96, 106, 0.05); opacity: 0.5; }
-        .gm-legend-ring--unsaved { border-style: dashed; }
         .gm-legend-ring--selected { border-width: 4px; background: rgba(87, 96, 106, 0.15); box-shadow: 0 0 4px rgba(0, 0, 0, 0.55); }
         .gm-legend-filters { margin: 0; padding: 0; list-style: none; }
         .gm-legend-filter { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
@@ -509,7 +508,7 @@
             .gm-icon-btn { width: 40px; height: 40px; }
         }
 
-        /* Short messages from the parent, e.g. why a change was not staged */
+        /* Short messages from the parent, e.g. Applied with Undo, or why a change was not applied */
         #gm-toast {
             display: none;
             position: fixed;
@@ -587,7 +586,7 @@
          */
         var selection = null;
 
-        // Filters of the last setFilters in config order: { sid, name, color, enabled, staged };
+        // Filters of the last setFilters in config order: { sid, name, color, enabled };
         // null until the parent has sent them
         var filters = null;
         var hiddenSids = {};    // filters whose circles the legend hides
@@ -595,13 +594,13 @@
         /*
          * Region identity lives in layer.gm, never in layer.options: Leaflet.draw's edit toolbar
          * saved and restored layer.options around every edit session.
-         * gm = { token, sid, name, color, enabled, region, stored, inflight, staged, pending,
+         * gm = { token, sid, name, color, enabled, region, stored, inflight, pending,
          *        selected, hover, deleting, label }
          * stored is the string the parent last confirmed for UCI; region is the newest string the
          * map reported, which the next action names. The parent matches regions on the string
-         * alone and answers the actions in the order they were sent; inflight counts the open ones.
-         * staged: the filter has staged changes (stagedSids, or an answer of the parent); pending:
-         * a new circle waits for the parent; deleting: its delete waits for the parent.
+         * alone and answers the actions in the order they were sent, each once it has applied it
+         * (committed); inflight counts the open ones. pending: a new circle waits for the parent;
+         * deleting: its delete waits for the parent.
          */
         var circles = {}; // token -> layer, kept until the parent has answered for it
         var lastPick = null;    // { point, time, layer } of the last click that selected a circle
@@ -713,27 +712,28 @@
         }
 
         /**
-         * Shows a short message on top of the map.
+         * Shows a short message on top of the map, 6 s, or 10 s with buttons.
          * @param {string} text - The message, shown as text.
-         * @param {Object} [action] - { label, name, sid }: a button that sends toastAction { name, sid }.
+         * @param {Array} [actions] - [{ label, name, sid, id }]: buttons that send
+         *   toastAction { name, sid, id }, e.g. Undo after a change was applied.
          */
-        function showToast(text, action) {
-            var el = document.getElementById('gm-toast'), button;
+        function showToast(text, actions) {
+            var el = document.getElementById('gm-toast');
             var hide = function() { el.style.display = 'none'; };
 
             el.textContent = text;
-            if (action) {
-                button = L.DomUtil.create('button', 'gm-toast-action', el);
+            (actions || []).forEach(function(action) {
+                var button = L.DomUtil.create('button', 'gm-toast-action', el);
                 button.type = 'button';
                 button.textContent = action.label;
                 onTap(button, function() {
                     hide();
-                    post('toastAction', { name: action.name, sid: action.sid });
+                    post('toastAction', { name: action.name, sid: action.sid, id: action.id });
                 });
-            }
+            });
             el.style.display = 'block';
             clearTimeout(toastTimer);
-            toastTimer = setTimeout(hide, action ? 15000 : 6000);
+            toastTimer = setTimeout(hide, (actions && actions.length) ? 10000 : 6000);
         }
 
         /**
@@ -851,7 +851,7 @@
 
         /**
          * Shows or hides the drawing tools and circle selection. Without write access the
-         * parent stages nothing, so the map offers no tools.
+         * parent applies nothing, so the map offers no tools.
          * @param {boolean} value - True when the user may not change regions.
          */
         function setReadonly(value) {
@@ -1664,8 +1664,8 @@
 
             actions = L.DomUtil.create('span', 'gm-sel-actions', box);
             barButton(actions, 'Done', 'gm-bar-btn--primary', function() { endSelection(true); },
-                'Keep the change');
-            barButton(actions, 'Cancel', '', function() { endSelection(false); }, 'Undo the change (Esc)');
+                'Apply the change');
+            barButton(actions, 'Cancel', '', function() { endSelection(false); }, 'Discard the change (Esc)');
             selBar.del = L.DomUtil.create('span', 'gm-sel-delete', actions);
 
             L.DomEvent.disableClickPropagation(box);
@@ -1920,7 +1920,6 @@
                 [
                     ['enabled', 'Enabled'],
                     ['disabled', 'Disabled'],
-                    ['unsaved', 'Unsaved'],
                     ['selected', 'Selected']
                 ].forEach(function(s) {
                     var swatch = legendItem(body, s[1]);
@@ -2100,9 +2099,9 @@
 
         /**
          * Sets style, classes and label of a circle from its layer.gm state: enabled; disabled
-         * (faded: thin, pale, desaturated); unsaved, i.e. its filter has staged changes (dashed,
-         * also when disabled); new (waits for the parent); deleting; selected (thicker, shadow)
-         * and hover (one pixel thicker).
+         * (faded: thin, pale, desaturated); applying, i.e. a change waits for the parent's answer
+         * (dashed, also when disabled); new (waits for the parent); deleting; selected (thicker,
+         * shadow) and hover (one pixel thicker).
          * @param {Object} layer - The circle layer.
          */
         function applyState(layer) {
@@ -2115,7 +2114,7 @@
                 style = { weight: 2, opacity: 0.5, fillOpacity: 0.04, dashArray: '2,6' };
             } else {
                 style = gm.enabled ? { weight: 3, opacity: 1, fillOpacity: 0.22 } : { weight: 1.5, opacity: 0.45, fillOpacity: 0.05 };
-                style.dashArray = gm.staged ? '10,6' : null;
+                style.dashArray = (gm.inflight > 0) ? '10,6' : null;
             }
             if (gm.selected) L.extend(style, { weight: 4, opacity: 1, fillOpacity: 0.15 });
             else if (gm.hover) style.weight += 1;
@@ -2209,9 +2208,8 @@
          * Adds a region of a filter to the map, unless the legend hides the filter.
          * @param {Object} filter - { sid, name, color, enabled } from the parent.
          * @param {string} region - The region string from UCI.
-         * @param {boolean} staged - The filter has staged changes.
          */
-        function addRegion(filter, region, staged) {
+        function addRegion(filter, region) {
             var c = parseRegion(region), layer;
             if (!c) {
                 post('regionInvalid', { sid: filter.sid, region: region });
@@ -2226,29 +2224,26 @@
                 enabled: !!filter.enabled,
                 region: region,
                 stored: region,
-                inflight: 0,
-                staged: staged
+                inflight: 0
             });
             if (!hiddenSids[filter.sid]) drawnItems.addLayer(layer);
         }
 
         /**
-         * Replaces all filters and regions with the ones the parent sent.
-         * @param {Object} data - { filters: [{ sid, name, color, enabled, regions }], stagedSids }
+         * Replaces all filters and regions with the ones the parent sent: at the start, and
+         * after Undo or a failed change, when the map shows the configuration again.
+         * @param {Object} data - { filters: [{ sid, name, color, enabled, regions }] }
          */
         function setFilters(data) {
-            var staged = {};
-            (data.stagedSids || []).forEach(function(sid) { staged[sid] = true; });
-
             endSelection(false);
             drawnItems.clearLayers();
             circles = {};
             filters = [];
             (data.filters || []).forEach(function(filter) {
                 if (!filter || !filter.sid) return;
-                filters.push({ sid: filter.sid, name: filter.name, color: filter.color, enabled: !!filter.enabled, staged: !!staged[filter.sid] });
+                filters.push({ sid: filter.sid, name: filter.name, color: filter.color, enabled: !!filter.enabled });
                 (filter.regions || []).forEach(function(region) {
-                    addRegion(filter, region, !!staged[filter.sid]);
+                    addRegion(filter, region);
                 });
             });
             renderLegendFilters();
@@ -2278,7 +2273,7 @@
             var f = filterBySid(sid);
             // A filter the modal has just created
             if (!f && filters && changes.name !== undefined) {
-                f = { sid: sid, name: '', color: undefined, enabled: false, staged: false };
+                f = { sid: sid, name: '', color: undefined, enabled: false };
                 filters.push(f);
             }
             if (f) L.extend(f, changes);
@@ -2378,7 +2373,7 @@
                 } else {
                     // A new circle cannot be selected before this answer, so it is unchanged
                     L.extend(gm, { sid: d.sid, region: d.region, stored: d.region, inflight: 0, pending: false });
-                    updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled, staged: true });
+                    updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled });
                     // The user has just drawn for this filter: show its circles
                     if (hiddenSids[d.sid]) setFilterVisible(d.sid, true);
                 }
@@ -2386,14 +2381,12 @@
                 gm.inflight--;
                 if (type === 'regionRemoved') {
                     forget(d.token);
-                    updateFilter(gm.sid, { staged: true });
                 } else if (type === 'regionSaved') {
                     gm.stored = d.region;
-                    updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled, staged: true });
+                    updateFilter(d.sid, { name: d.name, color: d.color, enabled: !!d.enabled });
                 } else if (gm.deleting) {
                     // regionRejected after a delete: the circle stays
                     gm.deleting = false;
-                    applyState(layer);
                 }
 
                 // With every answer in, the circle shows what UCI holds
@@ -2404,10 +2397,11 @@
                     if (c) {
                         layer.setLatLng([c.lat, c.lng]);
                         layer.setRadius(c.radius);
-                        applyState(layer);
                         sortCircles();
                     }
                 }
+                // No longer dashed once the last answer is in
+                if (circles[d.token]) applyState(layer);
             }
 
             if (type === 'regionRejected' && d.reason) showToast(d.reason);
@@ -2422,19 +2416,19 @@
          *   regionEdited      { token, sid, oldRegion, region }
          *   regionDeleted     { token, sid, oldRegion }
          *   regionInvalid     { sid, region }
-         *   toastAction       { name, sid }                    button in a toast, e.g. enableFilter
+         *   toastAction       { name, sid, id }                button in a toast: undo, enableFilter
          *   fullscreen        { on }                           fullscreen button or Escape asks for it
          * parent -> map:
          *   theme             { dark, bg, fg, border, accent, accentFg, danger, dangerFg, success }
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
-         *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
+         *   setFilters        { filters: [{ sid, name, color, enabled, regions }] }
          *   fitFilter         { sid }                          start view: the circles of this filter, once, before the first setFilters
          *   cancelDraw        -                                Escape outside the map
          *   filterChanged     { sid, name, color, enabled }    e.g. after Enable in a toast
-         *   regionSaved       { token, sid, name, color, enabled, region }
+         *   regionSaved       { token, sid, name, color, enabled, region }   sent once applied
          *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
-         *   toast             { text, action: { label, name, sid } }
+         *   toast             { text, actions: [{ label, name, sid, id }] }
          *   updateConnections [connection]
          */
         window.addEventListener('message', function(event) {
@@ -2457,11 +2451,13 @@
             } else if (type === 'cancelDraw') {
                 cancelDraw();
             } else if (type === 'filterChanged' && data && data.sid) {
-                updateFilter(data.sid, { name: data.name, color: data.color, enabled: !!data.enabled, staged: true });
+                updateFilter(data.sid, { name: data.name, color: data.color, enabled: !!data.enabled });
             } else if (type === 'toast' && data && data.text) {
-                var action = data.action;
-                showToast(String(data.text), (action && action.name && action.label)
-                    ? { label: String(action.label), name: String(action.name), sid: action.sid } : null);
+                showToast(String(data.text), (Array.isArray(data.actions) ? data.actions : []).filter(function(a) {
+                    return a && a.name && a.label;
+                }).map(function(a) {
+                    return { label: String(a.label), name: String(a.name), sid: a.sid, id: a.id };
+                }));
             } else if (/^region(Saved|Removed|Discarded|Rejected)$/.test(type) && data) {
                 onRegionAnswer(type, data);
             }

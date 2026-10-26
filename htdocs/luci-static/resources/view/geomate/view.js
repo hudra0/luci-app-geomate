@@ -28,7 +28,7 @@ function formatVersionDisplay(version) {
 // Region strings as the map writes them: circle:<lat>:<lon>:<radius in meters>
 var REGION_RE = /^circle:-?\d{1,2}(\.\d+)?:-?\d{1,3}(\.\d+)?:[1-9]\d*$/;
 
-// Same bounds as parseRegion in map.html, so the map can load every region the view stages
+// Same bounds as parseRegion in map.html, so the map can load every region the view writes
 function validRegion(region) {
     var p = String(region || '').split(':');
     return REGION_RE.test(region || '') && Math.abs(p[1]) <= 90 && Math.abs(p[2]) <= 180;
@@ -56,6 +56,57 @@ function isGeoFilter(sid) {
 
 function isEmpty(v) {
     return Array.isArray(v) ? v.length == 0 : (v == null || v === '');
+}
+
+// The staged geomate changes of a uci changes result, as JSON ('[]' for none)
+function stagedKey(changes) {
+    return JSON.stringify(L.toArray((changes || {}).geomate));
+}
+
+// Copy of the options of a section, without the '.' fields: what Undo writes back. null for no
+// such section
+function filterOptions(sid) {
+    var s = sid ? uci.get('geomate', sid) : null, copy = {};
+
+    if (!s)
+        return null;
+    Object.keys(s).forEach(function(k) {
+        if (k.charAt(0) != '.')
+            copy[k] = Array.isArray(s[k]) ? s[k].slice() : s[k];
+    });
+    return copy;
+}
+
+// The keys whose values differ between two filterOptions() results
+function changedOptions(a, b) {
+    return Object.keys(Object.assign({}, a, b)).filter(function(k) {
+        return JSON.stringify(a[k]) !== JSON.stringify(b[k]);
+    });
+}
+
+// Only the given keys of a filterOptions() result
+function pick(o, keys) {
+    var copy = {};
+
+    keys.forEach(function(k) { copy[k] = o[k]; });
+    return copy;
+}
+
+// An error whose text the map shows as it is (enqueue)
+function failure(text) {
+    var err = new Error(text);
+    err.plain = true;
+    return err;
+}
+
+// A map action whose filter id names another filter now (movedFilter)
+function filtersChanged() {
+    return failure(_('Not applied: the filters were changed in the meantime.'));
+}
+
+// The Enable button of a map toast (toastAction enableFilter)
+function enableAction(sid) {
+    return { name: 'enableFilter', sid: sid, label: _('Enable') };
 }
 
 // Suggested IP list path for a filter name
@@ -102,6 +153,16 @@ var callUciChanges = rpc.declare({
     object: 'uci',
     method: 'changes',
     expect: { changes: {} },
+    reject: true
+});
+
+// Commits one configuration of this session; the luci-app-geomate ACL grants it for geomate.
+// Unlike ui.changes.apply() it leaves the staged changes of other configurations alone and does
+// not reload the page. rpcd then fires config.change, and procd runs geomate's reload trigger
+var callUciCommit = rpc.declare({
+    object: 'uci',
+    method: 'commit',
+    params: [ 'config' ],
     reject: true
 });
 
@@ -171,11 +232,18 @@ var CONNECTIONS_INTERVAL = 5,
     CONNECTIONS_STALE_AFTER = 3;
 
 return view.extend({
-    // Every region action stages at once: there is nothing left for a Save button to do
+    // Every map change is applied at once (commitGeomate), so the page has no footer
     handleSave: null,
+    handleSaveApply: null,
+    handleReset: null,
 
-    pending: {},        // last staged changes (callUciChanges)
-    busy: null,         // promise chain that serializes region actions
+    knownChanges: '[]', // staged geomate changes at the last check, as JSON (stagedKey)
+    notice: null,       // notification about staged geomate changes (showNotice)
+    undo: null,         // { id, sid, before, after, extra } of the last applied change: Undo in the map toast
+    undoSeq: 0,         // id of the last applied change
+    generation: 0,      // counts the full map updates (pushFilters); older queued circle actions are dropped
+    sidNames: {},       // filter name per section id as the map knows it (pushFilters, ackRegion)
+    busy: null,         // promise chain that serializes map actions
     reported: {},       // region problems already shown, so a new map iframe does not repeat them
     connections: [],    // last getGeomateConnections result
     connectionsAt: null,    // time of the last getGeomateConnections reply
@@ -207,12 +275,12 @@ return view.extend({
         ]);
     },
 
-    // Plain nodes, no form.Map: the footer buttons and the polls never render the map iframe again
+    // Plain nodes, no form.Map: the polls never render the map iframe again
     render: function(data) {
         var configLoaded = data[0] != null;
 
-        this.pending = data[1] || {};
-        // hasViewPermission() is what the footer uses without a form.Map to disable its buttons
+        this.knownChanges = stagedKey(data[1]);
+        // hasViewPermission() is what LuCI's footer uses without a form.Map
         this.readonly = !L.hasViewPermission() || !configLoaded;
         this.nodes = {};
         this.focusSid = this.takeFocusHash();
@@ -221,6 +289,10 @@ return view.extend({
             ui.addNotification(null, E('p', {}, [
                 _('Could not load the geomate configuration. Reload the page.')
             ]), 'error');
+
+        // Staged geomate changes, e.g. from the Geo Filters page: map changes wait for them
+        if (!this.readonly && this.knownChanges !== '[]')
+            this.showNotice();
 
         var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
 
@@ -279,8 +351,7 @@ return view.extend({
         n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
 
         return E('div', { style: 'display: flex; flex-direction: column;' }, [
-            // Service status, health checks, loading and stale connections in one row. Staged
-            // changes: LuCI's own Unsaved Changes indicator in the header
+            // Service status, health checks, loading and stale connections in one row
             E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
                 E('div', { style: 'display: flex; align-items: center;' }, [ n.indicator, n.state ]),
                 n.health,
@@ -714,7 +785,7 @@ return view.extend({
 
         var self = this, type = ev.data.type, d = ev.data.data || {};
 
-        // Without write access nothing is staged; the map has no drawing tools then anyway
+        // Without write access nothing is applied; the map has no drawing tools then anyway
         if (this.readonly && type == 'toastAction')
             return;
         if (this.readonly && /^region(Drawn|Edited|Deleted)$/.test(type))
@@ -742,17 +813,19 @@ return view.extend({
             this.setFullscreen(d.on);
             break;
         case 'regionDrawn':
-            this.enqueue(d.token, function() { return self.addDrawnRegion(d.token, d.region, d.sid); });
+            this.enqueue(d.token, d.sid, function() { return self.addDrawnRegion(d.token, d.region, d.sid); });
             break;
         case 'toastAction':
             if (d.name == 'enableFilter')
                 this.enableFilter(d.sid);
+            else if (d.name == 'undo')
+                this.undoChange(d.id);
             break;
         case 'regionEdited':
-            this.enqueue(d.token, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
+            this.enqueue(d.token, d.sid, function() { return self.replaceRegion(d.token, d.sid, d.oldRegion, d.region); });
             break;
         case 'regionDeleted':
-            this.enqueue(d.token, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
+            this.enqueue(d.token, d.sid, function() { return self.removeRegion(d.token, d.sid, d.oldRegion); });
             break;
         case 'regionInvalid':
             this.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
@@ -761,19 +834,244 @@ return view.extend({
         }
     },
 
-    // Run region actions one after another: uci.save() reloads the configuration, so a second
-    // action must not read it in between. A failed action hands its region back to the map.
-    enqueue: function(token, fn) {
-        var self = this;
-        this.busy = Promise.resolve(this.busy).then(fn).catch(function(err) {
-            var reason = _('Change failed: %s. Reload the page.').format(errorText(err));
-            ui.addNotification(null, E('p', {}, [ reason ]), 'error');
-            self.sendMessageToMap('regionRejected', { token: token, reason: reason });
-            // A failed uci.save() keeps its changes in memory; drop them so a later save does not stage them
-            uci.unload('geomate');
-            return L.resolveDefault(uci.load('geomate'));
+    // Run map actions one after another, each on the configuration as committed now (another
+    // tab may have applied changes since): uci.save() reloads it, so a second action must not
+    // read it in between. checkStaged() may stop an action before it changes anything; its
+    // circle then goes back (token), or onRefuse(reason) answers. An action with a circle queued
+    // before the map got all filters again (pushFilters) is dropped: the map no longer has its
+    // circle. So is an action whose filter id sid names another filter now than at the click
+    // (movedFilter; a resync queued before may have renamed the id in sidNames since). A failed
+    // action shows the error, and the map shows the configuration again (resync)
+    enqueue: function(token, sid, fn, onRefuse) {
+        var self = this, generation = this.generation, known = this.sidNames[sid];
+
+        this.busy = Promise.resolve(this.busy).then(function() {
+            if (self.readonly)
+                return token && self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+            if (token && generation !== self.generation)
+                return self.sendMessageToMap('toast', { text: _('Not applied: the map was reloaded.') });
+            return self.checkStaged().then(function(ok) {
+                var reason = (ok === null) ? _('Could not check for unsaved changes.')
+                    : _('Apply or revert the unsaved geomate changes first.');
+
+                if (!ok) {
+                    if (token)
+                        return self.sendMessageToMap('regionRejected', { token: token, reason: reason });
+                    return onRefuse ? onRefuse(reason) : self.sendMessageToMap('toast', { text: reason });
+                }
+                return self.loadConfig().then(function() {
+                    if (self.movedFilter(sid, known))
+                        throw filtersChanged();
+                    return fn();
+                });
+            });
+        }).catch(function(err) {
+            return self.resync((err && err.plain) ? err.message
+                : _('Could not apply the change: %s').format(errorText(err)), token);
         });
         return this.busy;
+    },
+
+    // Drop the in-memory configuration and load it as the session holds it now: at the start of
+    // each map action, again after a dialog, which may have stayed open while another tab
+    // applied changes, and in resync
+    loadConfig: function() {
+        uci.unload('geomate');
+        return uci.load('geomate');
+    },
+
+    // The section id sid names another filter than known, the name the map had for it: geo_filter
+    // sections are anonymous, so deleting one (e.g. in another tab) shifts the ids of all filters
+    // after it. An id that is gone does not count: the actions handle a deleted filter themselves.
+    // Filters are told apart by name only, so two filters of the same name pass as one
+    movedFilter: function(sid, known) {
+        return isGeoFilter(sid) && known !== (uci.get('geomate', sid, 'name') || '');
+    },
+
+    // The one call that makes map changes active: commit the geomate configuration of this
+    // session. procd's reload trigger then reloads geomate (an older backend restarts it).
+    // The page also works when this resolves without committing anything
+    commitGeomate: function() {
+        return callUciCommit('geomate');
+    },
+
+    // Save the in-memory changes in the session, check the reloaded configuration (verify
+    // throws when it lacks the change), then commit. checkStaged() runs again first: a dialog
+    // may have stayed open while geomate changes were staged elsewhere
+    applyChange: function(verify) {
+        var self = this;
+
+        return this.checkStaged().then(function(ok) {
+            if (ok === null)
+                throw failure(_('Could not check for unsaved changes.'));
+            if (!ok)
+                throw failure(_('Apply or revert the unsaved geomate changes first.'));
+            return uci.save();
+        }).then(function() {
+            if (verify)
+                verify();
+            return self.commitGeomate();
+        }).then(function() {
+            return self.refreshChanges();
+        });
+    },
+
+    // Resolves false while the session holds staged geomate changes, e.g. from the Geo Filters
+    // page: a commit would apply them too, unseen. The notice offers LuCI's changes dialog.
+    // null: the check failed, which must not count as "nothing staged"
+    checkStaged: function() {
+        var self = this;
+
+        return L.resolveDefault(callUciChanges(), null).then(function(changes) {
+            if (!changes)
+                return null;
+            self.knownChanges = stagedKey(changes);
+            if (self.knownChanges !== '[]') {
+                self.showNotice();
+                return false;
+            }
+            self.hideNotice();
+            return true;
+        });
+    },
+
+    // Fetch the staged changes after a commit: LuCI's header indicator counted them at the last
+    // uci.save(). The notice shows while geomate has any left
+    refreshChanges: function() {
+        var self = this;
+
+        return L.resolveDefault(callUciChanges(), null).then(function(changes) {
+            if (!changes)
+                return;
+            self.knownChanges = stagedKey(changes);
+            ui.changes.renderChangeIndicator(changes);
+            if (self.knownChanges === '[]')
+                self.hideNotice();
+            else
+                self.showNotice();
+        });
+    },
+
+    // One notification about staged geomate changes, with a button to LuCI's changes dialog
+    showNotice: function() {
+        var n = this.notice;
+
+        if (n && n.parentNode && !n.classList.contains('fade-out'))
+            return;
+        this.notice = ui.addNotification(null, [
+            E('p', {}, [ _('Apply or revert the unsaved geomate changes before you change the map.') ]),
+            E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'showChanges') }, [ _('Show changes') ])
+        ], 'info');
+    },
+
+    hideNotice: function() {
+        var n = this.notice;
+
+        if (n && n.parentNode)
+            n.parentNode.removeChild(n);
+        this.notice = null;
+    },
+
+    // LuCI's dialog of the staged changes (Unsaved Changes in the header), with fresh content
+    showChanges: function() {
+        return L.resolveDefault(callUciChanges(), null).then(function(changes) {
+            if (changes)
+                ui.changes.renderChangeIndicator(changes);
+            ui.changes.displayChanges();
+        });
+    },
+
+    // After a failed change: drop the in-memory changes, load the configuration as the session
+    // holds it and show it on the map, with the error. A change that was saved but not
+    // committed stays staged, and the notice shows. Without a configuration the map keeps its
+    // circles and loses its tools, so nothing is applied on top of a missing one
+    resync: function(reason, token) {
+        var self = this;
+
+        return L.resolveDefault(this.loadConfig(), null).then(function(loaded) {
+            if (!loaded) {
+                self.readonly = true;
+                self.sendMessageToMap('setReadonly', { readonly: true });
+                if (token)
+                    self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+                return self.sendMessageToMap('toast', { text: reason + ' ' + _('Reload the page.') });
+            }
+            return self.refreshChanges().then(function() {
+                self.pushFilters();
+                self.sendMessageToMap('toast', { text: reason });
+            });
+        });
+    },
+
+    /**
+     * 'Applied.' in the map with Undo, which restores the options the change set. Only the last
+     * change can be undone. Call it after applyChange(): after is the reloaded filter.
+     * @param {string} sid - The filter section.
+     * @param {Object|null} before - Its options before the change (filterOptions); null: the
+     *   change created the filter, Undo deletes it.
+     * @param {string} [text] - Another text.
+     * @param {Array} [extra] - Toast buttons before Undo: [{ name, sid, label }].
+     */
+    showApplied: function(sid, before, text, extra) {
+        this.undo = { id: ++this.undoSeq, sid: sid, before: before, after: filterOptions(sid), extra: extra || [] };
+        this.sendToast(text || _('Applied.'), this.undo);
+    },
+
+    // A map toast with the buttons of the applied change u (its extra buttons and Undo) while it
+    // is the last change. action: a button the toast gets in any case. A refused toast button
+    // (checkStaged) shows its toast again this way, so Enable and Undo both stay available
+    sendToast: function(text, u, action) {
+        var actions = (u && u === this.undo) ? u.extra.concat([ { name: 'undo', id: u.id, label: _('Undo') } ]) : [];
+
+        if (action && !actions.some(function(a) { return a.name === action.name && a.sid === action.sid; }))
+            actions.unshift(action);
+        this.sendMessageToMap('toast', { text: text, actions: actions });
+    },
+
+    // Undo in the map toast: write back the options the change set, apply that, show all
+    // filters again. Not when they have changed since, e.g. in another tab. A refusal by
+    // checkStaged() offers the toast's buttons again
+    undoChange: function(id) {
+        var self = this, u = this.undo;
+
+        if (!u || u.id !== id)
+            return;
+
+        return this.enqueue(null, u.sid, function() {
+            var now = filterOptions(u.sid),
+                name = (u.before && u.before.name) || (u.after && u.after.name) || u.sid,
+                keys = u.before ? changedOptions(u.after || {}, u.before) : null;
+
+            // A change queued before the click has been applied since: Undo would revert it too
+            if (self.undoSeq !== u.id)
+                return self.sendMessageToMap('toast', { text: _('Only the last change can be undone.') });
+            // Clicked twice: undone already
+            if (self.undo !== u)
+                return;
+            self.undo = null;
+            if (!now || !u.after)
+                throw failure(_('Filter %s not found.').format(name));
+            if (keys ? changedOptions(pick(now, keys), pick(u.after, keys)).length : changedOptions(now, u.after).length)
+                return self.sendMessageToMap('toast', { text: _('Not undone: filter %s has changed since.').format(name) });
+
+            if (!u.before)
+                uci.remove('geomate', u.sid);
+            else
+                keys.forEach(function(k) {
+                    uci.set('geomate', u.sid, k, (u.before[k] != null) ? u.before[k] : null);
+                });
+
+            return self.applyChange(function() {
+                var after = filterOptions(u.sid);
+                if (u.before ? (!after || changedOptions(pick(after, keys), pick(u.before, keys)).length) : after)
+                    throw failure(_('Could not undo the change of filter %s.').format(name));
+            }).then(function() {
+                self.pushFilters();
+                self.sendMessageToMap('toast', { text: _('Undone.') });
+            });
+        }, function(reason) {
+            self.sendToast(reason, u);
+        });
     },
 
     filterName: function(sid) {
@@ -810,38 +1108,21 @@ return view.extend({
         return Array.isArray(v) ? v.slice() : [];
     },
 
-    // Send every filter to the map, also disabled ones; done once per mapReady
+    // Send every filter to the map, also disabled ones: at mapReady, after Undo and after a
+    // failed change. The map drops its circles, so circle actions queued before are dropped too
     pushFilters: function() {
-        var self = this, staged = {};
+        var self = this;
 
-        L.toArray((this.pending || {}).geomate).forEach(function(change) {
-            staged[change[1]] = true;
-        });
-
+        this.generation++;
+        this.sidNames = {};
         this.sendMessageToMap('setFilters', {
             filters: uci.sections('geomate', 'geo_filter').map(function(s) {
+                self.sidNames[s['.name']] = s.name || '';
                 if (typeof s.allowed_region == 'string')
                     self.warnOnce(s['.name'] + ' option', _('Filter %s has "option allowed_region %s", which the map cannot show and the service start skips. A circle drawn for this filter replaces it.')
                         .format(s.name || s['.name'], s.allowed_region));
                 return Object.assign(self.filterInfo(s['.name']), { regions: self.regionList(s['.name']) });
-            }),
-            stagedSids: Object.keys(staged)
-        });
-    },
-
-    // Stage the in-memory changes in the LuCI session. LuCI's Unsaved Changes indicator in the
-    // header counts them, the map dashes the circles of the changed filters. toast: { text,
-    // action: { name, sid, label } }, an optional note inside the map (a LuCI notification would
-    // push the page and the map toolbar down)
-    stage: function(toast) {
-        var self = this;
-        return uci.save().then(function() {
-            return L.resolveDefault(callUciChanges(), null);
-        }).then(function(changes) {
-            if (changes)
-                self.pending = changes;
-            if (toast)
-                self.sendMessageToMap('toast', toast);
+            })
         });
     },
 
@@ -854,29 +1135,34 @@ return view.extend({
         if (!validRegion(region))
             return Promise.reject(new Error(_('Invalid circle %s').format(region)));
 
-        var name = this.filterName(sid),
+        var self = this,
+            name = this.filterName(sid),
             list = this.regionList(sid),
+            before = filterOptions(sid),
             disabled = uci.get('geomate', sid, 'enabled') !== '1';
 
         if (list.indexOf(region) < 0)
             list.push(region);
         uci.set('geomate', sid, 'allowed_region', list);
 
-        // Drawing never enables a filter; a disabled one gets a one-click offer. An enabled filter
-        // needs no note: the dashed circle and LuCI's Unsaved Changes show the change. A circle
-        // drawn for a filter with a hand-written 'option allowed_region' replaces it, which the
-        // warning at page load has announced
-        return this.stage(!disabled ? null : {
-            text: _('Filter %s is disabled.').format(name),
-            action: { name: 'enableFilter', sid: sid, label: _('Enable') }
-        }).then(this.ackRegion.bind(this, token, sid, region));
+        // Drawing never enables a filter; a disabled one gets a one-click offer next to Undo.
+        // A circle drawn for a filter with a hand-written 'option allowed_region' replaces it,
+        // which the warning at page load has announced
+        return this.applyChange(this.checkRegion.bind(this, sid, region)).then(function() {
+            self.ackRegion(token, sid, region);
+            if (disabled)
+                self.showApplied(sid, before, _('Applied. Filter %s is disabled.').format(name), [ enableAction(sid) ]);
+            else
+                self.showApplied(sid, before);
+        });
     },
 
-    // Stage enabled=1 for a filter, from the toast after drawing
+    // Apply enabled=1 for a filter, from the toast after drawing. A refusal by checkStaged()
+    // offers Enable again, and Undo while the toast's change is the last one
     enableFilter: function(sid) {
-        var self = this;
+        var self = this, u = this.undo;
 
-        return this.enqueue(null, function() {
+        return this.enqueue(null, sid, function() {
             if (!isGeoFilter(sid) || uci.get('geomate', sid, 'enabled') === '1')
                 return;
             // A filter without a region blocks all its traffic in strict mode: the Geo Filters page decides that
@@ -885,19 +1171,37 @@ return view.extend({
                     text: _('Draw a circle for filter %s before enabling it.').format(self.filterName(sid))
                 });
 
+            var before = filterOptions(sid);
             uci.set('geomate', sid, 'enabled', '1');
-            return self.stage().then(function() {
+            return self.applyChange(function() {
+                if (uci.get('geomate', sid, 'enabled') !== '1')
+                    throw failure(_('Could not enable filter %s.').format(self.filterName(sid)));
+            }).then(function() {
                 self.sendMessageToMap('filterChanged', self.filterInfo(sid));
+                self.showApplied(sid, before);
             });
+        }, function(reason) {
+            self.sendToast(reason, u, enableAction(sid));
         });
     },
 
     // uci.save() resolves even when the session refused a change or the section is gone (deleted
-    // in another tab), then reloads the configuration: confirm only a region that it holds
-    ackRegion: function(token, sid, region) {
+    // in another tab), then reloads the configuration: commit only when it holds the region
+    checkRegion: function(sid, region) {
         if (this.regionList(sid).indexOf(region) < 0)
-            return this.rejectRegion(token, sid, _('Could not save the circle of filter %s. Reload the page.').format(this.filterName(sid)));
-        this.sendMessageToMap('regionSaved', Object.assign(this.filterInfo(sid), { token: token, region: region }));
+            throw failure(_('Could not save the circle of filter %s.').format(this.filterName(sid)));
+    },
+
+    // Confirm an applied circle to the map, which learns a new filter's id this way. A dialog
+    // picks from the configuration as loaded now: when the map knows that id under another
+    // name (ids shifted), it gets all filters again instead of relabelling the stale entry
+    ackRegion: function(token, sid, region) {
+        var info = this.filterInfo(sid), known = this.sidNames[sid];
+
+        this.sidNames[sid] = info.name;
+        this.sendMessageToMap('regionSaved', Object.assign(info, { token: token, region: region }));
+        if (known !== undefined && known !== info.name)
+            this.pushFilters();
     },
 
     rejectRegion: function(token, sid, reason) {
@@ -908,8 +1212,10 @@ return view.extend({
 
     // A circle was moved or resized: replace the stored string it was loaded with
     replaceRegion: function(token, sid, oldRegion, region) {
-        var list = this.regionList(sid),
-            index = list.indexOf(oldRegion);
+        var self = this,
+            list = this.regionList(sid),
+            index = list.indexOf(oldRegion),
+            before = filterOptions(sid);
 
         if (!validRegion(region))
             return this.rejectRegion(token, sid, _('Invalid circle %s').format(region));
@@ -918,54 +1224,81 @@ return view.extend({
 
         list[index] = region;
         uci.set('geomate', sid, 'allowed_region', list);
-        return this.stage().then(this.ackRegion.bind(this, token, sid, region));
+        return this.applyChange(this.checkRegion.bind(this, sid, region)).then(function() {
+            self.ackRegion(token, sid, region);
+            self.showApplied(sid, before);
+        });
     },
 
-    // A circle was deleted; the last one of a filter needs a decision about the filter
+    // A circle was deleted; the last one of a filter needs a decision about the filter. After
+    // that dialog the configuration is loaded again, and the list and Undo's copy come from it
     removeRegion: function(token, sid, oldRegion) {
         var self = this,
             list = this.regionList(sid),
-            index = list.indexOf(oldRegion);
+            effect = (list.length > 1) ? null : this.lastRegionEffect(sid);
 
-        if (index < 0)
+        if (list.indexOf(oldRegion) < 0)
             return this.rejectRegion(token, sid);
 
-        list.splice(index, 1);
-
-        return (list.length ? Promise.resolve('keep') : this.confirmLastRegion(sid)).then(function(choice) {
+        return ((list.length > 1) ? Promise.resolve('keep') : this.confirmLastRegion(sid).then(function(choice) {
+            return choice && self.loadConfig().then(function() { return choice; });
+        })).then(function(choice) {
             if (!choice)
                 return self.sendMessageToMap('regionRejected', { token: token, reason: '' });
+            if (self.movedFilter(sid, self.sidNames[sid]))
+                throw filtersChanged();
+
+            var before = filterOptions(sid), index, text = null;
+
+            list = self.regionList(sid);
+            index = list.indexOf(oldRegion);
+            if (index < 0)
+                return self.rejectRegion(token, sid);
+            list.splice(index, 1);
+            // A circle added in the meantime: no longer the last one, the filter stays as it is
+            if (list.length && choice == 'disable')
+                text = _('Applied. Filter %s has another circle now and stays enabled.').format(self.filterName(sid));
+            if (list.length)
+                choice = 'keep';
+            // The dialog showed another effect, e.g. the filter was enabled in the meantime
+            else if (choice == 'keep' && self.lastRegionEffect(sid) !== effect)
+                throw filtersChanged();
 
             uci.set('geomate', sid, 'allowed_region', list.length ? list : null);
             if (choice == 'disable')
                 uci.set('geomate', sid, 'enabled', '0');
 
-            return self.stage().then(function() {
-                // As in ackRegion: the reloaded list must have lost the circle
+            return self.applyChange(function() {
+                // As in checkRegion: the reloaded list must have lost the circle
                 if (self.regionList(sid).length !== list.length)
-                    return self.rejectRegion(token, sid, _('Could not delete the circle of filter %s. Reload the page.').format(self.filterName(sid)));
+                    throw failure(_('Could not delete the circle of filter %s.').format(self.filterName(sid)));
+            }).then(function() {
                 self.sendMessageToMap('regionRemoved', { token: token });
                 // The legend and the draw menu show the filter as disabled now
                 if (choice == 'disable')
                     self.sendMessageToMap('filterChanged', self.filterInfo(sid));
+                self.showApplied(sid, before, text);
             });
         });
+    },
+
+    // What deleting the last circle of a filter means while it stays as it is, with %s for its name
+    lastRegionEffect: function(sid) {
+        var monitor = (uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor',
+            strict = uci.get('geomate', 'global', 'strict_mode') === '1';
+
+        if (uci.get('geomate', sid, 'enabled') !== '1')
+            return _('Filter %s is disabled and will have no circles.');
+        if (strict && !monitor)
+            return _('Strict mode is on, so filter %s will block every server except its allowed IPs.');
+        return _('Without circles, filter %s blocks no servers.');
     },
 
     // Resolves with 'disable', 'keep' or null (cancelled)
     confirmLastRegion: function(sid) {
         var name = this.filterName(sid),
             enabled = uci.get('geomate', sid, 'enabled') === '1',
-            monitor = (uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor',
-            strict = uci.get('geomate', 'global', 'strict_mode') === '1',
-            effect;
-
-        if (!enabled)
-            effect = _('Filter %s is disabled and will have no circles.');
-        else if (strict && !monitor)
-            effect = _('Strict mode is on, so filter %s will block every server except its allowed IPs.');
-        else
-            effect = _('Without circles, filter %s blocks no servers.');
+            effect = this.lastRegionEffect(sid);
 
         return new Promise(function(resolve) {
             var button = function(cls, label, choice) {
@@ -1256,8 +1589,10 @@ return view.extend({
                 Object.keys(fields).forEach(function(k) { values[k] = value(k); });
                 values.ip_list = values.ip_list || suggestedList();
 
+                // The dialog may have stayed open while another tab applied changes: write on
+                // the configuration as the session holds it now
                 ui.hideModal();
-                resolve(Promise.resolve().then(function() {
+                resolve(self.loadConfig().then(function() {
                     return self.saveRegion(token, region, name, sec, values, initial);
                 }));
             };
@@ -1279,13 +1614,24 @@ return view.extend({
         });
     },
 
-    // Stage a drawn region from the modal. An existing filter only gets the options the user
-    // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox
+    // Apply a drawn region from the modal. An existing filter only gets the options the user
+    // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox.
+    // The caller has loaded the configuration again after the dialog, sec is the dialog's copy:
+    // its id may name another filter or none now (movedFilter), or a filter of the new name may
+    // exist (names match without regard to case, as in the dialog)
     saveRegion: function(token, region, name, sec, values, initial) {
-        var self = this, sid;
+        var self = this, sid, before = null;
+
+        if (sec && uci.get('geomate', sec['.name'], 'name') !== sec.name)
+            throw filtersChanged();
+        if (!sec && uci.sections('geomate', 'geo_filter').some(function(s) {
+            return String(s.name || '').toLowerCase() === name.toLowerCase();
+        }))
+            throw failure(_('Not applied: filter %s was created in the meantime.').format(name));
 
         if (sec) {
             sid = sec['.name'];
+            before = filterOptions(sid);
             var list = this.regionList(sid);
             if (list.indexOf(region) < 0)
                 list.push(region);
@@ -1307,63 +1653,20 @@ return view.extend({
             });
         }
 
-        return this.stage().then(function() {
+        return this.applyChange(function() {
             // uci.save() replaced the new%06x id; find the section by name and region
             if (!sec) {
                 var found = uci.sections('geomate', 'geo_filter').find(function(s) {
                     return s.name === name && L.toArray(s.allowed_region).indexOf(region) > -1;
                 });
                 if (!found)
-                    throw new Error(_('Filter %s not found after saving').format(name));
+                    throw failure(_('Filter %s not found after saving.').format(name));
                 sid = found['.name'];
             }
+            self.checkRegion(sid, region);
+        }).then(function() {
             self.ackRegion(token, sid, region);
-        });
-    },
-
-    // Region actions stage at once; apply what the session has staged after the running one
-    handleSaveApply: function(ev, mode) {
-        return Promise.resolve(this.busy).then(function() {
-            ui.changes.apply(mode == '0');
-        });
-    },
-
-    // Staged changes live in the LuCI session, so Reset means revert. LuCI reverts every
-    // configuration with staged changes at once (like the header's Unsaved Changes dialog).
-    // Like Save & Apply it waits for a running region action, so the reset includes its change
-    handleReset: function(ev) {
-        var self = this;
-
-        return Promise.resolve(this.busy).then(function() {
-            return L.resolveDefault(callUciChanges(), null);
-        }).then(function(changes) {
-            if (changes)
-                self.pending = changes;
-
-            var pending = self.pending || {},
-                others = Object.keys(pending).filter(function(config) {
-                    return config != 'geomate' && L.toArray(pending[config]).length;
-                });
-
-            if (!L.toArray(pending.geomate).length) {
-                ui.addNotification(null, E('p', {}, [ _('Geomate has no unsaved changes.') ]), 'info');
-                return;
-            }
-
-            // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
-            var body = [ E('p', {}, [ _('Discard all unsaved changes and reload the page?') ]) ];
-            if (others.length)
-                body.push(E('p', {}, [ _('This also discards the unsaved changes of %s.').format(others.join(', ')) ]));
-
-            ui.showModal(_('Unsaved changes'), body.concat([
-                E('div', { 'class': 'right' }, [
-                    E('button', { 'class': 'btn cbi-button-neutral', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
-                    E('button', { 'class': 'btn cbi-button-negative', 'click': ui.createHandlerFn(self, function() {
-                        ui.hideModal();
-                        ui.changes.revert();
-                    }) }, [ _('Reset') ])
-                ])
-            ]));
+            self.showApplied(sid, before);
         });
     },
 
