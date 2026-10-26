@@ -280,6 +280,36 @@ function filterAllowsIp(sid, ip) {
     return L.toArray(uci.get('geomate', sid, 'allowed_ip')).indexOf(ip) > -1;
 }
 
+// An IPv4 address as a number, null for anything else
+function ipNumber(ip) {
+    return validIPv4(ip) ? ip.split('.').reduce(function(n, o) { return n * 256 + +o; }, 0) : null;
+}
+
+// A prefix (a.b.c.d/nn) or range (a.b.c.d-e.f.g.h) of the filter's allowed IPs covers the
+// address. Read like add_element in luci.geomate; other entries count as nothing
+function rangeAllowsIp(sid, ip) {
+    var n = ipNumber(ip);
+
+    return n != null && L.toArray(uci.get('geomate', sid, 'allowed_ip')).some(function(entry) {
+        var m = /^([\d.]+)\/(\d+)$/.exec(entry), lo, hi, size;
+
+        if (m) {
+            lo = ipNumber(m[1]);
+            if (lo == null || +m[2] > 32)
+                return false;
+            size = Math.pow(2, 32 - m[2]);
+            lo -= lo % size;
+            return n >= lo && n < lo + size;
+        }
+        m = /^([\d.]+)-([\d.]+)$/.exec(entry);
+        if (!m)
+            return false;
+        lo = ipNumber(m[1]);
+        hi = ipNumber(m[2]);
+        return lo != null && hi != null && n >= lo && n <= hi;
+    });
+}
+
 // Refusals and errors of a table action: the map toast may be out of view below the table
 function notify(text, type) {
     ui.addNotification(null, E('p', {}, [ text ]), type || 'warning');
@@ -391,6 +421,7 @@ return view.extend({
     connectionsTable: null, // ui.Table of the active connections
     connectionsActions: false,  // the table has the Allow/Remove column (write access at render)
     connectionsKey: null,   // rows of the last table update, as JSON
+    configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
 
@@ -1088,6 +1119,16 @@ return view.extend({
         return this.connectionsBusy;
     },
 
+    // Ask for the connections again after a table action: a request already running may have
+    // been answered before the commit
+    refreshConnections: function() {
+        var self = this;
+
+        return Promise.resolve(this.connectionsBusy).then(function() {
+            return self.pollConnections();
+        });
+    },
+
     // Only the map iframe of this page may send messages to the view
     isMapMessage: function(ev) {
         var frame = this.nodes && this.nodes.frame;
@@ -1162,7 +1203,7 @@ return view.extend({
     // Run map actions one after another, each on the configuration as committed now (another
     // tab may have applied changes since): uci.save() reloads it, so a second action must not
     // read it in between. checkStaged() may stop an action before it changes anything; its
-    // circle then goes back (token), or onRefuse(reason) answers. An action with a circle queued
+    // circle then goes back (token), or onRefuse(reason, ok) answers. An action with a circle queued
     // before the map got all filters again (pushFilters) is dropped: the map no longer has its
     // circle. So is an action whose filter id sid names another filter now than at the click
     // (movedFilter; a resync queued before may have renamed the id in sidNames since). A failed
@@ -1183,7 +1224,7 @@ return view.extend({
                 if (!ok) {
                     if (token)
                         return self.sendMessageToMap('regionRejected', { token: token, reason: reason });
-                    return onRefuse ? onRefuse(reason) : self.sendMessageToMap('toast', { text: reason });
+                    return onRefuse ? onRefuse(reason, ok) : self.sendMessageToMap('toast', { text: reason });
                 }
                 return self.loadConfig().then(function() {
                     if (self.movedFilter(sid, known))
@@ -1202,8 +1243,21 @@ return view.extend({
     // each map action, again after a dialog, which may have stayed open while another tab
     // applied changes, and in resync
     loadConfig: function() {
-        uci.unload('geomate');
-        return uci.load('geomate');
+        return this.whileReloading(function() {
+            uci.unload('geomate');
+            return uci.load('geomate');
+        });
+    },
+
+    // Run fn, which unloads the configuration and loads it again (loadConfig, uci.save()). Until
+    // it is back, a connections poll would see no filters and show every row with Allow
+    whileReloading: function(fn) {
+        var self = this;
+
+        this.configLoads++;
+        return Promise.resolve().then(fn).finally(function() {
+            self.configLoads--;
+        });
     },
 
     // The section id sid names another filter than known, the name the map had for it: geo_filter
@@ -1232,7 +1286,7 @@ return view.extend({
                 throw failure(_('Could not check for unsaved changes.'));
             if (!ok)
                 throw failure(_('Apply or revert the unsaved geomate changes first.'));
-            return uci.save();
+            return self.whileReloading(function() { return uci.save(); });
         }).then(function() {
             if (verify)
                 verify();
@@ -1399,6 +1453,7 @@ return view.extend({
                 self.pushFilters();
                 // Undo of Allow or Remove: the table shows the other button again
                 self.updateActiveConnectionsList();
+                self.refreshConnections();
                 self.sendMessageToMap('toast', { text: _('Undone.') });
             });
         }, function(reason) {
@@ -2008,7 +2063,7 @@ return view.extend({
     // a row changed: ui.Table replaces every row, and with it a button under the pointer
     updateActiveConnectionsList: function() {
         var self = this, table = this.connectionsTable;
-        if (!table || !this.nodes.connectionsTitle) return;
+        if (!table || !this.nodes.connectionsTitle || this.configLoads) return;
 
         // Skip any connection object lacking filter_name to avoid errors
         var list = this.connections.filter(function(conn) {
@@ -2060,7 +2115,8 @@ return view.extend({
 
     // Button of a table row, from the configuration as loaded: 'remove' when the filter's own
     // allowed IPs list the address, 'range' (no button) when only a prefix or range of them
-    // covers it, else 'allow'. null without write access. A filter name that is not unique
+    // covers it, else 'allow'. null without write access. Not from the poll's is_allowed_ip:
+    // right after an action that is still the old verdict. A filter name that is not unique
     // gets 'allow', and the click says why nothing happens (setIpAllowed)
     connectionAction: function(conn) {
         var sid;
@@ -2070,7 +2126,7 @@ return view.extend({
         sid = sidByName(conn.filter_name);
         if (sid && filterAllowsIp(sid, conn.dst))
             return 'remove';
-        return (sid && conn.is_allowed_ip) ? 'range' : 'allow';
+        return (sid && rangeAllowsIp(sid, conn.dst)) ? 'range' : 'allow';
     },
 
     renderConnectionAction: function(r) {
@@ -2130,12 +2186,18 @@ return view.extend({
                 if (uci.get('geomate', sid, 'name') !== name || filterAllowsIp(sid, ip) !== allow)
                     throw failure(_('Could not save the allowed IPs of filter %s.').format(name));
             }).then(function() {
+                var text = (allow ? _('Added %s to the allowed IPs of %s.') : _('Removed %s from the allowed IPs of %s.')).format(ip, name);
+
                 self.updateActiveConnectionsList();
-                self.showApplied(sid, before, (allow ? _('Added %s to the allowed IPs of %s.') : _('Removed %s from the allowed IPs of %s.')).format(ip, name));
+                self.refreshConnections();
+                self.showApplied(sid, before, text);
+                // The toast needs the map; without it the notification is the only feedback
+                if (!self.mapReady)
+                    notify(text, 'info');
             });
-        }, function(reason) {
-            // checkStaged() has shown its notice about unsaved changes, unless the check failed
-            if (!(self.notice && self.notice.parentNode))
+        }, function(reason, ok) {
+            // ok false: checkStaged() has shown its notice about unsaved changes
+            if (ok !== false || !(self.notice && self.notice.parentNode))
                 notify(reason);
         }, notify);
     },
