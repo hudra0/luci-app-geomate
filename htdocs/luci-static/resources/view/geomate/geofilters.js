@@ -6,11 +6,26 @@
 'require fs';
 'require dom';
 'require rpc';
+'require validation';
 
 var callGetGeolocationStatus = rpc.declare({
     object: 'luci.geomate',
     method: 'getGeolocationStatus',
     expect: { status: {} }
+});
+
+// LAN devices for the Source IP suggestions (same calls as LuCI's Static Leases page). The
+// luci-app-geomate ACL grants both; a ubus error such as "Access denied" resolves to {}
+var callHostHints = rpc.declare({
+    object: 'luci-rpc',
+    method: 'getHostHints',
+    expect: { '': {} }
+});
+
+var callNetworkDevices = rpc.declare({
+    object: 'luci-rpc',
+    method: 'getNetworkDevices',
+    expect: { '': {} }
 });
 
 // Staged changes of this session. Unlike uci.changes(), a ubus error rejects instead of
@@ -24,6 +39,9 @@ var callUciChanges = rpc.declare({
 
 // Store geolocation status globally for access in render functions
 var geoStats = null;
+
+// Source IP suggestions and host names (hostChoices), loaded with the page
+var hosts = { keys: [], labels: {}, names: {} };
 
 // Staged changes of this LuCI session (uci changes): loaded with the page and again after every
 // save of the form. The backend sees only what Save & Apply has committed
@@ -78,12 +96,141 @@ function formatRadius(meters) {
 
 // Entries of src_ip, src_port or dest_port as the config has them, split at white space like
 // the service does. A port 'any' is no restriction (an option that says only 'any' adds no
-// match to the rule)
+// match to the rule). A Source IP address gets the name a host hint has for it, an exception
+// ('!' or '!=', also written apart from the address) reads 'except <address>'
 function matchItems(section_id, option) {
-    return L.toArray(L.toArray(uci.get('geomate', section_id, option)).join(' ')).filter(function(v) {
+    var text = L.toArray(uci.get('geomate', section_id, option)).join(' ');
+
+    if (option == 'src_ip')
+        text = text.replace(/(^|\s)(!=?)\s+/g, '$1$2');
+
+    return L.toArray(text).filter(function(v) {
         return v !== 'any' || option == 'src_ip';
+    }).map(function(v) {
+        var m = (option == 'src_ip') ? /^(!=?)?(.*)$/.exec(v) : null,
+            addr = m ? m[2] : v;
+
+        if (m && hosts.names.hasOwnProperty(addr))
+            addr = '%s (%s)'.format(addr, hosts.names[addr]);
+        return (m && m[1]) ? _('except %s').format(addr) : addr;
     }).join(', ');
 }
+
+// The backend reports this feature token ('capabilities' of getGeolocationStatus, from
+// '/etc/geomate.sh capabilities'). Unknown, as with an older backend or a failed request,
+// counts as not supported
+function hasCapability(token) {
+    return !!geoStats && Array.isArray(geoStats.capabilities) && geoStats.capabilities.indexOf(token) > -1;
+}
+
+// Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
+// 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
+// 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
+// once. Returns { keys: the addresses in numeric order, labels: { address: node }, names:
+// { address: host name } }; a label is a node, because LuCI puts a string label in as HTML
+// (same function in view.js)
+function hostChoices(hints, devices) {
+    var own = {}, text = {}, names = {}, labels = {}, keys;
+
+    hints = L.isObject(hints) ? hints : {};
+    devices = L.isObject(devices) ? devices : {};
+
+    // getNetworkDevices lists each address as { address, netmask, ... }
+    Object.keys(devices).forEach(function(dev) {
+        L.toArray(L.isObject(devices[dev]) ? devices[dev].ipaddrs : null).forEach(function(a) {
+            if (L.isObject(a) && typeof a.address == 'string')
+                own[a.address] = true;
+        });
+    });
+
+    Object.keys(hints).forEach(function(mac) {
+        var h = L.isObject(hints[mac]) ? hints[mac] : {};
+
+        L.toArray(h.ipaddrs || h.ipv4).forEach(function(ip) {
+            if (typeof ip != 'string' || !plainIPv4(ip) || /^127\./.test(ip) || own[ip] || text[ip])
+                return;
+            text[ip] = '%s (%s)'.format(ip, h.name || mac);
+            if (h.name)
+                names[ip] = h.name;
+        });
+    });
+
+    keys = L.sortedKeys(text, null, 'addr');
+    keys.forEach(function(ip) { labels[ip] = E('span', {}, [ text[ip] ]); });
+    return { keys: keys, labels: labels, names: names };
+}
+
+// A dotted IPv4 address, every octet 0-255 without a leading zero: nft reads 010 as octal
+function plainIPv4(s) {
+    return validation.parseIPv4(s) != null && !/(^|\.)0\d/.test(s);
+}
+
+// An entry of Source IP as geomate.sh (is_ipv4_entry) takes it: an IPv4 address, a.b.c.d/0-32
+// or a range a.b.c.d-e.f.g.h whose first address is not above the last. nft rejects a dotted
+// mask (a.b.c.d/255.255.255.0) and a range the other way round
+function srcIpEntry(s) {
+    var m = /^([\d.]+)(?:\/(3[0-2]|[12]?\d)|-([\d.]+))?$/.exec(s);
+    var number = function(ip) {
+        return validation.parseIPv4(ip).reduce(function(n, o) { return n * 256 + o; }, 0);
+    };
+
+    if (!m || !plainIPv4(m[1]))
+        return false;
+    if (m[3] == null)
+        return true;
+    return plainIPv4(m[3]) && number(m[1]) <= number(m[3]);
+}
+
+// Check a Source IP value (entries separated by white space, or an array of entries). multi:
+// the backend takes several entries and exceptions ('!' or '!=' before an entry). An entry
+// that the saved value (saved: its entries) has unchanged is valid, and so is the unchanged
+// saved value as a whole: a filter saved before these checks stays savable. Returns true or
+// the error text
+function checkSrcIp(value, saved, multi) {
+    var entries = L.toArray(L.toArray(value).join(' ')), i, entry;
+
+    if (entries.join(' ') === saved.join(' '))
+        return true;
+    if (!multi && entries.length > 1)
+        return _('This Geomate backend supports one address only.');
+
+    for (i = 0; i < entries.length; i++) {
+        entry = entries[i];
+        if (saved.indexOf(entry) > -1)
+            continue;
+        if (!multi && entry.charAt(0) == '!')
+            return _('This Geomate backend supports no exceptions.');
+        if (!srcIpEntry(multi ? entry.replace(/^!=?/, '') : entry))
+            return _('Expecting: %s').format(_('IPv4 address, address/prefix or address range'));
+    }
+    return true;
+}
+
+// Make a ui.DynamicList add pasted 'a b' as two entries, like CBIDynamicMultiValueList in
+// LuCI's tools/firewall.js (not loaded: luci-app-firewall is no dependency). A single entry
+// keeps its label, e.g. a picked suggestion (same function in view.js)
+function splitEntries(widget) {
+    widget.addItem = function(dl, value, text, flash) {
+        var values = L.toArray(value);
+
+        values.forEach(function(v) {
+            var label = (values.length == 1) ? text : (this.choices || {})[v];
+
+            ui.DynamicList.prototype.addItem.call(this, dl, v, dom.elem(label) ? label.cloneNode(true) : label, flash);
+        }, this);
+    };
+    return widget;
+}
+
+// Source IP with several entries: a form.DynamicList whose widget splits pasted entries
+var SrcIpList = form.DynamicList.extend({
+    renderWidget: function(/* section_id, option_index, cfgvalue */) {
+        var node = form.DynamicList.prototype.renderWidget.apply(this, arguments);
+
+        splitEntries(dom.findClassInstance(node));
+        return node;
+    }
+});
 
 // The traffic a filter looks at, as the rule in the service is built from protocol, src_ip,
 // src_port and dest_port: 'UDP from 192.168.2.208 port 3074, 3075'. A missing protocol or
@@ -195,10 +342,13 @@ return view.extend({
                 console.log('Failed to load geolocation status:', err);
                 return null;
             }),
-            L.resolveDefault(callUciChanges(), {})
+            L.resolveDefault(callUciChanges(), {}),
+            L.resolveDefault(callHostHints(), {}),
+            L.resolveDefault(callNetworkDevices(), {})
         ]).then(function(data) {
             geoStats = data[0] || null;
             pending = data[1] || {};
+            hosts = hostChoices(data[2], data[3]);
             return data;
         });
     },
@@ -499,12 +649,35 @@ return view.extend({
         o.rmempty = false;
         o.modalonly = true;
 
-        // Source IP configuration
-        o = s.option(form.Value, 'src_ip', _('Source IP'));
-        o.datatype = 'list(neg(ip4addr))';
-        o.placeholder = _('192.168.1.0/24 or !192.168.1.128/25');
+        // Source IP: the devices the filter applies to, like the field "Source address" of
+        // LuCI's firewall. Several entries and exceptions need a backend that reports
+        // src_ip_multi; with any other one the field takes one address, as before. Written as
+        // one option with the entries separated by a space, never as a UCI list. No datatype:
+        // LuCI checks it before validate, and a saved value it rejects would block every save
+        // of the dialog
+        var multi = hasCapability('src_ip_multi');
+        o = s.option(multi ? SrcIpList : form.Value, 'src_ip', _('Source IP'),
+            (multi ? _('Devices this filter applies to. Empty: all devices. Put ! before an address to leave it out.')
+                : _('Device this filter applies to. Empty: all devices.')) + ' ' +
+            _('Use a static lease so the address stays the same.'));
+        o.placeholder = multi ? _('-- add IP --') : _('any');
         o.rmempty = true;
         o.modalonly = true;
+        hosts.keys.forEach(function(ip) { o.value(ip, hosts.labels[ip]); });
+        // The entries of an option or of a hand-written list, as one string or as an array
+        o.load = function(section_id) {
+            var v = L.toArray(form.Value.prototype.load.call(this, section_id)).join(' ');
+            return (v === '') ? null : multi ? L.toArray(v) : v;
+        };
+        o.write = function(section_id, value) {
+            return form.Value.prototype.write.call(this, section_id, L.toArray(value).join(' '));
+        };
+        // value '' is the check of the widget as a whole, any other value the text typed into
+        // its input
+        o.validate = function(section_id, value) {
+            return checkSrcIp((value == null || value === '') ? this.formvalue(section_id) : value,
+                L.toArray(this.cfgvalue(section_id)), multi);
+        };
 
         // Source port configuration
         o = s.option(form.Value, 'src_port', _('Source Port'));
@@ -521,7 +694,7 @@ return view.extend({
         // Whitelist for specific IP addresses
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
         o.datatype = 'list(neg(ip4addr))';
-        o.placeholder = _('192.168.1.0/24 or !192.168.1.128/25');
+        o.placeholder = _('1.2.3.4 or 1.2.3.0/24');
         o.rmempty = true;
         o.modalonly = true;
 

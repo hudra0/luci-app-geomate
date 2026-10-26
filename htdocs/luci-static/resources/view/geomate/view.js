@@ -6,6 +6,7 @@
 'require poll';
 'require fs';
 'require dom';
+'require validation';
 
 // Version and update channel information
 const UI_VERSION = 'dev';
@@ -151,6 +152,21 @@ var callGetHealthCheck = rpc.declare({
     method: 'getHealthCheck',
     expect: { health: {} },
     reject: true
+});
+
+// LAN devices for the Source IP suggestions of the filter dialog (same calls as LuCI's Static
+// Leases page). The luci-app-geomate ACL grants both; a ubus error such as "Access denied"
+// resolves to {}
+var callHostHints = rpc.declare({
+    object: 'luci-rpc',
+    method: 'getHostHints',
+    expect: { '': {} }
+});
+
+var callNetworkDevices = rpc.declare({
+    object: 'luci-rpc',
+    method: 'getNetworkDevices',
+    expect: { '': {} }
 });
 
 // Staged changes of this session. Unlike uci.changes(), a ubus error rejects instead of
@@ -355,6 +371,112 @@ function notify(text, type) {
     ui.addNotification(null, E('p', {}, [ text ]), type || 'warning');
 }
 
+// The status reports this feature token ('capabilities' of getStatus, from
+// '/etc/geomate.sh capabilities'). Unknown, as with an older backend or a failed request,
+// counts as not supported
+function hasCapability(status, token) {
+    return !!status && Array.isArray(status.capabilities) && status.capabilities.indexOf(token) > -1;
+}
+
+// Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
+// 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
+// 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
+// once. Returns { keys: the addresses in numeric order, labels: { address: node }, names:
+// { address: host name } }; a label is a node, because LuCI puts a string label in as HTML
+// (same function in geofilters.js)
+function hostChoices(hints, devices) {
+    var own = {}, text = {}, names = {}, labels = {}, keys;
+
+    hints = L.isObject(hints) ? hints : {};
+    devices = L.isObject(devices) ? devices : {};
+
+    // getNetworkDevices lists each address as { address, netmask, ... }
+    Object.keys(devices).forEach(function(dev) {
+        L.toArray(L.isObject(devices[dev]) ? devices[dev].ipaddrs : null).forEach(function(a) {
+            if (L.isObject(a) && typeof a.address == 'string')
+                own[a.address] = true;
+        });
+    });
+
+    Object.keys(hints).forEach(function(mac) {
+        var h = L.isObject(hints[mac]) ? hints[mac] : {};
+
+        L.toArray(h.ipaddrs || h.ipv4).forEach(function(ip) {
+            if (typeof ip != 'string' || !plainIPv4(ip) || /^127\./.test(ip) || own[ip] || text[ip])
+                return;
+            text[ip] = '%s (%s)'.format(ip, h.name || mac);
+            if (h.name)
+                names[ip] = h.name;
+        });
+    });
+
+    keys = L.sortedKeys(text, null, 'addr');
+    keys.forEach(function(ip) { labels[ip] = E('span', {}, [ text[ip] ]); });
+    return { keys: keys, labels: labels, names: names };
+}
+
+// A dotted IPv4 address, every octet 0-255 without a leading zero: nft reads 010 as octal
+function plainIPv4(s) {
+    return validation.parseIPv4(s) != null && !/(^|\.)0\d/.test(s);
+}
+
+// An entry of Source IP as geomate.sh (is_ipv4_entry) takes it: an IPv4 address, a.b.c.d/0-32
+// or a range a.b.c.d-e.f.g.h whose first address is not above the last. nft rejects a dotted
+// mask (a.b.c.d/255.255.255.0) and a range the other way round
+function srcIpEntry(s) {
+    var m = /^([\d.]+)(?:\/(3[0-2]|[12]?\d)|-([\d.]+))?$/.exec(s);
+    var number = function(ip) {
+        return validation.parseIPv4(ip).reduce(function(n, o) { return n * 256 + o; }, 0);
+    };
+
+    if (!m || !plainIPv4(m[1]))
+        return false;
+    if (m[3] == null)
+        return true;
+    return plainIPv4(m[3]) && number(m[1]) <= number(m[3]);
+}
+
+// Check a Source IP value (entries separated by white space, or an array of entries). multi:
+// the backend takes several entries and exceptions ('!' or '!=' before an entry). An entry
+// that the saved value (saved: its entries) has unchanged is valid, and so is the unchanged
+// saved value as a whole: a filter saved before these checks stays savable. Returns true or
+// the error text
+function checkSrcIp(value, saved, multi) {
+    var entries = L.toArray(L.toArray(value).join(' ')), i, entry;
+
+    if (entries.join(' ') === saved.join(' '))
+        return true;
+    if (!multi && entries.length > 1)
+        return _('This Geomate backend supports one address only.');
+
+    for (i = 0; i < entries.length; i++) {
+        entry = entries[i];
+        if (saved.indexOf(entry) > -1)
+            continue;
+        if (!multi && entry.charAt(0) == '!')
+            return _('This Geomate backend supports no exceptions.');
+        if (!srcIpEntry(multi ? entry.replace(/^!=?/, '') : entry))
+            return _('Expecting: %s').format(_('IPv4 address, address/prefix or address range'));
+    }
+    return true;
+}
+
+// Make a ui.DynamicList add pasted 'a b' as two entries, like CBIDynamicMultiValueList in
+// LuCI's tools/firewall.js (not loaded: luci-app-firewall is no dependency). A single entry
+// keeps its label, e.g. a picked suggestion (same function in geofilters.js)
+function splitEntries(widget) {
+    widget.addItem = function(dl, value, text, flash) {
+        var values = L.toArray(value);
+
+        values.forEach(function(v) {
+            var label = (values.length == 1) ? text : (this.choices || {})[v];
+
+            ui.DynamicList.prototype.addItem.call(this, dl, v, dom.elem(label) ? label.cloneNode(true) : label, flash);
+        }, this);
+    };
+    return widget;
+}
+
 // Poll intervals in seconds
 var CONNECTIONS_INTERVAL = 5,
     STATUS_INTERVAL = 10,
@@ -464,6 +586,7 @@ return view.extend({
     configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
+    hostsLoad: null,        // promise of the Source IP suggestions (loadHostChoices)
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
@@ -1748,10 +1871,38 @@ return view.extend({
         });
     },
 
+    // Source IP suggestions (hostChoices), fetched when the filter dialog opens for the first
+    // time, then kept for the page. Not in load(): LuCI sends the calls of load() as one batch,
+    // which would delay the map
+    loadHostChoices: function() {
+        if (!this.hostsLoad)
+            this.hostsLoad = Promise.all([
+                L.resolveDefault(callHostHints(), {}),
+                L.resolveDefault(callNetworkDevices(), {})
+            ]).then(function(r) {
+                return hostChoices(r[0], r[1]);
+            });
+        return this.hostsLoad;
+    },
+
+    // The filter dialog, after its Source IP suggestions and the backend's capabilities have
+    // arrived. Without a status poll result yet the status is asked once
+    openFilterModal: function(token, region, pick) {
+        var self = this;
+
+        return Promise.all([
+            this.loadHostChoices(),
+            this.status || L.resolveDefault(callGetStatus(), null)
+        ]).then(function(r) {
+            return self.renderFilterModal(token, region, pick, r[0], hasCapability(r[1], 'src_ip_multi'));
+        });
+    },
+
     // A new circle was drawn for a new filter: name it, or choose a filter. The circle stays
     // pending on the map until this modal ends with regionSaved, regionDiscarded or regionRejected.
-    // pick: NEW_FILTER opens with the name field focused, '' with the filter list
-    openFilterModal: function(token, region, pick) {
+    // pick: NEW_FILTER opens with the name field focused, '' with the filter list. hosts: the
+    // Source IP suggestions (hostChoices); multi: the backend takes several Source IP entries
+    renderFilterModal: function(token, region, pick, hosts, multi) {
         var self = this,
             f = this.filterChoices(_('-- Please choose --')),
             sections = f.sections,
@@ -1781,13 +1932,31 @@ return view.extend({
             }
         });
 
-        var ipPlaceholder = _('192.168.1.0/24 or !192.168.1.128/25'),
+        var ipPlaceholder = _('1.2.3.4 or 1.2.3.0/24'),
             portPlaceholder = _('25200 25300 or 27015-27020');
+
+        // Entries of the shown filter's saved Source IP, valid as they are (checkSrcIp). The
+        // widget's own check passes '', the input of the widget the typed text. No datatype:
+        // ui checks it before validate, and a saved value it rejects would block the dialog
+        var srcSaved = [];
+        var srcValidate = function(v) {
+            return checkSrcIp((v == null || v === '') ? fields.src_ip.getValue() : v, srcSaved, multi);
+        };
+        var srcHint = E('div', { 'class': 'cbi-value-description' }, [
+            (multi ? _('Devices this filter applies to. Empty: all devices. Put ! before an address to leave it out.')
+                : _('Device this filter applies to. Empty: all devices.')) + ' ' +
+            _('Use a static lease so the address stays the same.')
+        ]);
 
         var fields = {
             enabled: new ui.Checkbox('1', { value_enabled: '1', value_disabled: '0' }),
             protocol: new ui.Select('udp', { tcp: 'TCP', udp: 'UDP' }, {}),
-            src_ip: new ui.Textfield('', { datatype: 'list(neg(ip4addr))', placeholder: ipPlaceholder }),
+            // Like the field on the Geo Filters page: a list with a backend that reports
+            // src_ip_multi, else one address
+            src_ip: multi
+                ? splitEntries(new ui.DynamicList([], hosts.keys.length ? hosts.labels : null,
+                    { sort: hosts.keys, placeholder: _('-- add IP --'), validate: srcValidate }))
+                : new ui.Combobox('', hosts.labels, { sort: hosts.keys, select_placeholder: _('any'), validate: srcValidate }),
             src_port: new ui.Textfield('', { datatype: 'list(neg(portrange))', placeholder: portPlaceholder }),
             dest_port: new ui.Textfield('', { datatype: 'list(neg(portrange))', placeholder: portPlaceholder }),
             allowed_ip: new ui.DynamicList([], null, { datatype: 'list(neg(ip4addr))', placeholder: ipPlaceholder }),
@@ -1810,6 +1979,9 @@ return view.extend({
 
         var value = function(k) {
             var v = fields[k].getValue();
+            // Source IP is one option, its entries separated by a space; never a UCI list
+            if (k == 'src_ip')
+                return L.toArray(L.toArray(v).join(' ')).join(' ');
             return Array.isArray(v) ? v.filter(function(x) { return x.trim() !== ''; }) : String(v == null ? '' : v).trim();
         };
 
@@ -1840,6 +2012,9 @@ return view.extend({
 
         // Show the settings of the chosen filter; for a new one the values typed for it, or the defaults
         var fill = function(sec) {
+            // An option or a hand-written list
+            srcSaved = sec ? L.toArray(L.toArray(sec.src_ip).join(' ')) : [];
+
             Object.keys(fields).forEach(function(k) {
                 var v = sec ? sec[k] : null;
 
@@ -1851,6 +2026,9 @@ return view.extend({
                     v = sec ? v : 'udp';
                 else if (k == 'allowed_ip')
                     v = L.toArray(v);
+                // The entries for the list, one string for the combobox; null clears it
+                else if (k == 'src_ip')
+                    v = multi ? srcSaved.slice() : (srcSaved.join(' ') || null);
                 else
                     v = Array.isArray(v) ? v.join(' ') : (v == null ? '' : v);
 
@@ -1969,7 +2147,7 @@ return view.extend({
 
         var body = E('div', { 'class': 'cbi-section-node' }, [ row(_('Filter'), filterNode, [ nameNode, hint ]) ]);
         Object.keys(fields).forEach(function(k) {
-            body.appendChild(row(labels[k], fields[k].render(), (k != 'ip_list') ? null : [
+            body.appendChild(row(labels[k], fields[k].render(), (k == 'src_ip') ? [ srcHint ] : (k != 'ip_list') ? null : [
                 E('div', { 'style': 'margin-top: 8px' }, [
                     E('button', { 'class': 'btn cbi-button-neutral', 'click': function() {
                         if (!currentName())
