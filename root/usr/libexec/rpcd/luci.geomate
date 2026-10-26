@@ -305,25 +305,29 @@ end
 -- Servers the enabled filters see right now (_ui_dynamic), one entry per IP:
 -- { ip, filter = <section>, allowed = true (in _allowed), false (in _blocked) or nil }.
 -- nil means untracked: not geolocated yet, or the filter has no circles. _allowed wins because
--- the accept rule comes before the drop rule. If several filters see an IP, a filter with a
--- verdict wins over one without, otherwise the first in config order. Private and reserved
--- addresses and the router's own addresses are left out
+-- the accept rule comes before the drop rule. If several filters see an IP, their rules run in
+-- config order: the first filter with a verdict wins. With strict_mode the first filter that
+-- sees the IP decides, because its catch-all drop stops an untracked server before any later
+-- filter. strict_mode counts in monitor mode too: the table shows what the rules would do.
+-- Private and reserved addresses and the router's own addresses are left out
 local function get_ui_dynamic_ips()
     local entries, by_ip = {}, {}
     local own = router_addresses()
 
     uci:load('geomate')
+    local strict = uci:get('geomate', 'global', 'strict_mode') == '1'
     uci:foreach('geomate', 'geo_filter', function(s)
         local set_name = filter_set_name(s.name)
         if s.enabled ~= '1' or not set_name then
             return
         end
 
-        -- IPs this filter may still claim: new ones and untracked ones of an earlier filter
+        -- IPs this filter may still claim: new ones, and without strict_mode untracked ones of
+        -- an earlier filter
         local candidates = {}
         for ip in nft_list_set(set_name .. "_ui_dynamic"):gmatch("(%d+%.%d+%.%d+%.%d+)") do
             local entry = by_ip[ip]
-            if (not entry or entry.allowed == nil) and is_public_ip(ip, own) then
+            if (not entry or (entry.allowed == nil and not strict)) and is_public_ip(ip, own) then
                 table.insert(candidates, ip)
             end
         end
@@ -356,8 +360,10 @@ local function get_ui_dynamic_ips()
 end
 
 -- Connections from the _ui_dynamic sets of the enabled filters (previously also from conntrack)
--- with the verdict of the filter's nft sets. is_allowed_ip: the IP is in the filter's own
--- allowed_ip, as an address or inside a prefix or range
+-- with the verdict of the filter's nft sets. is_allowed_ip: the IP is in _allowed and in the
+-- filter's own allowed_ip, as an address or inside a prefix or range. The set has to agree:
+-- nft rejects the whole allowed_ip batch for one '!' entry, and a saved change counts only
+-- after the next service start
 local function get_all_connections()
     load_cache()
     local entries = get_ui_dynamic_ips()
@@ -373,13 +379,17 @@ local function get_all_connections()
     local connections, whitelists = {}, {}
     for _, e in ipairs(entries) do
         local s = e.filter
-        local whitelist = whitelists[s['.name']]
-        if not whitelist then
-            whitelist = new_set()
-            for _, entry in ipairs(allowed_ip_list(s)) do
-                add_element(whitelist, entry)
+        local whitelisted = false
+        if e.allowed == true then
+            local whitelist = whitelists[s['.name']]
+            if not whitelist then
+                whitelist = new_set()
+                for _, entry in ipairs(allowed_ip_list(s)) do
+                    add_element(whitelist, entry)
+                end
+                whitelists[s['.name']] = whitelist
             end
-            whitelists[s['.name']] = whitelist
+            whitelisted = set_has(whitelist, e.ip)
         end
 
         -- No position for an untracked server: older map.html versions draw a connection
@@ -396,7 +406,7 @@ local function get_all_connections()
             geo = geo,
             filter_name = s.name,
             is_dynamic = true,        -- Indicates the connection is from a dynamic set
-            is_allowed_ip = set_has(whitelist, e.ip)
+            is_allowed_ip = whitelisted
         })
     end
 
