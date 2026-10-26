@@ -213,17 +213,41 @@ function textOn(color) {
 
 // Status of a connection for the table: [ sort key, label, tooltip ]. luci.geomate takes
 // 'allowed' from the filter's nft sets: true in _allowed, false in _blocked, missing when the
-// server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs
+// server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs.
+// A row the map cannot show gets the tooltip of notOnMapNote; an untracked one has its own
 function connectionStatus(conn) {
+    var note = hasPosition(conn.geo) ? null : notOnMapNote();
+
     if (conn.is_allowed_ip)
-        return [ 'whitelist', _('Whitelisted') ];
+        return [ 'whitelist', _('Whitelisted'), note ];
     if (conn.allowed === true)
-        return [ 'allowed', _('Allowed') ];
+        return [ 'allowed', _('Allowed'), note ];
     if (conn.allowed === false)
-        return [ 'blocked', _('Blocked') ];
+        return [ 'blocked', _('Blocked'), note ];
     if (conn.allowed == null)
         return [ 'untracked', _('Untracked'), untrackedNote(conn.filter_name) ];
-    return [ 'unknown', _('Unknown') ];
+    return [ 'unknown', _('Unknown'), note ];
+}
+
+// Whether a connection's geo data has a position the map draws a marker for: finite, non-zero
+// lat and lon. The same test as updateConnections in map.html; a failed lookup is an empty array
+function hasPosition(geo) {
+    var lat, lon;
+
+    if (!geo || typeof geo != 'object' || Array.isArray(geo.lat) || Array.isArray(geo.lon))
+        return false;
+    lat = Number(geo.lat);
+    lon = Number(geo.lon);
+    return !!lat && !!lon && isFinite(lat) && isFinite(lon);
+}
+
+// Tooltip of a server without a position: it has no map marker until the geo data has one.
+// Dynamic and monitor mode collect the server into the IP list and geolocate it later; static
+// mode has no collection, so only an uploaded list geolocates it
+function notOnMapNote() {
+    if ((uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'static')
+        return _('Not on the map: static mode does not geolocate new servers.');
+    return _('Not on the map until geolocated.');
 }
 
 // Tooltip of an untracked server of a filter: what the configured mode does with it until it
