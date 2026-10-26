@@ -26,34 +26,69 @@ local function save_cache()
     end
 end
 
--- Geolocate an IP address
-local function geolocate_ip(ip)
+-- Text fields of an ip-api result that the connections table and the map popups show.
+-- Additive: cache entries written before they existed carry lat/lon only and stay valid
+local GEO_TEXT_FIELDS = { "country", "countryCode", "city", "isp", "org" }
+
+-- Searches one geo data file (JSON lines from ip-api) for an IP. The plain-text find skips
+-- the JSON parse of every other line; geolocate.sh writes the compact "query":"<ip>" form
+local function find_in_geo_file(filepath, ip)
+    local f = io.open(filepath, "r")
+    if not f then
+        return nil
+    end
+
+    local needle = '"query":"' .. ip .. '"'
+    for line in f:lines() do
+        if line:find(needle, 1, true) then
+            local data = jsonc.parse(line)
+            if data and data.query == ip and data.lat and data.lon then
+                f:close()
+                local entry = { lat = data.lat, lon = data.lon }
+                for _, k in ipairs(GEO_TEXT_FIELDS) do
+                    if type(data[k]) == "string" and data[k] ~= "" then
+                        entry[k] = data[k]
+                    end
+                end
+                return entry
+            end
+        end
+    end
+    f:close()
+    return nil
+end
+
+-- Filter names the backend supports in nft set names and geo data file names. A name that
+-- matches contains no '/' and no shell quote
+local FILTER_NAME_PATTERN = "^[%w_ .%-]+$"
+
+-- Geolocate an IP address from the geo data in /etc/geomate.d: first the file of the
+-- filter the IP belongs to (filter_name, optional), then the other files
+local function geolocate_ip(ip, filter_name)
     if cache[ip] then
         return cache[ip]
     end
 
-    -- Use existing geodata from /etc/geomate.d
     local geodata_dir = "/etc/geomate.d"
-    for file in nixio.fs.dir(geodata_dir) do
-        if file:match("_geo_data%.json$") then
-            local filepath = geodata_dir .. "/" .. file
-            local f = io.open(filepath, "r")
-            if f then
-                for line in f:lines() do
-                    local data = jsonc.parse(line)
-                    if data and data.query == ip and data.lat and data.lon then
-                        cache[ip] = { lat = data.lat, lon = data.lon }
-                        f:close()
-                        return cache[ip]
-                    end
+    -- No '/' can leave the directory
+    local own = (type(filter_name) == "string" and filter_name:match(FILTER_NAME_PATTERN))
+        and (filter_name .. "_geo_data.json") or nil
+    local found = own and find_in_geo_file(geodata_dir .. "/" .. own, ip)
+
+    local files = not found and nixio.fs.dir(geodata_dir)
+    if files then
+        for file in files do
+            if file ~= own and file:match("_geo_data%.json$") then
+                found = find_in_geo_file(geodata_dir .. "/" .. file, ip)
+                if found then
+                    break
                 end
-                f:close()
             end
         end
     end
 
-    -- Fallback if geodata was not found
-    cache[ip] = { lat = nil, lon = nil }
+    -- Misses are cached too, until the next service start or geolocation batch empties the cache
+    cache[ip] = found or { lat = nil, lon = nil }
     return cache[ip]
 end
 
@@ -138,7 +173,7 @@ end
 -- nft set name prefix of a filter, or nil if the name must not reach a shell command.
 -- The pattern covers what the backend supports in nft set names and file names
 local function filter_set_name(name)
-    if type(name) ~= "string" or not name:match("^[%w_ .%-]+$") then
+    if type(name) ~= "string" or not name:match(FILTER_NAME_PATTERN) then
         return nil
     end
     return "geomate_" .. (name:gsub(' ', '_'))
@@ -236,7 +271,7 @@ local function is_ip_allowed(ip, filter, allowed_ips_set)
     end
 
     -- Check if the IP is within **any** allowed region
-    local geo = geolocate_ip(ip)
+    local geo = geolocate_ip(ip, filter.name)
     local allowed = is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)
 
     return allowed, false  -- allowed, is_allowed_ip = false
@@ -263,7 +298,7 @@ local function get_all_connections()
 
         if not processed_ips[ip] then
             local allowed, is_allowed_ip = is_ip_allowed(ip, filter, allowed_ips_set)
-            local geo = geolocate_ip(ip)
+            local geo = geolocate_ip(ip, filter_name)
 
             local conn = {
                 src = "unknown",
@@ -295,7 +330,7 @@ local function get_allowed_ips()
     uci:foreach('geomate', 'geo_filter', function(s)
         if s.enabled == '1' and s.allowed_ip then
             for _, ip in ipairs(s.allowed_ip) do
-                local geo = geolocate_ip(ip)
+                local geo = geolocate_ip(ip, s.name)
                 if geo.lat and geo.lon then
                     table.insert(allowed_ips, { ip = ip, geo = geo, filter = s.name })
                 end

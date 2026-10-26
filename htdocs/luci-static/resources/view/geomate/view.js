@@ -72,12 +72,13 @@ function errorText(err) {
 // timeout, missing method, no permission) rejects instead of resolving to the expect default, so
 // L.resolveDefault() gives null: the connection list stays as it was, the status shows "unknown".
 // Whitelisted IPs reach the map through getGeomateConnections (is_allowed_ip): the map shows only
-// IPs with an active connection
+// IPs with an active connection. nobatch: a slow geo lookup never delays the status batch
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
     method: 'getGeomateConnections',
     expect: { connections: [] },
-    reject: true
+    reject: true,
+    nobatch: true
 });
 
 var callGetStatus = rpc.declare({
@@ -103,6 +104,64 @@ var callUciChanges = rpc.declare({
     expect: { changes: {} },
     reject: true
 });
+
+// The map iframe sees none of the page's CSS, so the view sends it the theme colors. Candidate
+// variables of Argon, Bootstrap and OpenWrt 2020, in this order; other themes get the fallbacks
+var THEME_VARS = {
+    accent: [ '--primary', '--primary-color-high', '--main-bright-color' ],
+    danger: [ '--danger', '--red', '--error-color-high', '--danger-color' ],
+    success: [ '--success', '--green', '--success-color-high', '--success-color' ]
+};
+var THEME_FALLBACKS = {
+    light: { bg: 'rgb(255, 255, 255)', fg: 'rgb(31, 35, 40)', accent: 'rgb(26, 111, 209)', danger: 'rgb(207, 34, 46)', success: 'rgb(26, 127, 55)' },
+    dark: { bg: 'rgb(30, 30, 30)', fg: 'rgb(230, 230, 230)', accent: 'rgb(76, 142, 218)', danger: 'rgb(248, 81, 73)', success: 'rgb(63, 185, 80)' }
+};
+
+// { r, g, b, a } of a computed color ('rgb(…)' or 'rgba(…)'), null for anything else
+function parseRgb(color) {
+    var m = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,\/]\s*([\d.]+)(%?))?\s*\)$/.exec(color || '');
+    if (!m)
+        return null;
+    return { r: +m[1], g: +m[2], b: +m[3], a: (m[4] == null) ? 1 : m[5] ? m[4] / 100 : +m[4] };
+}
+
+function rgbString(c, alpha) {
+    return (alpha == null) ? 'rgb(%d, %d, %d)'.format(c.r, c.g, c.b) : 'rgba(%d, %d, %d, %s)'.format(c.r, c.g, c.b, alpha);
+}
+
+// Relative luminance (WCAG): 0 for black, 1 for white
+function luminance(c) {
+    var channel = function(v) {
+        v /= 255;
+        return (v <= 0.03928) ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b);
+}
+
+// Text color on a background: dark text on light colors, white on dark ones
+function textOn(color) {
+    var c = parseRgb(color);
+    return (c && luminance(c) > 0.4) ? 'rgb(31, 35, 40)' : 'rgb(255, 255, 255)';
+}
+
+// Status of a connection for the table: [ sort key, label ]
+function connectionStatus(conn, geo) {
+    if (conn.is_allowed_ip)
+        return [ 'whitelist', _('Whitelisted') ];
+    if (conn.allowed === true)
+        return [ 'allowed', _('Allowed') ];
+    if (!geo.lat || !geo.lon)
+        return [ 'untracked', _('Untracked') ];
+    if (conn.allowed === false)
+        return [ 'blocked', _('Blocked') ];
+    return [ 'unknown', _('Unknown') ];
+}
+
+// A table cell as an element: ui.Table puts a plain string in as HTML. Missing values show '–'
+function textCell(value, title) {
+    var text = (typeof value == 'string' && value !== '') ? value : '–';
+    return E('span', (title && title !== text) ? { 'title': title } : {}, [ text ]);
+}
 
 // Poll intervals in seconds
 var CONNECTIONS_INTERVAL = 5,
@@ -132,6 +191,9 @@ return view.extend({
     connectionsBusy: null,  // running getGeomateConnections request
     statusBusy: null,       // running status request
     versionBusy: null,      // running check_version request
+    connectionsTable: null, // ui.Table of the active connections
+    themeKey: null,         // last theme sent to the map, as JSON
+    fullscreen: false,      // the map covers the window
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
@@ -161,13 +223,19 @@ return view.extend({
         var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
 
         window.addEventListener('message', L.bind(this.handleMessage, this), false);
-        // Escape outside the map also ends drawing; the map handles it when it has the focus
+        // Escape outside the map also ends drawing, then fullscreen; the map handles it when it
+        // has the focus. Capture phase: Escape that closes a LuCI dialog leaves fullscreen alone
         document.addEventListener('keydown', L.bind(function(ev) {
-            if (ev.key === 'Escape' && this.drawing)
+            if (ev.key !== 'Escape')
+                return;
+            if (this.drawing)
                 this.sendMessageToMap('cancelDraw');
-        }, this));
+            else if (this.fullscreen && !document.body.classList.contains('modal-overlay-active'))
+                this.setFullscreen(false);
+        }, this), true);
         this.updateStatus();
         this.startPolls();
+        this.watchTheme();
 
         return nodes;
     },
@@ -232,107 +300,229 @@ return view.extend({
     },
 
     renderMap: function() {
-        this.nodes.frame = E('iframe', {
+        var n = this.nodes;
+
+        var style = E('style', {}, `
+            /* No side margin: the map and the sections around it share the edges of the page content */
+            #geomate-map-container { margin: 12px 0 0; }
+            .gm-map-frame { display: block; width: 100%; height: 80vh; border: 0; }
+            .gm-map-frame.gm-map-frame--short { height: 600px; height: min(600px, 80vh); }
+            @media (max-width: 767px) {
+                .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+            }
+            /* Fullscreen: the map covers the window. An ancestor with its own z-index (Argon's
+               #maincontent) is lifted with it; a LuCI dialog stays above both */
+            #geomate-map-container.gm-map-fullscreen { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 10000; margin: 0; }
+            #geomate-map-container.gm-map-fullscreen .gm-map-frame { height: 100%; }
+            body.gm-map-fullscreen-active { overflow: hidden; }
+            .gm-map-fullscreen-lift { z-index: 10000 !important; }
+            body.modal-overlay-active #geomate-map-container.gm-map-fullscreen,
+            body.modal-overlay-active .gm-map-fullscreen-lift { z-index: 899 !important; }
+        `);
+
+        n.frame = E('iframe', {
             // The version parameter makes browsers fetch map.html again after an update
             src: L.resource('view/geomate/map.html') + '?v=' + encodeURIComponent(UI_VERSION),
             title: _('Geomate map'),
-            style: 'width: 100%; height: 80vh; border: none;' // Use 80% of the viewport height
+            'class': 'gm-map-frame'
         });
+        // Probes for detectTheme(): theme colors resolved by the browser, never shown
+        n.colorProbe = E('span', { 'style': 'display: none' });
+        n.surfaceProbe = E('div', { 'class': 'cbi-section', 'style': 'display: none' });
+        n.mapBox = E('div', { id: 'geomate-map-container' }, [ style, n.frame, n.colorProbe, n.surfaceProbe ]);
 
-        return E('div', { id: 'geomate-map-container', style: 'margin-top: 12px;' }, [ this.nodes.frame ]);
+        return n.mapBox;
     },
 
-    // Below the map: a header "Active connections (n)" with a Show/Hide button, and the table,
-    // hidden until shown
+    /**
+     * Colors of the LuCI theme for the map: dark or light from the luminance of the page
+     * background, the control surface from the theme's section background, accent, danger and
+     * success from the theme's CSS variables (THEME_VARS) with fallbacks.
+     */
+    detectTheme: function() {
+        var n = this.nodes,
+            vars = window.getComputedStyle(document.body),
+            dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches,
+            page = null, surface, fg, fallback, el, c;
+
+        // The first ancestor of the map that paints a background
+        for (el = n.mapBox; el && !page; el = el.parentElement) {
+            c = parseRgb(window.getComputedStyle(el).backgroundColor);
+            if (c && c.a > 0.5)
+                page = c;
+        }
+        if (page)
+            dark = luminance(page) < 0.2;
+        fallback = THEME_FALLBACKS[dark ? 'dark' : 'light'];
+
+        // Sections are white on Argon's grey page; Argon dark paints none, so the page color stays
+        c = parseRgb(window.getComputedStyle(n.surfaceProbe).backgroundColor);
+        surface = (c && c.a > 0.5 && (luminance(c) < 0.2) === dark) ? c : (page || parseRgb(fallback.bg));
+
+        // Text must contrast with the surface, else the fallback
+        c = parseRgb(window.getComputedStyle(n.mapBox).color);
+        fg = (c && (luminance(c) > 0.4) === dark) ? c : parseRgb(fallback.fg);
+
+        var resolve = function(names, color) {
+            for (var i = 0; i < names.length; i++) {
+                if (vars.getPropertyValue(names[i]).trim() === '')
+                    continue;
+                n.colorProbe.style.color = 'var(' + names[i] + ')';
+                c = parseRgb(window.getComputedStyle(n.colorProbe).color);
+                if (c && c.a > 0.5)
+                    return rgbString(c);
+            }
+            return color;
+        };
+
+        var theme = {
+            dark: dark,
+            bg: rgbString(surface),
+            fg: rgbString(fg),
+            border: rgbString(fg, 0.35),
+            accent: resolve(THEME_VARS.accent, fallback.accent),
+            danger: resolve(THEME_VARS.danger, fallback.danger),
+            success: resolve(THEME_VARS.success, fallback.success)
+        };
+        theme.accentFg = textOn(theme.accent);
+        theme.dangerFg = textOn(theme.danger);
+        return theme;
+    },
+
+    // Send the theme to the map when it differs from the last one sent (always with force)
+    sendTheme: function(force) {
+        var theme, key;
+
+        if (!this.mapReady)
+            return;
+        theme = this.detectTheme();
+        key = JSON.stringify(theme);
+        if (force || key !== this.themeKey) {
+            this.themeKey = key;
+            this.sendMessageToMap('theme', theme);
+        }
+    },
+
+    // Follow theme changes without a reload: the OS color scheme (Argon in its default mode)
+    // and attributes such as data-darkmode on <html> (Bootstrap). Transitions of the theme
+    // (Argon fades backgrounds) end before the second look
+    watchTheme: function() {
+        var self = this, timer = null;
+        var update = function() {
+            self.sendTheme(false);
+            window.clearTimeout(timer);
+            timer = window.setTimeout(function() { self.sendTheme(false); }, 400);
+        };
+        var mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+
+        if (mq && mq.addEventListener)
+            mq.addEventListener('change', update);
+        else if (mq && mq.addListener)
+            mq.addListener(update);
+
+        if (window.MutationObserver) {
+            var mo = new MutationObserver(update);
+            mo.observe(document.documentElement, { attributes: true, attributeFilter: [ 'class', 'style', 'data-darkmode', 'data-theme' ] });
+            mo.observe(document.body, { attributes: true, attributeFilter: [ 'class', 'style' ] });
+        }
+    },
+
+    /**
+     * Shows the map in the whole window or back in the page; the map asks for it with its
+     * fullscreen button and Escape, the view answers with the new state.
+     * @param {boolean} on - Fullscreen on.
+     */
+    setFullscreen: function(on) {
+        var box = this.nodes && this.nodes.mapBox, el;
+
+        on = !!on;
+        if (!box || on === this.fullscreen)
+            return this.sendMessageToMap('fullscreen', { on: this.fullscreen });
+
+        this.fullscreen = on;
+        box.classList.toggle('gm-map-fullscreen', on);
+        document.body.classList.toggle('gm-map-fullscreen-active', on);
+        // position: fixed stays inside the stacking context of an ancestor with a z-index
+        if (on) {
+            for (el = box.parentElement; el && el !== document.body; el = el.parentElement)
+                if (window.getComputedStyle(el).zIndex !== 'auto')
+                    el.classList.add('gm-map-fullscreen-lift');
+        }
+        else {
+            document.querySelectorAll('.gm-map-fullscreen-lift').forEach(function(lifted) {
+                lifted.classList.remove('gm-map-fullscreen-lift');
+            });
+        }
+        this.sendMessageToMap('fullscreen', { on: on });
+    },
+
+    // Section below the map: a header "Active connections (n)" with a Show/Hide button, and the
+    // table, collapsed until shown
     renderConnections: function() {
         var n = this.nodes;
 
-        // Define CSS styles for the active connections container and table
         var style = E('style', {}, `
-            /* No side margin: the header and the map share the edges of the page content */
-            .gm-connections-head { display: flex; flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 8px; margin: 12px 0 8px; }
+            /* No side margin, whatever the theme gives a section: the same edges as the map */
+            #active-connections-container { margin: 12px 0 0; }
+            #active-connections-container .gm-connections-head { display: flex; flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 8px; }
             /* A theme may give h3 width: 100%, which pushed the button to a second row */
-            .gm-connections-head h3 { flex: 1 1 0; min-width: 0; width: auto; margin: 0; }
-            .gm-connections-head .btn { flex: none; margin: 0; }
-            #active-connections-container {
-                padding: 10px;
-                box-sizing: border-box;
-                background-color: #f9f9f9;
-                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-                display: none; /* Hidden by default */
-                margin-left: 9px; /* Add left margin */
+            #active-connections-container .gm-connections-head h3 { flex: 1 1 0; min-width: 0; width: auto; margin: 0; }
+            #active-connections-container .gm-connections-head .btn { flex: none; margin: 0; }
+            #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
+            #active-connections-container .gm-connections-wrap[hidden] { display: none; }
+            #active-connections-container .table { margin: 0; }
+            .gm-status {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.4em;
+                padding: 0 0.6em;
+                line-height: 1.6;
+                white-space: nowrap;
+                border: 1px solid var(--gm-status-color);
+                border-radius: 999px;
             }
-            #active-connections-container .table-wrapper {
-                max-height: 400px;
-                overflow-y: auto;
-            }
-            #active-connections-container table {
-                width: 100%;
-                border-collapse: collapse;
-                font-family: Arial, sans-serif;
-                font-size: 14px;
-            }
-            #active-connections-container th,
-            #active-connections-container td {
-                padding: 12px 8px;
-                border-bottom: 1px solid #ddd;
-                text-align: left;
-            }
-            #active-connections-container th {
-                background-color: #607D8B;
-                color: black;
-                position: sticky;
-                top: 0;
-                z-index: 1;
-            }
-            #active-connections-container tr:nth-child(even) {
-                background-color: #f2f2f2;
-            }
-            #active-connections-container tr:hover {
-                background-color: #e0f7fa;
-            }
+            .gm-status::before { content: ""; flex: none; width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--gm-status-color); }
+            .gm-status--allowed { --gm-status-color: var(--success, var(--success-color-high, var(--success-color, #1a7f37))); }
+            .gm-status--blocked { --gm-status-color: var(--danger, var(--error-color-high, var(--danger-color, #cf222e))); }
+            .gm-status--whitelist { --gm-status-color: var(--primary, var(--primary-color-high, var(--main-bright-color, #1a6fd1))); }
+            .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
         `);
 
+        // Sortable columns; the theme styles the table like every LuCI table
+        this.connectionsTable = new ui.Table(
+            [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP') ],
+            { id: 'geomate-connections', sortable: true, placeholder: _('No active connections') },
+            E('em', {}, [ _('Loading connections…') ])
+        );
+
         n.connectionsTitle = E('h3', {}, [ _('Active connections') ]);
+        n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ]);
+        n.connectionsWrap.hidden = true;
         n.toggle = E('button', {
             'class': 'btn cbi-button cbi-button-neutral',
             'aria-expanded': 'false',
-            'aria-controls': 'active-connections-container',
+            'aria-controls': 'gm-connections-wrap',
             'click': L.bind(this.toggleConnections, this)
         }, [ _('Show') ]);
 
-        n.connectionsBody = E('tbody', { id: 'active-connections-table-body' });
-        n.connections = E('div', { id: 'active-connections-container' }, [
-            E('div', { class: 'table-wrapper' }, [
-                E('table', { class: 'table' }, [
-                    E('thead', {}, [
-                        E('tr', {}, [
-                            E('th', {}, [ _('IP') ]),
-                            E('th', {}, [ _('Geo-Filter Name') ]),
-                            E('th', {}, [ _('Status') ])
-                        ])
-                    ]),
-                    n.connectionsBody
-                ])
-            ])
-        ]);
-
-        return E('div', {}, [
+        n.connections = E('div', { 'class': 'cbi-section', 'id': 'active-connections-container' }, [
             style,
             E('div', { 'class': 'gm-connections-head' }, [ n.connectionsTitle, n.toggle ]),
-            n.connections
+            n.connectionsWrap
         ]);
+
+        return n.connections;
     },
 
     // Show or hide the connections table; the map gets smaller while it is shown
     toggleConnections: function() {
         var n = this.nodes,
-            show = n.connections.style.display !== 'block';
+            show = n.connectionsWrap.hidden;
 
-        n.connections.style.display = show ? 'block' : 'none';
+        n.connectionsWrap.hidden = !show;
         n.toggle.textContent = show ? _('Hide') : _('Show');
         n.toggle.setAttribute('aria-expanded', show ? 'true' : 'false');
-        n.frame.style.height = show ? '600px' : '80vh';
+        n.frame.classList.toggle('gm-map-frame--short', show);
         if (show)
             n.connections.scrollIntoView({ behavior: 'smooth' });
     },
@@ -469,8 +659,12 @@ return view.extend({
                     self.connectionsAt = Date.now();
                 if (self.connectionsFailed >= CONNECTIONS_STALE_AFTER || failed >= CONNECTIONS_STALE_AFTER)
                     self.updateStatus();
-                if (!list)
+                if (!list) {
+                    // Without any reply the table would keep saying it loads
+                    if (self.connectionsAt == null && self.connectionsFailed == CONNECTIONS_STALE_AFTER && self.connectionsTable)
+                        self.connectionsTable.update([], _('Connections unavailable'));
                     return;
+                }
                 self.connections = list;
                 self.sendMessageToMap('updateConnections', list);
                 self.updateActiveConnectionsList();
@@ -513,12 +707,17 @@ return view.extend({
         case 'mapReady':
             this.mapReady = true;
             this.drawing = false;
+            this.sendTheme(true);
+            this.sendMessageToMap('fullscreen', { on: this.fullscreen });
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
             this.pushFilters();
             this.sendMessageToMap('updateConnections', this.connections);
             break;
         case 'drawState':
             this.drawing = !!d.drawing;
+            break;
+        case 'fullscreen':
+            this.setFullscreen(d.on);
             break;
         case 'regionDrawn':
             this.enqueue(d.token, function() { return self.addDrawnRegion(d.token, d.region, d.sid); });
@@ -1143,10 +1342,11 @@ return view.extend({
         });
     },
 
-    // Function to update the active connections table
+    // Fill the connections table. Country, city and ISP come from luci.geomate's geo lookup;
+    // older backends and cache entries have none of them, the cells then show '–'
     updateActiveConnectionsList: function() {
-        var tbody = this.nodes && this.nodes.connectionsBody;
-        if (!tbody) return;
+        var table = this.connectionsTable;
+        if (!table || !this.nodes.connectionsTitle) return;
 
         // Skip any connection object lacking filter_name to avoid errors
         var list = this.connections.filter(function(conn) {
@@ -1155,29 +1355,20 @@ return view.extend({
 
         this.nodes.connectionsTitle.textContent = _('Active connections (%d)').format(list.length);
 
-        dom.content(tbody, list.map(function(conn) {
-            var status;
+        table.update(list.map(function(conn) {
+            // A failed lookup arrives as an empty array
+            var geo = (conn.geo && typeof conn.geo == 'object' && !Array.isArray(conn.geo)) ? conn.geo : {},
+                status = connectionStatus(conn, geo);
 
-            // Determine the status based on connection data
-            if (conn.is_allowed_ip) {
-                status = _('Allowed (Whitelist)');
-            } else if (conn.allowed === true) {
-                status = _('Allowed');
-            } else if ((!conn.geo || !conn.geo.lat || !conn.geo.lon) &&
-                       (conn.allowed === false || typeof conn.allowed === 'undefined')) {
-                status = _('Untracked');
-            } else if (conn.allowed === false) {
-                status = _('Blocked');
-            } else {
-                status = _('Unknown');
-            }
-
-            // Cells take text nodes only: names and addresses never run as markup
-            return E('tr', {}, [
-                E('td', {}, [ conn.dst || _('Unknown') ]),
-                E('td', {}, [ conn.filter_name ]),
-                E('td', {}, [ status ])
-            ]);
+            // Every cell is an element: names and provider strings never run as markup
+            return [
+                textCell(conn.dst),
+                textCell(conn.filter_name),
+                E('span', { 'class': 'gm-status gm-status--' + status[0], 'data-value': status[0] }, [ status[1] ]),
+                textCell(geo.country, geo.countryCode),
+                textCell(geo.city),
+                textCell(geo.isp, geo.org)
+            ];
         }));
     },
 
