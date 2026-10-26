@@ -436,14 +436,23 @@ function srcIpEntry(s) {
     return plainIPv4(m[3]) && number(m[1]) <= number(m[3]);
 }
 
-// Check a Source IP value (entries separated by white space, or an array of entries). multi:
-// the backend takes several entries and exceptions ('!' or '!=' before an entry). An entry
-// that the saved value (saved: its entries) has unchanged is valid, and so is the unchanged
-// saved value as a whole: a filter saved before these checks stays savable. Returns true or
-// the error text
-function checkSrcIp(value, saved, multi) {
-    var entries = L.toArray(L.toArray(value).join(' ')), i, entry;
+// The entries of a Source IP value (a string, or an array of strings), split at white space.
+// A '!' or '!=' written apart from its address joins it: the service reads '!= a.b.c.d' as
+// one exception only when it is the whole value (same function in geofilters.js)
+function srcIpEntries(value) {
+    return L.toArray(L.toArray(value).join(' ').replace(/(^|\s)(!=?)\s+/g, '$1$2'));
+}
 
+// Check a Source IP value against the saved one (both as srcIpEntries takes them). multi: the
+// backend takes several entries and exceptions ('!' or '!=' before an entry). The unchanged
+// saved value is valid, and so is one entry without '!' that it has: a filter saved before
+// these checks stays savable. With several entries or an exception the service checks every
+// entry and gives any other value to nft unchecked, so every entry must pass, saved ones too.
+// Returns true or the error text
+function checkSrcIp(value, saved, multi) {
+    var entries = srcIpEntries(value), i, entry;
+
+    saved = srcIpEntries(saved);
     if (entries.join(' ') === saved.join(' '))
         return true;
     if (!multi && entries.length > 1)
@@ -451,14 +460,39 @@ function checkSrcIp(value, saved, multi) {
 
     for (i = 0; i < entries.length; i++) {
         entry = entries[i];
-        if (saved.indexOf(entry) > -1)
+        if (entries.length == 1 && entry.charAt(0) != '!' && saved.indexOf(entry) > -1)
             continue;
         if (!multi && entry.charAt(0) == '!')
             return _('This Geomate backend supports no exceptions.');
-        if (!srcIpEntry(multi ? entry.replace(/^!=?/, '') : entry))
+        if (!srcIpEntry(entry.replace(/^!=?/, '')))
             return _('Expecting: %s').format(_('IPv4 address, address/prefix or address range'));
     }
     return true;
+}
+
+// Add the text typed into the custom input of a Source IP widget as Enter would: LuCI drops it
+// when the dropdown closes, so Save would store the field without it. Text that fails the
+// check stays in the input, keeps the field invalid and opens the dropdown to show its error
+// (same function in geofilters.js)
+function takeTypedEntry(widget) {
+    var input = (widget && widget.node) ? widget.node.querySelector('.create-item-input') : null,
+        sb = input ? input.closest('.cbi-dropdown') : null;
+
+    if (!sb || !input.value.trim())
+        return;
+    // LuCI checks the input on keyup; the result also sets the valid state of the field
+    input.dispatchEvent(new Event('keyup'));
+    if (input.classList.contains('cbi-input-invalid')) {
+        // After this click, which closes every dropdown
+        window.setTimeout(function() {
+            dom.findClassInstance(sb).openDropdown(sb);
+            input.focus();
+        }, 0);
+        return;
+    }
+    dom.findClassInstance(sb).createItems(sb, input.value);
+    input.value = '';
+    widget.triggerValidation();
 }
 
 // Make a ui.DynamicList add pasted 'a b' as two entries, like CBIDynamicMultiValueList in
@@ -466,7 +500,7 @@ function checkSrcIp(value, saved, multi) {
 // keeps its label, e.g. a picked suggestion (same function in geofilters.js)
 function splitEntries(widget) {
     widget.addItem = function(dl, value, text, flash) {
-        var values = L.toArray(value);
+        var values = srcIpEntries(value);
 
         values.forEach(function(v) {
             var label = (values.length == 1) ? text : (this.choices || {})[v];
@@ -1952,11 +1986,13 @@ return view.extend({
             enabled: new ui.Checkbox('1', { value_enabled: '1', value_disabled: '0' }),
             protocol: new ui.Select('udp', { tcp: 'TCP', udp: 'UDP' }, {}),
             // Like the field on the Geo Filters page: a list with a backend that reports
-            // src_ip_multi, else one address
+            // src_ip_multi, else one address; a text field without suggestions
             src_ip: multi
                 ? splitEntries(new ui.DynamicList([], hosts.keys.length ? hosts.labels : null,
                     { sort: hosts.keys, placeholder: _('-- add IP --'), validate: srcValidate }))
-                : new ui.Combobox('', hosts.labels, { sort: hosts.keys, select_placeholder: _('any'), validate: srcValidate }),
+                : hosts.keys.length
+                    ? new ui.Combobox('', hosts.labels, { sort: hosts.keys, select_placeholder: _('any'), validate: srcValidate })
+                    : new ui.Textfield('', { placeholder: _('any'), validate: srcValidate }),
             src_port: new ui.Textfield('', { datatype: 'list(neg(portrange))', placeholder: portPlaceholder }),
             dest_port: new ui.Textfield('', { datatype: 'list(neg(portrange))', placeholder: portPlaceholder }),
             allowed_ip: new ui.DynamicList([], null, { datatype: 'list(neg(ip4addr))', placeholder: ipPlaceholder }),
@@ -1981,7 +2017,7 @@ return view.extend({
             var v = fields[k].getValue();
             // Source IP is one option, its entries separated by a space; never a UCI list
             if (k == 'src_ip')
-                return L.toArray(L.toArray(v).join(' ')).join(' ');
+                return srcIpEntries(v).join(' ');
             return Array.isArray(v) ? v.filter(function(x) { return x.trim() !== ''; }) : String(v == null ? '' : v).trim();
         };
 
@@ -2013,7 +2049,7 @@ return view.extend({
         // Show the settings of the chosen filter; for a new one the values typed for it, or the defaults
         var fill = function(sec) {
             // An option or a hand-written list
-            srcSaved = sec ? L.toArray(L.toArray(sec.src_ip).join(' ')) : [];
+            srcSaved = sec ? srcIpEntries(sec.src_ip) : [];
 
             Object.keys(fields).forEach(function(k) {
                 var v = sec ? sec[k] : null;
@@ -2176,6 +2212,8 @@ return view.extend({
                 // The fields already show the target filter: update() runs on every pick and keystroke
                 var picked = filterW.getValue(), sec = target(), name = currentName();
 
+                // Source IP text typed without Enter counts too
+                takeTypedEntry(fields.src_ip);
                 Object.keys(fields).forEach(function(k) { fields[k].triggerValidation(); });
                 if (isNew())
                     nameW.triggerValidation();

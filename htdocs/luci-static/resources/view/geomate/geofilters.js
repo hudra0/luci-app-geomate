@@ -99,12 +99,10 @@ function formatRadius(meters) {
 // match to the rule). A Source IP address gets the name a host hint has for it, an exception
 // ('!' or '!=', also written apart from the address) reads 'except <address>'
 function matchItems(section_id, option) {
-    var text = L.toArray(uci.get('geomate', section_id, option)).join(' ');
+    var value = uci.get('geomate', section_id, option),
+        items = (option == 'src_ip') ? srcIpEntries(value) : L.toArray(L.toArray(value).join(' '));
 
-    if (option == 'src_ip')
-        text = text.replace(/(^|\s)(!=?)\s+/g, '$1$2');
-
-    return L.toArray(text).filter(function(v) {
+    return items.filter(function(v) {
         return v !== 'any' || option == 'src_ip';
     }).map(function(v) {
         var m = (option == 'src_ip') ? /^(!=?)?(.*)$/.exec(v) : null,
@@ -181,14 +179,23 @@ function srcIpEntry(s) {
     return plainIPv4(m[3]) && number(m[1]) <= number(m[3]);
 }
 
-// Check a Source IP value (entries separated by white space, or an array of entries). multi:
-// the backend takes several entries and exceptions ('!' or '!=' before an entry). An entry
-// that the saved value (saved: its entries) has unchanged is valid, and so is the unchanged
-// saved value as a whole: a filter saved before these checks stays savable. Returns true or
-// the error text
-function checkSrcIp(value, saved, multi) {
-    var entries = L.toArray(L.toArray(value).join(' ')), i, entry;
+// The entries of a Source IP value (a string, or an array of strings), split at white space.
+// A '!' or '!=' written apart from its address joins it: the service reads '!= a.b.c.d' as
+// one exception only when it is the whole value (same function in view.js)
+function srcIpEntries(value) {
+    return L.toArray(L.toArray(value).join(' ').replace(/(^|\s)(!=?)\s+/g, '$1$2'));
+}
 
+// Check a Source IP value against the saved one (both as srcIpEntries takes them). multi: the
+// backend takes several entries and exceptions ('!' or '!=' before an entry). The unchanged
+// saved value is valid, and so is one entry without '!' that it has: a filter saved before
+// these checks stays savable. With several entries or an exception the service checks every
+// entry and gives any other value to nft unchecked, so every entry must pass, saved ones too.
+// Returns true or the error text
+function checkSrcIp(value, saved, multi) {
+    var entries = srcIpEntries(value), i, entry;
+
+    saved = srcIpEntries(saved);
     if (entries.join(' ') === saved.join(' '))
         return true;
     if (!multi && entries.length > 1)
@@ -196,14 +203,39 @@ function checkSrcIp(value, saved, multi) {
 
     for (i = 0; i < entries.length; i++) {
         entry = entries[i];
-        if (saved.indexOf(entry) > -1)
+        if (entries.length == 1 && entry.charAt(0) != '!' && saved.indexOf(entry) > -1)
             continue;
         if (!multi && entry.charAt(0) == '!')
             return _('This Geomate backend supports no exceptions.');
-        if (!srcIpEntry(multi ? entry.replace(/^!=?/, '') : entry))
+        if (!srcIpEntry(entry.replace(/^!=?/, '')))
             return _('Expecting: %s').format(_('IPv4 address, address/prefix or address range'));
     }
     return true;
+}
+
+// Add the text typed into the custom input of a Source IP widget as Enter would: LuCI drops it
+// when the dropdown closes, so Save would store the field without it. Text that fails the
+// check stays in the input, keeps the field invalid and opens the dropdown to show its error
+// (same function in view.js)
+function takeTypedEntry(widget) {
+    var input = (widget && widget.node) ? widget.node.querySelector('.create-item-input') : null,
+        sb = input ? input.closest('.cbi-dropdown') : null;
+
+    if (!sb || !input.value.trim())
+        return;
+    // LuCI checks the input on keyup; the result also sets the valid state of the field
+    input.dispatchEvent(new Event('keyup'));
+    if (input.classList.contains('cbi-input-invalid')) {
+        // After this click, which closes every dropdown
+        window.setTimeout(function() {
+            dom.findClassInstance(sb).openDropdown(sb);
+            input.focus();
+        }, 0);
+        return;
+    }
+    dom.findClassInstance(sb).createItems(sb, input.value);
+    input.value = '';
+    widget.triggerValidation();
 }
 
 // Make a ui.DynamicList add pasted 'a b' as two entries, like CBIDynamicMultiValueList in
@@ -211,7 +243,7 @@ function checkSrcIp(value, saved, multi) {
 // keeps its label, e.g. a picked suggestion (same function in view.js)
 function splitEntries(widget) {
     widget.addItem = function(dl, value, text, flash) {
-        var values = L.toArray(value);
+        var values = srcIpEntries(value);
 
         values.forEach(function(v) {
             var label = (values.length == 1) ? text : (this.choices || {})[v];
@@ -664,19 +696,31 @@ return view.extend({
         o.rmempty = true;
         o.modalonly = true;
         hosts.keys.forEach(function(ip) { o.value(ip, hosts.labels[ip]); });
+        // A saved value that is no suggestion: the combobox adds it to the shared keylist, which
+        // would list it in the dialog of every other filter
+        o.transformChoices = function() {
+            if (this.keylist)
+                this.keylist.length = this.vallist.length;
+            return form.Value.prototype.transformChoices.call(this);
+        };
         // The entries of an option or of a hand-written list, as one string or as an array
         o.load = function(section_id) {
-            var v = L.toArray(form.Value.prototype.load.call(this, section_id)).join(' ');
-            return (v === '') ? null : multi ? L.toArray(v) : v;
+            var v = srcIpEntries(form.Value.prototype.load.call(this, section_id));
+            return !v.length ? null : multi ? v : v.join(' ');
         };
         o.write = function(section_id, value) {
-            return form.Value.prototype.write.call(this, section_id, L.toArray(value).join(' '));
+            return form.Value.prototype.write.call(this, section_id, srcIpEntries(value).join(' '));
+        };
+        // Text typed without Enter counts too
+        o.parse = function(section_id) {
+            takeTypedEntry(this.getUIElement(section_id));
+            return form.Value.prototype.parse.call(this, section_id);
         };
         // value '' is the check of the widget as a whole, any other value the text typed into
         // its input
         o.validate = function(section_id, value) {
             return checkSrcIp((value == null || value === '') ? this.formvalue(section_id) : value,
-                L.toArray(this.cfgvalue(section_id)), multi);
+                this.cfgvalue(section_id), multi);
         };
 
         // Source port configuration
