@@ -577,6 +577,7 @@
         var drawEndedAt = 0;    // a click right after a drawing ends selects no circle
         var viewFitted = false; // the start view has been fitted to the regions
         var refitUntil = 0;     // until then a resize fits the start view again; user input ends it
+        var focusSid = null;    // filter whose circles the start view fits (fitFilter message)
         var radiusPill = null;  // radius at the resize handle (edit) or at the cursor (draw)
 
         /*
@@ -973,12 +974,6 @@
             }
         }
 
-        // The start view: the saved home view, else all regions
-        function fitStartView() {
-            if (home) map.setView(home.center, home.zoom);
-            else fitAll(true);
-        }
-
         /**
          * Lowest zoom: the smallest at which the world covers the whole map, never below 1.
          * maxBounds keeps the map on one world copy, so a smaller world leaves grey bands beside
@@ -1011,6 +1006,14 @@
                 map.addLayer(markerClusters);
                 markerClusters.addLayers(markers);
             }
+        }
+
+        // The start view: the circles of the focus filter if it has any, else the saved home
+        // view, else all regions
+        function fitStartView() {
+            if (focusSid && fitFilter(focusSid)) return;
+            if (home) map.setView(home.center, home.zoom);
+            else fitAll(true);
         }
 
         // A resize shortly after the start view was fitted (the page still settles, a phone
@@ -1787,7 +1790,8 @@
             renderLegendFilters();
         }
 
-        // Zooms to the circles of a filter (magnifier in the legend); hidden ones show again
+        // Zooms to the circles of a filter (magnifier in the legend); hidden ones show again.
+        // Returns false when the filter has no circle
         function fitFilter(sid) {
             var bounds = null;
             if (hiddenSids[sid]) setFilterVisible(sid, true);
@@ -1796,6 +1800,7 @@
                 bounds = bounds ? bounds.extend(b) : b;
             });
             if (bounds) map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 16 });
+            return !!bounds;
         }
 
         function iconButton(parent, icon, label, key, fn) {
@@ -2253,7 +2258,8 @@
             refreshDrawMenu();
             updateToolbar();
 
-            // Start view: the saved home view, else all regions. The iframe may have changed
+            // Start view: the focus filter, else the saved home view, else all regions. Fitted
+            // once (a second fit right after an animated one is lost). The iframe may have changed
             // its size since the map measured it, and may still do so while the page settles
             if (!viewFitted) {
                 viewFitted = true;
@@ -2423,6 +2429,7 @@
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }], stagedSids }
+         *   fitFilter         { sid }                          start view: the circles of this filter, once, before the first setFilters
          *   cancelDraw        -                                Escape outside the map
          *   filterChanged     { sid, name, color, enabled }    e.g. after Enable in a toast
          *   regionSaved       { token, sid, name, color, enabled, region }
@@ -2436,6 +2443,9 @@
             var type = event.data.type, data = event.data.data;
             if (type === 'setFilters') {
                 setFilters(data || {});
+            } else if (type === 'fitFilter' && data && data.sid) {
+                focusSid = String(data.sid);
+                if (viewFitted) fitStartView();  // late: the start view has been fitted already
             } else if (type === 'updateConnections') {
                 updateConnections(data || []);
             } else if (type === 'theme' && data) {

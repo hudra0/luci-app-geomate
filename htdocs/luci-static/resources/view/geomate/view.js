@@ -185,6 +185,7 @@ return view.extend({
     health: null,       // last getHealthCheck result, null when it failed
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
+    focusSid: null,     // filter whose circles the first map view shows (#focus=<section>)
     nodes: null,        // nodes that the polls update in place
     pollFns: null,      // bound poll functions; poll.add() and poll.remove() match them by identity
     drawing: false,     // the map is drawing a circle (drawState)
@@ -214,6 +215,7 @@ return view.extend({
         // hasViewPermission() is what the footer uses without a form.Map to disable its buttons
         this.readonly = !L.hasViewPermission() || !configLoaded;
         this.nodes = {};
+        this.focusSid = this.takeFocusHash();
 
         if (!configLoaded)
             ui.addNotification(null, E('p', {}, [
@@ -238,6 +240,21 @@ return view.extend({
         this.watchTheme();
 
         return nodes;
+    },
+
+    // '#focus=<section>' (link "Show on map" of the Geo Filters page) names the filter whose
+    // circles the first map view shows. The hash is cleared, so a reload starts at the usual view.
+    // Returns the section id, or null for no hash or a section that is no geo_filter
+    takeFocusHash: function() {
+        var match = /^#focus=([^&]+)$/.exec(window.location.hash), sid = null;
+
+        if (!match)
+            return null;
+
+        try { sid = decodeURIComponent(match[1]); } catch (e) { sid = null; }
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+
+        return isGeoFilter(sid) ? sid : null;
     },
 
     renderStatus: function() {
@@ -710,6 +727,11 @@ return view.extend({
             this.sendTheme(true);
             this.sendMessageToMap('fullscreen', { on: this.fullscreen });
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
+            // Once, before the first setFilters, which then fits the start view to this filter
+            if (this.focusSid) {
+                this.sendMessageToMap('fitFilter', { sid: this.focusSid });
+                this.focusSid = null;
+            }
             this.pushFilters();
             this.sendMessageToMap('updateConnections', this.connections);
             break;
@@ -1087,7 +1109,8 @@ return view.extend({
 
         var hint = E('div', { 'class': 'cbi-value-description' }),
             status = E('div', { 'class': 'cbi-value-description' }),
-            listHint = E('div', { 'class': 'cbi-value-description' });
+            listHint = E('div', { 'class': 'cbi-value-description' }),
+            geoLink = E('a', { 'href': L.url('admin/services/geomate/geofilters') }, [ _('Geo Filters') ]);
 
         var nameNode = E('div', { 'style': 'margin-top: 8px' }, [ nameW.render() ]);
 
@@ -1108,6 +1131,8 @@ return view.extend({
             }
 
             fields.ip_list.node.querySelector('input').placeholder = suggestedList();
+            // The page opens the dialog of an existing filter at once
+            geoLink.href = L.url('admin/services/geomate/geofilters') + (secId ? '#edit=' + encodeURIComponent(secId) : '');
             // No null entries: dom.append in LuCI 23.05 and 26.036 renders them as the text "null"
             var hintText = [ !sec
                 ? _('Creates the filter %s.').format(name)
@@ -1241,7 +1266,7 @@ return view.extend({
                 E('div', { 'class': 'cbi-map' }, [ E('div', { 'class': 'cbi-section' }, [ body ]) ]),
                 E('p', {}, [
                     _('More options:'), ' ',
-                    E('a', { 'href': L.url('admin/services/geomate/geofilters') }, [ _('Geo Filters') ])
+                    geoLink
                 ]),
                 E('div', { 'class': 'right' }, [
                     E('button', { 'class': 'btn cbi-button-neutral', 'click': cancel }, [ _('Cancel') ]), ' ',
