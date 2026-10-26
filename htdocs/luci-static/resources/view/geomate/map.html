@@ -160,7 +160,7 @@
         'use strict';
 
         var map, drawnItems;
-        var allowedIPMarkers = {}; // New layer for Allowed IPs
+        var drawControl = null; // on the map only while the parent allows changes (setReadonly)
         var homePosition = [51.505, -0.09];
 
         /*
@@ -196,7 +196,6 @@
         });
 
         var connectionMarkers = {};
-        var activeConnectionIPs = {}; // Set of active connection IPs
 
         // Initialize MarkerCluster group with customized iconCreateFunction
         var markerClusters = L.markerClusterGroup({
@@ -272,7 +271,6 @@
             // Remove old connection markers from the cluster group
             markerClusters.clearLayers();
             connectionMarkers = {};
-            activeConnectionIPs = {};
 
             connections.forEach(function(conn) {
                 if (!conn || !conn.geo) {
@@ -286,13 +284,11 @@
                 var isAllowedIP = conn.is_allowed_ip;
 
                 if (geo.lat && geo.lon && !Array.isArray(geo.lat) && !Array.isArray(geo.lon)) {
-                    activeConnectionIPs[ip] = true;
-
                     var marker;
+                    // Whitelisted IPs (allowed_ip) arrive here with is_allowed_ip
                     if (isAllowedIP) {
                         marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
                         marker.bindPopup(popupContent(['Allowed IP: ' + ip, 'Filter: ' + filterName]));
-                        allowedIPMarkers[ip] = marker;
                     } else if (allowed) {
                         marker = L.marker([geo.lat, geo.lon], { icon: allowedConnectionIcon });
                         marker.bindPopup(popupContent(['IP: ' + ip, 'Status: Allowed', 'Filter: ' + filterName]));
@@ -308,37 +304,16 @@
         }
 
         /**
-         * Updates the UI with the list of allowed IPs.
-         * @param {Array} allowedIPsData - An array of allowed IP objects.
+         * Shows or hides the drawing and editing toolbar. Without write access the parent
+         * stages nothing, so the map offers no tools.
+         * @param {boolean} readonly - True when the user may not change regions.
          */
-        function updateAllowedIPsUI(allowedIPsData) {
-            // Remove old Allowed IP markers from the cluster group
-            for (var ip in allowedIPMarkers) {
-                markerClusters.removeLayer(allowedIPMarkers[ip]);
-                delete allowedIPMarkers[ip];
+        function setReadonly(readonly) {
+            if (readonly && drawControl._map) {
+                map.removeControl(drawControl);
+            } else if (!readonly && !drawControl._map) {
+                map.addControl(drawControl);
             }
-
-            // Add new Allowed IP markers only if the IP has an active connection
-            allowedIPsData.forEach(function(entry) {
-                var geo = entry.geo;
-                var ip = entry.ip;
-                var filter = entry.filter;
-
-                if (geo && geo.lat && geo.lon && activeConnectionIPs[ip]) { // Add only for active connections
-                    if (!allowedIPMarkers[ip]) { // Add only if not already present
-                        var marker = L.marker([geo.lat, geo.lon], { icon: allowedIPIcon });
-                        marker.bindPopup(popupContent(['Allowed IP: ' + ip, 'Filter: ' + filter]));
-                        markerClusters.addLayer(marker);
-                        allowedIPMarkers[ip] = marker;
-                    }
-                } else {
-                    // If the IP is no longer active but still on the allowlist
-                    if (allowedIPMarkers[ip]) {
-                        markerClusters.removeLayer(allowedIPMarkers[ip]);
-                        delete allowedIPMarkers[ip];
-                    }
-                }
-            });
         }
 
         /**
@@ -413,8 +388,8 @@
             // No "Clear All" in the delete toolbar: it removed every circle of every filter at once
             L.EditToolbar.Delete.prototype.removeAllLayers = null;
 
-            // Initialize drawing controls
-            var drawControl = new L.Control.Draw({
+            // Drawing controls; setReadonly adds them once the parent allows changes
+            drawControl = new L.Control.Draw({
                 edit: { featureGroup: drawnItems },
                 draw: {
                     polygon: false,
@@ -425,7 +400,6 @@
                     circlemarker: false
                 }
             });
-            map.addControl(drawControl);
 
             // Event listeners for drawing actions
             map.on(L.Draw.Event.CREATED, onDrawCreated);
@@ -768,8 +742,8 @@
                 setFilters(data || {});
             } else if (type === 'updateConnections') {
                 updateConnections(data || []);
-            } else if (type === 'updateAllowedIPs') {
-                updateAllowedIPsUI(data || []);
+            } else if (type === 'setReadonly') {
+                setReadonly(!data || data.readonly !== false);
             } else if (type === 'toast' && data && data.text) {
                 showToast(String(data.text));
             } else if (/^region(Saved|Removed|Discarded|Rejected)$/.test(type) && data) {
