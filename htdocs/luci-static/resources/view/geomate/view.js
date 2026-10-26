@@ -114,6 +114,12 @@ function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
 }
 
+// mousedown handler of the <summary> bars: a click toggles the details without focusing the bar,
+// so Chromium draws no focus ring that lingers until the focus moves on
+function noFocus(ev) {
+    ev.preventDefault();
+}
+
 // The message of an error without the stack trace, which L.raise() appends to RPC errors
 function errorText(err) {
     return String((err && err.message) || err).split('\n')[0];
@@ -231,6 +237,70 @@ var CONNECTIONS_INTERVAL = 5,
     // Failed getGeomateConnections requests in a row before the status row says the list is old
     CONNECTIONS_STALE_AFTER = 3;
 
+// check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
+// IP. The browser keeps the last result ({ stdout, stderr, code, at, ui }) and shows it again on page load
+// and in the hourly poll: a success for VERSION_INTERVAL, a failure for VERSION_RETRY seconds
+var VERSION_CACHE_KEY = 'geomate-version-check',
+    VERSION_RETRY = 600;
+
+// Symbols of the health check states in the status row
+var CHECK_ICONS = { ok: '✓', info: '○', warning: '⚠', error: '✗' };
+
+// { current, latest, channel } of one 'Backend versions:' or 'Frontend versions:' block
+function versionFields(text) {
+    var field = function(label) {
+        var m = new RegExp(label + ': *(\\S+)').exec(text);
+        return m ? m[1] : null;
+    };
+    return { current: field('Current version'), latest: field('Latest version'), channel: field('Update channel') };
+}
+
+/**
+ * Versions and update state from a check_version result. The output has a 'Backend versions:'
+ * block before 'Frontend versions:'; when GitHub fails it stops after the backend's channel and
+ * current version. The frontend version then comes from this file (stamped by the updater).
+ * The errors, 'HTTP error 403' among them, are on stderr.
+ * @param {object} entry - { stdout, stderr, code } of check_version.
+ * @returns {object} { backend, frontend, state: 'current'|'update'|'failed', update: 'both'|'backend'|'frontend'|null, limited }
+ */
+function versionState(entry) {
+    var out = String(entry.stdout || ''),
+        start = out.indexOf('Backend versions:'),
+        at = out.indexOf('Frontend versions:'),
+        b = versionFields((start < 0) ? '' : out.slice(start, (at > start) ? at : undefined)),
+        f = versionFields((at < 0) ? '' : out.slice(at)),
+        newer = function(c) { return !!(c.current && c.latest && c.current !== c.latest); };
+
+    if (!f.current) {
+        f.current = UI_VERSION;
+        f.channel = f.channel || UI_UPD_CHANNEL;
+    }
+
+    return {
+        backend: b,
+        frontend: f,
+        update: (newer(b) && newer(f)) ? 'both' : newer(b) ? 'backend' : newer(f) ? 'frontend' : null,
+        state: (newer(b) || newer(f)) ? 'update' : (entry.code === 0 || (b.latest && f.latest)) ? 'current' : 'failed',
+        limited: /HTTP error 403|rate limit/i.test(out + '\n' + (entry.stderr || ''))
+    };
+}
+
+// The cached check_version result while it is fresh, else null. Only for this frontend version:
+// a frontend update changes it. A success expires a minute early, so the hourly poll asks again
+function cachedVersionCheck() {
+    var entry = null, ttl;
+
+    try { entry = JSON.parse(window.localStorage.getItem(VERSION_CACHE_KEY) || 'null'); } catch (e) {}
+    if (!entry || typeof entry.stdout != 'string' || typeof entry.at != 'number' || entry.ui !== UI_VERSION)
+        return null;
+    ttl = (versionState(entry).state == 'failed') ? VERSION_RETRY : VERSION_INTERVAL - 60;
+    return (Date.now() >= entry.at && Date.now() - entry.at < ttl * 1000) ? entry : null;
+}
+
+function storeVersionCheck(entry) {
+    try { window.localStorage.setItem(VERSION_CACHE_KEY, JSON.stringify(entry)); } catch (e) {}
+}
+
 return view.extend({
     // Every map change is applied at once (commitGeomate), so the page has no footer
     handleSave: null,
@@ -251,6 +321,9 @@ return view.extend({
     status: null,       // last getStatus result, null when it failed
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
+    problems: [],       // problems of the last status poll: 'process' and check keys (updateStatus)
+    confirmed: [],      // problems seen on two polls in a row; a new one opens the details
+    versionInfo: null,  // last versionState() result, null before the first check
     readonly: true,     // no write access, or no configuration: the map only shows
     mapReady: false,
     focusSid: null,     // filter whose circles the first map view shows (#focus=<section>)
@@ -329,44 +402,109 @@ return view.extend({
         return isGeoFilter(sid) ? sid : null;
     },
 
+    // Status row: a <details> whose summary shows service, mode, checks, notes, versions and the
+    // update state in one line, and whose panel lists each value. updateStatus() and
+    // showVersions() change these nodes in place, so the open state the user chose stays
     renderStatus: function() {
         var n = this.nodes;
 
-        n.indicator = E('div', {
-            id: 'service-status-indicator',
-            style: 'width: 12px; height: 12px; border-radius: 50%; margin-right: 8px;'
-        });
-        n.state = E('span', { id: 'service-status-text', style: 'margin: 0; font-weight: bold;' });
-        n.health = E('span', { id: 'health-check-status', style: 'font-size: 13px; margin-left: 8px;' });
-        n.loading = E('span', {
-            id: 'geomate-loading-indicator',
-            style: 'display: none; color: orange; margin-left: 8px;'
-        }, [ _('Loading GeoFilter data ...') ]);
-        n.stale = E('span', {
-            id: 'geomate-connections-stale',
-            style: 'display: none; color: orange; margin-left: 8px;'
-        });
-        n.mode = E('p', { id: 'operational-mode-text', style: 'margin: 0;' });
-        n.version = E('span', { id: 'version-display', style: 'color: #6b7280;' }, [ _('Loading version...') ]);
-        n.update = E('span', { id: 'version-update-status', style: 'margin-left: 8px; font-style: italic;' });
+        var style = E('style', {}, `
+            /* Theme colors with fallbacks, for the status row and the connection pills */
+            #geomate-status, #active-connections-container {
+                --gm-success: var(--success, var(--success-color-high, var(--success-color, #1a7f37)));
+                --gm-danger: var(--danger, var(--error-color-high, var(--danger-color, var(--error-color, #cf222e))));
+                --gm-primary: var(--primary, var(--primary-color-high, var(--main-bright-color, #1a6fd1)));
+                --gm-warning: var(--warning, var(--warn-color-high, var(--warning-color, #9a6700)));
+            }
+            /* Pill: border and dot in --gm-status-color, the text in the theme's color */
+            .gm-status {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.4em;
+                padding: 0 0.6em;
+                line-height: 1.6;
+                white-space: nowrap;
+                border: 1px solid var(--gm-status-color);
+                border-radius: 999px;
+            }
+            .gm-status::before { content: ""; flex: none; width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--gm-status-color); }
+            .gm-status--running { --gm-status-color: var(--gm-success); }
+            .gm-status--stopped { --gm-status-color: var(--gm-danger); }
+            .gm-status--mode { --gm-status-color: var(--gm-primary); }
+            .gm-status--neutral { --gm-status-color: currentColor; }
+            #geomate-status [hidden] { display: none; }
+            #geomate-status > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; list-style: none; cursor: pointer; }
+            #geomate-status > summary::-webkit-details-marker { display: none; }
+            /* A mouse click leaves no focus ring (see noFocus); the keyboard ring uses the theme color */
+            #geomate-status > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: -2px; }
+            #geomate-status > summary:focus:not(:focus-visible) { outline: none; }
+            #geomate-status .gm-spacer { flex: 1 1 0; }
+            #geomate-status .gm-muted, #geomate-status .gm-icon--info { opacity: 0.65; }
+            #geomate-status .gm-primary { color: var(--gm-primary); }
+            /* Arrow of a summary toggle: here and in the connections header */
+            .gm-arrow { display: inline-block; transition: transform 0.15s; }
+            details[open] > summary .gm-arrow { transform: rotate(180deg); }
+            /* The warning colors of Bootstrap and Material are too light for text on white: warning
+               icons and dots carry the color, the text keeps the theme's color. Errors are text */
+            #geomate-status .gm-icon--ok { color: var(--gm-success); }
+            #geomate-status .gm-icon--warning { color: var(--gm-warning); }
+            #geomate-status .gm-icon--error { color: var(--gm-danger); }
+            #geomate-status .gm-note { font-size: 90%; }
+            #geomate-status .gm-note::before { content: ""; display: inline-block; width: 0.5em; height: 0.5em; margin-right: 0.4em; border-radius: 50%; background: var(--gm-warning); }
+            #geomate-status .gm-status-details { position: relative; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; align-items: center; margin-top: 8px; padding: 8px 12px; font-size: 90%; overflow-wrap: anywhere; }
+            /* A faint border in the theme's text color */
+            #geomate-status .gm-status-details::before { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; border: 1px solid currentColor; border-radius: 4px; opacity: 0.2; pointer-events: none; }
+            #geomate-status .gm-contents { display: contents; }
+            #geomate-status .gm-status-details .cbi-button { margin: 0 0 0 8px; }
+            @media (max-width: 639px) {
+                #geomate-status .gm-wide { display: none; }
+            }
+        `);
 
-        return E('div', { style: 'display: flex; flex-direction: column;' }, [
-            // Service status, health checks, loading and stale connections in one row
-            E('div', { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px;' }, [
-                E('div', { style: 'display: flex; align-items: center;' }, [ n.indicator, n.state ]),
-                n.health,
-                n.loading,
-                n.stale
+        // A key and its value in the details panel
+        var row = function(label, value) {
+            return [ E('span', { 'class': 'gm-muted' }, [ label ]), value ];
+        };
+
+        n.state = E('span', { 'id': 'service-status-text', 'class': 'gm-status gm-status--neutral gm-muted' });
+        n.mode = E('span', { 'id': 'operational-mode-text', 'class': 'gm-status gm-status--mode' });
+        n.health = E('span', { 'id': 'health-check-status' });
+        n.loading = E('span', { 'id': 'geomate-loading-indicator', 'class': 'gm-note' }, [ _('Loading GeoFilter data ...') ]);
+        n.stale = E('span', { 'id': 'geomate-connections-stale', 'class': 'gm-note' });
+        n.version = E('span', { 'id': 'version-display', 'class': 'gm-muted gm-wide' });
+        n.update = E('span', { 'id': 'version-update-status', 'class': 'gm-wide' });
+
+        n.detailService = E('span');
+        n.detailMode = E('span');
+        n.detailChecks = E('div', { 'class': 'gm-contents' });
+        n.checkRows = {};   // { icon, text, cells } per check key (updateStatus)
+        n.checkKeys = null; // keys of the rows in detailChecks
+        n.detailBackend = E('span');
+        n.detailFrontend = E('span');
+        n.detailUpdate = E('span');
+        n.recheck = E('button', {
+            'class': 'btn cbi-button cbi-button-neutral',
+            'click': L.bind(function() { this.checkForUpdates(true); }, this)
+        }, [ _('Check again') ]);
+
+        n.statusRow = E('details', { 'id': 'geomate-status' }, [
+            E('summary', { 'mousedown': noFocus }, [
+                n.state, n.mode, n.health, n.loading, n.stale,
+                E('span', { 'class': 'gm-spacer' }),
+                n.version, n.update,
+                E('span', { 'class': 'gm-muted' }, [ _('Details'), ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
             ]),
-            // Operational mode and versions
-            E('div', {
-                id: 'operational-mode-container',
-                style: 'margin-top: 8px; display: flex; justify-content: space-between; align-items: center;'
-            }, [
-                n.mode,
-                E('div', { style: 'font-size: 13px; color: #6b7280;' }, [ n.version, n.update ])
-            ])
+            E('div', { 'class': 'gm-status-details' }, [].concat(
+                row(_('Service'), n.detailService),
+                row(_('Mode'), n.detailMode),
+                [ n.detailChecks ],
+                row(_('Backend'), n.detailBackend),
+                row(_('Frontend'), n.detailFrontend),
+                row(_('Updates'), E('span', {}, [ n.detailUpdate, n.recheck ]))
+            ))
         ]);
+
+        return E('div', {}, [ style, n.statusRow ]);
     },
 
     // Choices of the filter select in the new region dialog: placeholder (''), every named
@@ -496,10 +634,14 @@ return view.extend({
     // (Argon fades backgrounds) end before the second look
     watchTheme: function() {
         var self = this, timer = null;
-        var update = function() {
+        var look = function() {
             self.sendTheme(false);
+            self.updateStickyHeader();
+        };
+        var update = function() {
+            look();
             window.clearTimeout(timer);
-            timer = window.setTimeout(function() { self.sendTheme(false); }, 400);
+            timer = window.setTimeout(look, 400);
         };
         var mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
 
@@ -544,35 +686,37 @@ return view.extend({
         this.sendMessageToMap('fullscreen', { on: on });
     },
 
-    // Section below the map: a header "Active connections (n)" with a Show/Hide button, and the
-    // table, collapsed until shown
+    // Section below the map: a <details> whose summary is the "Active connections (n)" heading
+    // with a Show/Hide label, and the table, collapsed until shown
     renderConnections: function() {
         var n = this.nodes;
 
         var style = E('style', {}, `
             /* No side margin, whatever the theme gives a section: the same edges as the map */
             #active-connections-container { margin: 12px 0 0; }
-            #active-connections-container .gm-connections-head { display: flex; flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 8px; }
-            /* A theme may give h3 width: 100%, which pushed the button to a second row */
-            #active-connections-container .gm-connections-head h3 { flex: 1 1 0; min-width: 0; width: auto; margin: 0; }
-            #active-connections-container .gm-connections-head .btn { flex: none; margin: 0; }
+            #active-connections-container > summary { display: block; list-style: none; cursor: pointer; }
+            #active-connections-container > summary::-webkit-details-marker { display: none; }
+            #active-connections-container > summary:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: -2px; }
+            #active-connections-container > summary:focus:not(:focus-visible) { outline: none; }
+            /* The heading keeps the theme's look; a theme may give h3 width: 100% */
+            #active-connections-container h3 { display: flex; align-items: center; gap: 8px; min-width: 0; width: auto; margin: 0; }
+            #active-connections-container .gm-connections-title { flex: 1 1 auto; min-width: 0; }
+            /* Themes that uppercase headings leave the label as it is */
+            #active-connections-container .gm-connections-toggle { flex: none; font-size: 13px; font-weight: normal; opacity: 0.7; white-space: nowrap; text-transform: none; letter-spacing: normal; }
             #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
-            #active-connections-container .gm-connections-wrap[hidden] { display: none; }
-            #active-connections-container .table { margin: 0; }
-            .gm-status {
-                display: inline-flex;
-                align-items: center;
-                gap: 0.4em;
-                padding: 0 0.6em;
-                line-height: 1.6;
-                white-space: nowrap;
-                border: 1px solid var(--gm-status-color);
-                border-radius: 999px;
-            }
-            .gm-status::before { content: ""; flex: none; width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--gm-status-color); }
-            .gm-status--allowed { --gm-status-color: var(--success, var(--success-color-high, var(--success-color, #1a7f37))); }
-            .gm-status--blocked { --gm-status-color: var(--danger, var(--error-color-high, var(--danger-color, #cf222e))); }
-            .gm-status--whitelist { --gm-status-color: var(--primary, var(--primary-color-high, var(--main-bright-color, #1a6fd1))); }
+            /* Argon and Material set overflow-y: hidden on .table, which would make the table the
+               scroll box of the sticky title cells below and let them scroll away with the rows */
+            #active-connections-container .table { margin: 0; overflow: visible; }
+            /* The column titles stay visible while the table scrolls: sticky cells, a sticky row
+               is unreliable. Opaque fill in the theme's color: updateStickyHeader() */
+            #active-connections-container .table-titles > .th,
+            #active-connections-container thead th { position: sticky; top: 0; z-index: 1; }
+            #active-connections-container .gm-sticky-fill .table-titles > .th,
+            #active-connections-container .gm-sticky-fill thead th { background-color: var(--gm-sticky-bg); }
+            /* Pills and theme colors: renderStatus */
+            .gm-status--allowed { --gm-status-color: var(--gm-success); }
+            .gm-status--blocked { --gm-status-color: var(--gm-danger); }
+            .gm-status--whitelist { --gm-status-color: var(--gm-primary); }
             .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
         `);
 
@@ -583,97 +727,213 @@ return view.extend({
             E('em', {}, [ _('Loading connections…') ])
         );
 
-        n.connectionsTitle = E('h3', {}, [ _('Active connections') ]);
-        n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ]);
-        n.connectionsWrap.hidden = true;
-        n.toggle = E('button', {
-            'class': 'btn cbi-button cbi-button-neutral',
-            'aria-expanded': 'false',
-            'aria-controls': 'gm-connections-wrap',
-            'click': L.bind(this.toggleConnections, this)
-        }, [ _('Show') ]);
+        // updateActiveConnectionsList() sets the count in the title span
+        n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
+        n.connectionsToggle = E('span', {}, [ _('Show') ]);
 
-        n.connections = E('div', { 'class': 'cbi-section', 'id': 'active-connections-container' }, [
+        n.connections = E('details', {
+            'class': 'cbi-section',
+            'id': 'active-connections-container',
+            'toggle': L.bind(this.toggleConnections, this)
+        }, [
             style,
-            E('div', { 'class': 'gm-connections-head' }, [ n.connectionsTitle, n.toggle ]),
-            n.connectionsWrap
+            E('summary', { 'mousedown': noFocus }, [
+                E('h3', {}, [
+                    n.connectionsTitle,
+                    E('span', { 'class': 'gm-connections-toggle' }, [ n.connectionsToggle, ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
+                ])
+            ]),
+            n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ])
         ]);
 
         return n.connections;
     },
 
-    // Show or hide the connections table; the map gets smaller while it is shown
-    toggleConnections: function() {
-        var n = this.nodes,
-            show = n.connectionsWrap.hidden;
+    // Fill of the sticky column titles: the first opaque background from a title cell up. Argon
+    // paints the cells, Bootstrap the title row, other themes only the section or the page; a
+    // transparent sticky cell would show the scrolled rows through it. Called when the table is
+    // shown and when the theme changes
+    updateStickyHeader: function() {
+        var wrap = this.nodes && this.nodes.connectionsWrap,
+            cell = wrap && wrap.querySelector('.table-titles > .th, thead th'),
+            el, c = null;
 
-        n.connectionsWrap.hidden = !show;
-        n.toggle.textContent = show ? _('Hide') : _('Show');
-        n.toggle.setAttribute('aria-expanded', show ? 'true' : 'false');
-        n.frame.classList.toggle('gm-map-frame--short', show);
-        if (show)
-            n.connections.scrollIntoView({ behavior: 'smooth' });
+        if (!cell || !cell.isConnected)
+            return;
+        // Read the theme's colors, not the last fill
+        wrap.classList.remove('gm-sticky-fill');
+        for (el = cell; el && !c; el = el.parentElement) {
+            c = parseRgb(window.getComputedStyle(el).backgroundColor);
+            if (c && c.a < 1)
+                c = null;
+        }
+        // Without any background the browser paints the page white
+        wrap.style.setProperty('--gm-sticky-bg', c ? rgbString(c) : THEME_FALLBACKS.light.bg);
+        wrap.classList.add('gm-sticky-fill');
     },
 
-    // Show the last status and health check
-    updateStatus: function() {
+    // After the connections section opened or closed: the map gets smaller while the table is shown
+    toggleConnections: function() {
+        var n = this.nodes,
+            show = n.connections.open;
+
+        n.connectionsToggle.textContent = show ? _('Hide') : _('Show');
+        n.frame.classList.toggle('gm-map-frame--short', show);
+        if (show) {
+            this.updateStickyHeader();
+            n.connections.scrollIntoView({ behavior: 'smooth' });
+        }
+    },
+
+    // Show the last status and health check in the status row; polled: with a new status reply.
+    // A problem (service stopped although enabled, a check with an error or warning) seen on two
+    // polls in a row opens the details once, so a restart or one failed reply does not; they
+    // never close on their own
+    updateStatus: function(polled) {
         var n = this.nodes,
             st = this.status,
             checks = this.health && this.health.checks,
-            running = !!(st && st.running);
+            running = !!(st && st.running),
+            pid = running && st.pid,
+            loading = !!(st ? st.loading : (this.health && this.health.loading)),
+            problems = (st && !running && st.config_enabled !== false) ? [ 'process' ] : [];
 
         if (!n)
             return;
 
-        n.indicator.style.backgroundColor = st ? (running ? 'green' : 'red') : 'gray';
-        n.state.textContent = st ? (running ? _('Running') : _('Not Running'))
+        var state = st ? (running ? _('Running') : _('Not running'))
             : (this.statusLoaded ? _('Status unknown') : _('Loading status...'));
-        n.loading.style.display = (st ? st.loading : (this.health && this.health.loading)) ? 'inline' : 'none';
-
-        // Compact health check display; messages stay text, never markup
-        var checkLabels = {
-            'config': _('Config'),
-            'files': _('Files'),
-            'datadir': _('Data'),
-            'service': _('Autostart'),
-            'nft': _('nftables')
-        };
-        var icons = {
-            'error': ['✗', '#ef4444'],
-            'warning': ['⚠', '#f59e0b'],
-            'info': ['○', '#6b7280']
-        };
-        dom.content(n.health, !checks ? null : Object.keys(checkLabels).filter(function(key) {
-            return checks[key];
-        }).map(function(key) {
-            var icon = icons[checks[key].status] || ['✓', '#10b981'];
-            return E('span', { 'style': 'margin-right: 10px;', 'title': checks[key].message || '' }, [
-                E('span', { 'style': 'color: ' + icon[1] + ';' }, [ icon[0] ]),
-                ' ' + checkLabels[key]
-            ]);
-        }));
+        n.state.textContent = state;
+        n.state.className = 'gm-status ' + (st ? (running ? 'gm-status--running' : 'gm-status--stopped') : 'gm-status--neutral gm-muted');
+        n.state.title = pid ? _('PID %d').format(pid) : '';
+        n.detailService.textContent = pid ? _('Running (PID %d)').format(pid) : state;
+        n.loading.hidden = !loading;
 
         // Operational mode of the committed configuration, the one the service runs with
-        var mode = st && st.operational_mode, modeText = '', modeStyle = '';
-        if (mode === 'monitor') {
-            modeText = _('Mode: Monitor Only - Connections are tracked but NOT blocked');
-            modeStyle = 'color: orange; font-weight: bold;';
-        } else if (mode === 'static') {
-            modeText = _('Mode: Static - Using predefined IP lists');
-            modeStyle = 'color: blue;';
-        } else if (mode) {
-            modeText = _('Mode: Dynamic - Building IP lists automatically');
-            modeStyle = 'color: green;';
+        var modes = {
+            monitor: [ _('Monitor mode'), _('Connections are tracked but not blocked.') ],
+            static: [ _('Static mode'), _('Uses the IP lists as they are.') ],
+            dynamic: [ _('Dynamic mode'), _('Builds IP lists automatically.') ]
+        };
+        var mode = (st && st.operational_mode) ? (modes[st.operational_mode] || modes.dynamic) : null;
+        n.mode.hidden = !mode;
+        n.mode.textContent = mode ? mode[0] : '';
+        n.mode.title = mode ? mode[1] : '';
+        n.detailMode.textContent = mode ? mode[1] : '–';
+
+        // Health checks; process and loading are shown by the service pill and the loading note.
+        // 'info' (e.g. autostart disabled) is no problem. Messages stay text, never markup
+        var shown = !checks ? [] : [
+            [ 'config', _('Config') ],
+            [ 'files', _('Files') ],
+            [ 'datadir', _('Data') ],
+            [ 'service', _('Autostart') ],
+            [ 'nft', _('nftables') ],
+            [ 'nft_errors', _('nft errors') ]
+        ].filter(function(c) { return checks[c[0]]; }).map(function(c) {
+            var status = CHECK_ICONS[checks[c[0]].status] ? checks[c[0]].status : 'ok';
+            return { key: c[0], label: c[1], status: status, message: ' ' + String(checks[c[0]].message || '') };
+        });
+        var failing = function(status) {
+            return shown.filter(function(c) { return c.status == status; });
+        };
+        var errors = failing('error'), warnings = failing('warning'),
+            labels = (errors.length ? errors : warnings).map(function(c) { return c.label; }).join(', ');
+
+        n.health.title = shown.map(function(c) { return c.label + ':' + c.message; }).join('\n');
+        dom.content(n.health, !shown.length ? null
+            : errors.length ? E('span', { 'class': 'gm-icon--error' }, [ CHECK_ICONS.error + ' ' + labels ])
+            : warnings.length ? [ E('span', { 'class': 'gm-icon--warning' }, [ CHECK_ICONS.warning ]), ' ' + labels ]
+            : E('span', { 'class': 'gm-muted' }, [ CHECK_ICONS.ok + ' ' + _('All checks passed') ]));
+
+        // The check rows change in place, so a selected message stays selected
+        shown.forEach(function(c) {
+            var r = n.checkRows[c.key];
+
+            if (!r) {
+                r = n.checkRows[c.key] = { icon: E('span'), text: document.createTextNode('') };
+                r.cells = [ E('span', { 'class': 'gm-muted' }, [ c.label ]), E('span', {}, [ r.icon, r.text ]) ];
+            }
+            r.icon.className = 'gm-icon--' + c.status;
+            if (r.icon.textContent !== CHECK_ICONS[c.status])
+                r.icon.textContent = CHECK_ICONS[c.status];
+            if (r.text.data !== c.message)
+                r.text.data = c.message;
+        });
+        var keys = shown.map(function(c) { return c.key; }).join(' ');
+        if (keys !== n.checkKeys) {
+            n.checkKeys = keys;
+            dom.content(n.detailChecks, shown.reduce(function(cells, c) { return cells.concat(n.checkRows[c.key].cells); }, []));
         }
-        n.mode.textContent = modeText;
-        n.mode.style.cssText = 'margin: 0; ' + modeStyle;
+        problems = problems.concat(errors.concat(warnings).map(function(c) { return c.key; }));
 
         // A single failed request keeps the last list silently; a lasting failure becomes visible
         var stale = this.connectionsFailed >= CONNECTIONS_STALE_AFTER;
-        n.stale.style.display = stale ? 'inline' : 'none';
+        n.stale.hidden = !stale;
         n.stale.textContent = !stale ? '' : this.connectionsAt
             ? _('Connections not updated since %s').format(new Date(this.connectionsAt).toLocaleTimeString())
             : _('Connections unavailable');
+
+        // A failed reply tells nothing, and the service builds its table while it loads
+        if (!polled || !st || !checks || loading)
+            return;
+        var last = this.problems,
+            confirmed = problems.filter(function(p) { return last.indexOf(p) >= 0; });
+        if (confirmed.some(function(p) { return this.confirmed.indexOf(p) < 0; }, this))
+            n.statusRow.open = true;
+        this.problems = problems;
+        this.confirmed = confirmed;
+    },
+
+    // Show the versions and the update state of versionInfo; before the first result the
+    // frontend version of this file
+    showVersions: function() {
+        var n = this.nodes,
+            v = this.versionInfo || versionState({}),
+            versions = [],
+            summary = '', detail = '', primary = false;
+
+        if (!n)
+            return;
+
+        if (v.backend.current)
+            versions.push(_('Backend %s').format(formatVersionDisplay(v.backend.current)));
+        if (v.frontend.current)
+            versions.push(_('Frontend %s').format(formatVersionDisplay(v.frontend.current)));
+        n.version.textContent = versions.join(' · ');
+
+        [ [ n.detailBackend, v.backend ], [ n.detailFrontend, v.frontend ] ].forEach(function(d) {
+            d[0].textContent = !d[1].current ? '–' : d[1].channel ? '%s (%s)'.format(d[1].current, d[1].channel) : d[1].current;
+        });
+
+        if (this.versionBusy) {
+            summary = detail = _('Checking...');
+        }
+        else if (!this.versionInfo) {
+            // No check yet
+        }
+        else if (v.error) {
+            summary = _('Update check failed');
+            detail = _('Could not run the update check: %s').format(v.error);
+        }
+        else if (v.state == 'update') {
+            summary = (v.update == 'both') ? _('Update available')
+                : (v.update == 'backend') ? _('Backend update available') : _('Frontend update available');
+            detail = (v.update == 'both') ? _('Backend and frontend updates available') : summary;
+            primary = true;
+        }
+        else if (v.state == 'current') {
+            summary = detail = _('Up to date');
+        }
+        else {
+            summary = _('Update check failed');
+            detail = v.limited ? _('GitHub limit reached. Try again later.') : _('GitHub did not answer. Try again later.');
+        }
+
+        n.update.textContent = summary;
+        n.update.className = 'gm-wide ' + (primary ? 'gm-primary' : 'gm-muted');
+        n.detailUpdate.textContent = detail;
+        n.recheck.disabled = !!this.versionBusy;
     },
 
     // Polls are added once, after the first render, as bound functions: poll.add() skips only a
@@ -726,7 +986,7 @@ return view.extend({
                 self.status = r[0];
                 self.health = r[1];
                 self.statusLoaded = true;
-                self.updateStatus();
+                self.updateStatus(true);
             }).finally(function() {
                 self.statusBusy = null;
             });
@@ -1700,96 +1960,48 @@ return view.extend({
         }));
     },
 
-    // Check for updates. check_version asks GitHub: this runs at page load and hourly, one call at a time
-    checkForUpdates: function() {
-        var self = this;
-        var statusElement = this.nodes && this.nodes.update;
-        var versionDisplayElement = this.nodes && this.nodes.version;
+    /**
+     * Check for updates, one call at a time. On page load and in the hourly poll a fresh cached
+     * result (cachedVersionCheck) is shown instead of asking GitHub again.
+     * @param {boolean} force - Ask GitHub now, whatever the cache holds ('Check again').
+     */
+    checkForUpdates: function(force) {
+        var self = this, cached = (force === true) ? null : cachedVersionCheck();
 
-        if (this.versionBusy) {
-            return this.versionBusy;
-        }
-        
-        if (!statusElement) {
+        if (this.versionBusy || !this.nodes)
+            return this.versionBusy || Promise.resolve();
+
+        if (cached) {
+            this.versionInfo = versionState(cached);
+            this.showVersions();
             return Promise.resolve();
         }
-        
-        statusElement.textContent = _('Checking...');
-        statusElement.style.color = '#6b7280';
 
         // LuCI batches the RPC calls of one animation frame into one HTTP request. check_version
         // waits for GitHub, so it starts later than the polls and does not delay their answers
         this.versionBusy = new Promise(function(resolve) {
             window.setTimeout(resolve, 500);
         }).then(function() {
-            return fs.exec('/etc/init.d/geomate', ['check_version']);
+            // -i: past the backend's own 10-minute cache of the GitHub answer as well
+            return fs.exec('/etc/init.d/geomate', (force === true) ? [ 'check_version', '-i' ] : [ 'check_version' ]);
         }).then(function(result) {
-            var output = result.stdout || '';
-            var backendUpdateAvailable = false;
-            var frontendUpdateAvailable = false;
-            var backendCurrentVersion = '';
-            var frontendCurrentVersion = '';
-            
-            // Parse backend and frontend information separately
-            var backendMatch = output.match(/Backend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
-            var frontendMatch = output.match(/Frontend versions:[\s\S]*?(Current version: .+[\s\S]*?Latest version: .+)/);
-            
-            if (backendMatch) {
-                var backendCurrentMatch = backendMatch[1].match(/Current version: (.+)/);
-                var backendLatestMatch = backendMatch[1].match(/Latest version: (.+)/);
-                if (backendCurrentMatch) {
-                    backendCurrentVersion = backendCurrentMatch[1].trim();
-                }
-                if (backendCurrentMatch && backendLatestMatch && 
-                    backendCurrentMatch[1].trim() !== backendLatestMatch[1].trim()) {
-                    backendUpdateAvailable = true;
-                }
-            }
-            
-            if (frontendMatch) {
-                var frontendCurrentMatch = frontendMatch[1].match(/Current version: (.+)/);
-                var frontendLatestMatch = frontendMatch[1].match(/Latest version: (.+)/);
-                if (frontendCurrentMatch) {
-                    frontendCurrentVersion = frontendCurrentMatch[1].trim();
-                }
-                if (frontendCurrentMatch && frontendLatestMatch && 
-                    frontendCurrentMatch[1].trim() !== frontendLatestMatch[1].trim()) {
-                    frontendUpdateAvailable = true;
-                }
-            }
-            
-            // Update version display with actual current versions
-            if (versionDisplayElement && backendCurrentVersion && frontendCurrentVersion) {
-                versionDisplayElement.textContent = 
-                    'Backend: ' + formatVersionDisplay(backendCurrentVersion) + 
-                    ' | Frontend: ' + formatVersionDisplay(frontendCurrentVersion);
-            }
-            
-            // Display appropriate status
-            if (backendUpdateAvailable && frontendUpdateAvailable) {
-                statusElement.textContent = _('Updates available (Backend + Frontend)');
-                statusElement.style.color = '#dc2626';
-            } else if (backendUpdateAvailable) {
-                statusElement.textContent = _('Backend update available');
-                statusElement.style.color = '#dc2626';
-            } else if (frontendUpdateAvailable) {
-                statusElement.textContent = _('Frontend update available');
-                statusElement.style.color = '#dc2626';
-            } else if (result.code === 0 || (backendMatch && frontendMatch)) {
-                statusElement.textContent = _('Up to date');
-                statusElement.style.color = '#059669';
-            } else {
-                statusElement.textContent = _('Check failed');
-                statusElement.style.color = '#dc2626';
-            }
+            var entry = { stdout: result.stdout || '', stderr: result.stderr || '', code: result.code, at: Date.now(), ui: UI_VERSION };
+
+            storeVersionCheck(entry);
+            self.versionInfo = versionState(entry);
         }).catch(function(error) {
-            console.error('Error checking for updates:', error);
-            statusElement.textContent = _('Check failed');
-            statusElement.style.color = '#dc2626';
+            // No answer: a timeout means GitHub was slow, anything else that the command did
+            // not run (e.g. no permission). Nothing to cache; known versions stay
+            var known = self.versionInfo || versionState({}),
+                timeout = (error && error.name == 'TimeoutError') || /timed out/i.test(errorText(error));
+
+            self.versionInfo = Object.assign({}, known, { state: 'failed', update: null, limited: false, error: timeout ? null : errorText(error) });
         }).finally(function() {
             self.versionBusy = null;
+            self.showVersions();
         });
 
+        this.showVersions();
         return this.versionBusy;
     }
 });
