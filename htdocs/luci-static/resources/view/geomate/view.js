@@ -263,9 +263,10 @@ function textOn(color) {
 // Status of a connection for the table: [ sort key, label, tooltip ]. luci.geomate takes
 // 'allowed' from the filter's nft sets: true in _allowed, false in _blocked, missing when the
 // server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs.
-// A row the map cannot show gets the tooltip of notOnMapNote; an untracked one has its own
-function connectionStatus(conn) {
-    var note = hasPosition(conn.geo) ? null : notOnMapNote();
+// A row the map cannot show gets the tooltip of notOnMapNote, unless it is a past row (offMap): the
+// map never shows those. An untracked row has its own tooltip
+function connectionStatus(conn, offMap) {
+    var note = (offMap || hasPosition(conn.geo)) ? null : notOnMapNote();
 
     if (conn.is_allowed_ip)
         return [ 'whitelist', _('Whitelisted'), note ];
@@ -625,9 +626,10 @@ function readRecent() {
     return recent;
 }
 
-// Status of a row the last reply no longer has (entry e of the recent list): the verdict of the
-// last reply that had it, none when restored from sessionStorage. An Allow or Remove since then
-// wins: action (connectionAction) comes from the configuration, and no reply brings the new verdict
+// Status of a row the last reply no longer has (entry e of the recent list), or of a live row while
+// the list is old (e.live): the verdict of the last reply that had it, none when restored from
+// sessionStorage. An Allow or Remove since then wins: action (connectionAction) comes from the
+// configuration, and no reply brings the new verdict
 function pastStatus(e, action) {
     var whitelisted = !e.restored && !!e.conn.is_allowed_ip;
 
@@ -637,15 +639,18 @@ function pastStatus(e, action) {
         return [ 'unknown', _('Unknown'), _('Removed from the allowed IPs since last seen.') ];
     if (e.restored)
         return [ 'unknown', _('Unknown'), _('Seen before the page was loaded.') ];
-    return connectionStatus(e.conn);
+    return connectionStatus(e.conn, !e.live);
 }
 
 // Last seen cell of a row: 'Now' for a server of the last reply (lastSeen null), else the age in
-// whole minutes, so the text changes once a minute. data-value: the age in seconds, for sorting
+// whole minutes, from 60 minutes on in whole hours, so the text changes at most once a minute.
+// Past rows expire after RECENT_WINDOW (pruneRecent); a live row of an old list can be older.
+// data-value: the age in seconds, for sorting
 function showSeen(node, lastSeen, now) {
     var secs = (lastSeen == null) ? 0 : Math.max(1, Math.floor((now - lastSeen) / 1000)),
-        text = (lastSeen == null) ? _('Now')
-            : _('%d min ago').format(Math.min(Math.ceil(secs / 60), RECENT_WINDOW / 60000));
+        mins = Math.ceil(secs / 60),
+        text = (lastSeen == null) ? _('Now') : (mins < 60) ? _('%d min ago').format(mins)
+            : _('%d h ago').format(Math.floor(mins / 60));
 
     if (node.textContent !== text)
         node.textContent = text;
@@ -2619,7 +2624,8 @@ return view.extend({
             return !live[recent[key].conn.dst];
         }).map(function(key) { return recent[key]; }).sort(function(a, b) { return b.lastSeen - a.lastSeen; });
 
-        // While the status row says the list is old, its rows show the age of the last reply
+        // While the status row says the list is old, its rows show the age of the last reply and,
+        // like past rows, an Allow or Remove since then (pastStatus)
         var liveSeen = (this.connectionsFailed >= CONNECTIONS_STALE_AFTER) ? this.connectionsAt : null;
         var entries = list.map(function(conn) { return { conn: conn, lastSeen: liveSeen, live: true }; }).concat(past);
         var rows = entries.map(function(e) {
@@ -2631,7 +2637,7 @@ return view.extend({
             return {
                 ip: conn.dst,
                 filter: conn.filter_name,
-                status: e.live ? connectionStatus(conn) : pastStatus(e, action),
+                status: (e.live && liveSeen == null) ? connectionStatus(conn) : pastStatus(e, action),
                 geo: [ geo.country, geo.countryCode, geo.city, geo.isp, geo.org ],
                 action: action,
                 past: e.lastSeen != null
