@@ -667,6 +667,21 @@ var VERSION_CACHE_KEY = 'geomate-version-check',
 // Symbols of the health check states in the status row
 var CHECK_ICONS = { ok: '✓', info: '○', warning: '⚠', error: '✗' };
 
+// Operational modes in the order of the mode menu, the values of the Geo Filters page
+var MODE_ORDER = [ 'dynamic', 'static', 'monitor' ];
+
+// After a mode change, the status row waits this long (ms) for the restart (modeChanged)
+var RESTART_WAIT = 60 * 1000;
+
+// [ name, description ] per operational mode, for the status row and its mode menu
+function modeTexts() {
+    return {
+        monitor: [ _('Monitor mode'), _('Connections are tracked but not blocked.') ],
+        static: [ _('Static mode'), _('Uses the IP lists as they are.') ],
+        dynamic: [ _('Dynamic mode'), _('Builds IP lists automatically.') ]
+    };
+}
+
 // { current, latest, channel } of one 'Backend versions:' or 'Frontend versions:' block
 function versionFields(text) {
     var field = function(label) {
@@ -766,6 +781,8 @@ return view.extend({
     fullscreen: false,      // the map covers the window
     hostsLoad: null,        // promise of the Source IP suggestions (loadHostChoices)
     serversLoads: {},       // running getKnownServers request per filter section
+    restartPid: null,       // PID of the service when a mode change was applied, until it restarted
+    restartAt: 0,           // time of that change
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
@@ -841,7 +858,7 @@ return view.extend({
 
         var style = E('style', {}, `
             /* Theme colors with fallbacks, for the status row and the connection pills */
-            #geomate-status, #active-connections-container {
+            #geomate-status, #gm-mode-menu, #active-connections-container {
                 --gm-success: var(--success, var(--success-color-high, var(--success-color, #1a7f37)));
                 --gm-danger: var(--danger, var(--error-color-high, var(--danger-color, var(--error-color, #cf222e))));
                 --gm-primary: var(--primary, var(--primary-color-high, var(--main-bright-color, #1a6fd1)));
@@ -890,6 +907,66 @@ return view.extend({
             @media (max-width: 639px) {
                 #geomate-status .gm-wide { display: none; }
             }
+            /* With write access the mode pill is the button of the mode menu: the pill's look,
+               none of the theme's button styles */
+            #geomate-status button.gm-status {
+                -webkit-appearance: none;
+                appearance: none;
+                width: auto;
+                height: auto;
+                min-width: 0;
+                min-height: 0;
+                margin: 0;
+                padding: 0 0.6em;
+                font: inherit;
+                line-height: 1.6;
+                letter-spacing: inherit;
+                text-transform: none;
+                text-shadow: none;
+                color: inherit;
+                background: none;
+                border: 1px solid var(--gm-status-color);
+                border-radius: 999px;
+                box-shadow: none;
+                cursor: pointer;
+            }
+            #geomate-status button.gm-status:focus { outline: none; }
+            #geomate-status button.gm-status:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: 2px; }
+            /* The menu lies outside the <summary>, where a click would open or close the details.
+               Its colors come from detectTheme() when it opens, like the map's Draw circle menu */
+            .gm-status-box { position: relative; }
+            #gm-mode-menu { position: absolute; z-index: 100; box-sizing: border-box; width: max-content; min-width: 12em; max-width: min(24em, 100%); padding: 4px 0; color: var(--gm-menu-fg, inherit); background: var(--gm-menu-bg, #fff); border: 1px solid var(--gm-menu-border, rgba(0, 0, 0, 0.2)); border-radius: 4px; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4); }
+            #gm-mode-menu[hidden] { display: none; }
+            #gm-mode-menu button {
+                -webkit-appearance: none;
+                appearance: none;
+                display: flex;
+                gap: 8px;
+                box-sizing: border-box;
+                width: 100%;
+                height: auto;
+                min-height: 0;
+                margin: 0;
+                padding: 6px 12px;
+                font: inherit;
+                line-height: 1.4;
+                letter-spacing: inherit;
+                text-align: left;
+                text-transform: none;
+                text-shadow: none;
+                white-space: normal;
+                color: inherit;
+                background: none;
+                border: 0;
+                border-radius: 0;
+                box-shadow: none;
+                cursor: pointer;
+            }
+            #gm-mode-menu button:hover, #gm-mode-menu button:focus { background: var(--gm-menu-hover, rgba(128, 128, 128, 0.15)); outline: none; }
+            #gm-mode-menu button:focus-visible { outline: 2px solid var(--gm-primary); outline-offset: -2px; }
+            #gm-mode-menu .gm-mode-check { flex: none; width: 1em; color: var(--gm-primary); visibility: hidden; }
+            #gm-mode-menu [aria-checked="true"] .gm-mode-check { visibility: visible; }
+            #gm-mode-menu .gm-mode-note { display: block; font-size: 90%; opacity: 0.7; }
         `);
 
         // A key and its value in the details panel
@@ -898,7 +975,11 @@ return view.extend({
         };
 
         n.state = E('span', { 'id': 'service-status-text', 'class': 'gm-status gm-status--neutral gm-muted' });
-        n.mode = E('span', { 'id': 'operational-mode-text', 'class': 'gm-status gm-status--mode' });
+        // updateStatus() sets the mode name in modeLabel
+        n.modeLabel = E('span');
+        n.mode = this.readonly
+            ? E('span', { 'id': 'operational-mode-text', 'class': 'gm-status gm-status--mode' }, [ n.modeLabel ])
+            : this.renderModeMenu();
         n.health = E('span', { 'id': 'health-check-status' });
         n.loading = E('span', { 'id': 'geomate-loading-indicator', 'class': 'gm-note' }, [ _('Loading GeoFilter data ...') ]);
         n.stale = E('span', { 'id': 'geomate-connections-stale', 'class': 'gm-note' });
@@ -935,7 +1016,189 @@ return view.extend({
             ))
         ]);
 
-        return E('div', {}, [ style, n.statusRow ]);
+        n.statusBox = E('div', { 'class': 'gm-status-box' }, [ style, n.statusRow ].concat(n.modeMenu ? [ n.modeMenu ] : []));
+        return n.statusBox;
+    },
+
+    /**
+     * Mode button and mode menu of the status row (write access only): the mode pill opens a
+     * menu of the three modes with their descriptions, the running one checked. Like the map's
+     * Draw circle menu it opens on a click, Enter, Space or an arrow key, the arrow keys, Home and
+     * End move between the entries, and it closes on Escape and Tab (the focus goes back to the
+     * button), a press outside it, the focus leaving it and a pick (switchMode).
+     * @returns {Node} The button; the menu is this.nodes.modeMenu.
+     */
+    renderModeMenu: function() {
+        var self = this, n = this.nodes, texts = modeTexts();
+
+        n.modeMenu = E('div', {
+            'id': 'gm-mode-menu',
+            'role': 'menu',
+            'aria-label': _('Mode'),
+            'hidden': '',
+            // A press on the menu keeps the focus where it is
+            'mousedown': noFocus,
+            'keydown': L.bind(this.handleModeMenuKey, this),
+            'focusout': function(ev) {
+                if (!n.modeMenu.contains(ev.relatedTarget) && ev.relatedTarget !== n.mode)
+                    self.closeModeMenu(false);
+            }
+        }, MODE_ORDER.map(function(mode) {
+            return E('button', {
+                'type': 'button',
+                'role': 'menuitemradio',
+                'tabindex': '-1',
+                'aria-checked': 'false',
+                'data-mode': mode,
+                'click': function() {
+                    self.closeModeMenu(true);
+                    // The running mode: nothing to do
+                    if (mode !== self.statusMode())
+                        self.switchMode(mode);
+                }
+            }, [
+                E('span', { 'class': 'gm-mode-check', 'aria-hidden': 'true' }, [ '✓' ]),
+                E('span', {}, [
+                    E('span', { 'class': 'gm-mode-name' }, [ texts[mode][0] ]),
+                    E('span', { 'class': 'gm-mode-note' }, [ texts[mode][1] ])
+                ])
+            ]);
+        }));
+
+        document.addEventListener('pointerdown', function(ev) {
+            if (!n.modeMenu.hidden && !n.modeMenu.contains(ev.target) && !n.mode.contains(ev.target))
+                self.closeModeMenu(false);
+        }, true);
+        window.addEventListener('resize', function() {
+            if (!n.modeMenu.hidden)
+                self.placeModeMenu();
+        });
+
+        return E('button', {
+            'type': 'button',
+            'id': 'operational-mode-text',
+            'class': 'gm-status gm-status--mode',
+            'aria-haspopup': 'menu',
+            'aria-expanded': 'false',
+            'aria-controls': 'gm-mode-menu',
+            'click': function(ev) {
+                // The button is inside the <summary>: no toggle of the details
+                ev.preventDefault();
+                if (n.modeMenu.hidden)
+                    self.openModeMenu(false);
+                else
+                    self.closeModeMenu(false);
+            },
+            'keydown': function(ev) {
+                if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp')
+                    return;
+                // No click and no toggle of the details either
+                ev.preventDefault();
+                ev.stopPropagation();
+                self.openModeMenu(ev.key === 'ArrowUp');
+            }
+        }, [ n.modeLabel, ' ', E('span', { 'aria-hidden': 'true' }, [ '▾' ]) ]);
+    },
+
+    // The mode the status reports: the committed configuration's, the one the service runs with
+    // once it has (re)started. null without a status. An unknown value counts as dynamic, like
+    // in the status row
+    statusMode: function() {
+        var mode = this.status && this.status.operational_mode;
+        return mode ? (MODE_ORDER.indexOf(mode) > -1 ? mode : 'dynamic') : null;
+    },
+
+    modeItems: function() {
+        return Array.prototype.slice.call(this.nodes.modeMenu.querySelectorAll('[role="menuitemradio"]'));
+    },
+
+    // Check the entry of the status's mode
+    markModeMenu: function() {
+        var mode = this.statusMode();
+
+        this.modeItems().forEach(function(item) {
+            item.setAttribute('aria-checked', (item.getAttribute('data-mode') === mode) ? 'true' : 'false');
+        });
+    },
+
+    /**
+     * Shows the mode menu below the mode button, in the theme's colors, and focuses the checked
+     * entry (last: the last entry, for ArrowUp).
+     * @param {boolean} last - Focus the last entry.
+     */
+    openModeMenu: function(last) {
+        var n = this.nodes, theme, fg, items, item;
+
+        if (this.readonly || !n.modeMenu || n.mode.hidden)
+            return;
+
+        theme = this.detectTheme();
+        fg = parseRgb(theme.fg);
+        n.modeMenu.style.setProperty('--gm-menu-bg', theme.bg);
+        n.modeMenu.style.setProperty('--gm-menu-fg', theme.fg);
+        n.modeMenu.style.setProperty('--gm-menu-border', theme.border);
+        if (fg)
+            n.modeMenu.style.setProperty('--gm-menu-hover', rgbString(fg, 0.12));
+
+        this.markModeMenu();
+        n.modeMenu.hidden = false;
+        n.mode.setAttribute('aria-expanded', 'true');
+        this.placeModeMenu();
+
+        items = this.modeItems();
+        item = last ? items[items.length - 1]
+            : (items.filter(function(i) { return i.getAttribute('aria-checked') === 'true'; })[0] || items[0]);
+        item.focus({ preventScroll: true });
+    },
+
+    /**
+     * Hides the mode menu.
+     * @param {boolean} focusButton - Give the focus back to the mode button (Escape, Tab, a pick).
+     */
+    closeModeMenu: function(focusButton) {
+        var n = this.nodes;
+
+        if (!n || !n.modeMenu || n.modeMenu.hidden)
+            return;
+        n.modeMenu.hidden = true;
+        n.mode.setAttribute('aria-expanded', 'false');
+        if (focusButton)
+            n.mode.focus({ preventScroll: true });
+    },
+
+    // Below the mode button, inside the status box: on a narrow page moved left to fit
+    placeModeMenu: function() {
+        var n = this.nodes, box, b;
+
+        n.modeMenu.style.left = n.modeMenu.style.top = '0px';
+        box = n.statusBox.getBoundingClientRect();
+        b = n.mode.getBoundingClientRect();
+        n.modeMenu.style.left = Math.max(0, Math.min(b.left - box.left, box.width - n.modeMenu.offsetWidth)) + 'px';
+        n.modeMenu.style.top = (b.bottom - box.top + 4) + 'px';
+    },
+
+    handleModeMenuKey: function(ev) {
+        var items = this.modeItems(), i = items.indexOf(document.activeElement), next = null;
+
+        if (ev.key === 'ArrowDown')
+            next = items[(i + 1) % items.length];
+        else if (ev.key === 'ArrowUp')
+            next = items[(i > 0) ? i - 1 : items.length - 1];
+        else if (ev.key === 'Home')
+            next = items[0];
+        else if (ev.key === 'End')
+            next = items[items.length - 1];
+        else if (ev.key === 'Tab')
+            // Tab goes on from the button
+            return this.closeModeMenu(true);
+        else if (ev.key !== 'Escape')
+            return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (next)
+            next.focus();
+        else
+            this.closeModeMenu(true);
     },
 
     // Choices of the filter select in the new region dialog: placeholder (''), every named
@@ -1235,11 +1498,17 @@ return view.extend({
             checks = this.health && this.health.checks,
             running = !!(st && st.running),
             pid = running && st.pid,
-            loading = !!(st ? st.loading : (this.health && this.health.loading)),
-            problems = (st && !running && st.config_enabled !== false) ? [ 'process' ] : [];
+            loading, problems = (st && !running && st.config_enabled !== false) ? [ 'process' ] : [];
 
         if (!n)
             return;
+
+        // After a mode change the status reports the new mode before procd has restarted the
+        // service (modeChanged). Until a reply shows the restart (another PID, the loading file,
+        // the service stopped) the loading note shows, so the mode never looks applied early
+        if (this.restartPid != null && st && (!running || st.pid !== this.restartPid || st.loading || Date.now() - this.restartAt > RESTART_WAIT))
+            this.restartPid = null;
+        loading = !!(st ? (st.loading || this.restartPid != null) : (this.health && this.health.loading));
 
         var state = st ? (running ? _('Running') : _('Not running'))
             : (this.statusLoaded ? _('Status unknown') : _('Loading status...'));
@@ -1250,16 +1519,15 @@ return view.extend({
         n.loading.hidden = !loading;
 
         // Operational mode of the committed configuration, the one the service runs with
-        var modes = {
-            monitor: [ _('Monitor mode'), _('Connections are tracked but not blocked.') ],
-            static: [ _('Static mode'), _('Uses the IP lists as they are.') ],
-            dynamic: [ _('Dynamic mode'), _('Builds IP lists automatically.') ]
-        };
-        var mode = (st && st.operational_mode) ? (modes[st.operational_mode] || modes.dynamic) : null;
+        var mode = this.statusMode() ? modeTexts()[this.statusMode()] : null;
         n.mode.hidden = !mode;
-        n.mode.textContent = mode ? mode[0] : '';
+        n.modeLabel.textContent = mode ? mode[0] : '';
         n.mode.title = mode ? mode[1] : '';
         n.detailMode.textContent = mode ? mode[1] : '–';
+        if (!mode)
+            this.closeModeMenu(false);
+        else if (n.modeMenu)
+            this.markModeMenu();
 
         // Health checks; process and loading are shown by the service pill and the loading note.
         // 'info' (e.g. autostart disabled) is no problem. Messages stay text, never markup
@@ -1544,6 +1812,15 @@ return view.extend({
 
         return Promise.resolve(this.connectionsBusy).then(function() {
             return self.pollConnections();
+        });
+    },
+
+    // Ask for the status again after a mode change, like refreshConnections()
+    refreshStatus: function() {
+        var self = this;
+
+        return Promise.resolve(this.statusBusy).then(function() {
+            return self.pollStatus();
         });
     },
 
@@ -1857,7 +2134,7 @@ return view.extend({
     /**
      * 'Applied.' in the map with Undo, which restores the options the change set. Only the last
      * change can be undone. Call it after applyChange(): after is the reloaded filter.
-     * @param {string} sid - The filter section.
+     * @param {string} sid - The filter section; 'global' for a mode switch.
      * @param {Object|null} before - Its options before the change (filterOptions); null: the
      *   change created the filter, Undo deletes it.
      * @param {string} [text] - Another text.
@@ -1891,7 +2168,9 @@ return view.extend({
         return this.enqueue(null, u.sid, function() {
             var now = filterOptions(u.sid),
                 name = (u.before && u.before.name) || (u.after && u.after.name) || u.sid,
-                keys = u.before ? changedOptions(u.after || {}, u.before) : null;
+                keys = u.before ? changedOptions(u.after || {}, u.before) : null,
+                // The one change of the global section: a mode switch (switchMode)
+                mode = u.sid === 'global';
 
             // A change queued before the click has been applied since: Undo would revert it too
             if (self.undoSeq !== u.id)
@@ -1901,9 +2180,10 @@ return view.extend({
                 return;
             self.undo = null;
             if (!now || !u.after)
-                throw failure(_('Filter %s not found.').format(name));
+                throw failure(mode ? _('Not undone: the mode has changed since.') : _('Filter %s not found.').format(name));
             if (keys ? changedOptions(pick(now, keys), pick(u.after, keys)).length : changedOptions(now, u.after).length)
-                return self.sendMessageToMap('toast', { text: _('Not undone: filter %s has changed since.').format(name) });
+                return self.sendMessageToMap('toast', { text: mode ? _('Not undone: the mode has changed since.')
+                    : _('Not undone: filter %s has changed since.').format(name) });
 
             if (!u.before)
                 uci.remove('geomate', u.sid);
@@ -1915,12 +2195,16 @@ return view.extend({
             return self.applyChange(function() {
                 var after = filterOptions(u.sid);
                 if (u.before ? (!after || changedOptions(pick(after, keys), pick(u.before, keys)).length) : after)
-                    throw failure(_('Could not undo the change of filter %s.').format(name));
+                    throw failure(mode ? _('Could not undo the mode change.') : _('Could not undo the change of filter %s.').format(name));
             }).then(function() {
-                self.pushFilters();
+                // The map's filters have not changed with the mode
+                if (!mode)
+                    self.pushFilters();
                 // Undo of Allow or Remove: the table shows the other button again
                 self.updateActiveConnectionsList();
                 self.refreshConnections();
+                if (mode)
+                    self.modeChanged();
                 self.sendMessageToMap('toast', { text: _('Undone.') });
             });
         }, function(reason) {
@@ -2773,11 +3057,106 @@ return view.extend({
                 if (!self.mapReady)
                     notify(text, 'info');
             });
-        }, function(reason, ok) {
-            // ok false: checkStaged() has shown its notice about unsaved changes
-            if (ok !== false || !(self.notice && self.notice.parentNode))
-                notify(reason);
-        }, notify);
+        }, L.bind(this.notifyRefused, this), notify);
+    },
+
+    // onRefuse of an action outside the map (enqueue): the refusal as a notification, unless
+    // checkStaged() refused it (ok false) and its notice about unsaved changes shows
+    notifyRefused: function(reason, ok) {
+        if (ok !== false || !(this.notice && this.notice.parentNode))
+            notify(reason);
+    },
+
+    /**
+     * Switch the operational mode (mode menu of the status row) and apply it like a map change:
+     * a toast with Undo. A switch from monitor mode, after which geomate blocks, asks first.
+     * procd's reload trigger restarts geomate with the new mode; a stopped or disabled service
+     * stays stopped. Refusals and errors show as notifications.
+     * @param {string} mode - 'dynamic', 'static' or 'monitor'.
+     */
+    switchMode: function(mode) {
+        var self = this;
+
+        if (MODE_ORDER.indexOf(mode) < 0)
+            return Promise.resolve();
+
+        var configured = function() {
+            return uci.get('geomate', 'global', 'operational_mode') || 'dynamic';
+        };
+
+        return this.enqueue(null, null, function() {
+            // Applied in the meantime, e.g. in another tab: the status row catches up
+            if (configured() === mode)
+                return self.refreshStatus();
+
+            return ((configured() === 'monitor') ? self.confirmMode(mode).then(function(ok) {
+                return ok && self.loadConfig().then(function() { return ok; });
+            }) : Promise.resolve(true)).then(function(ok) {
+                var before = filterOptions('global'), text;
+
+                if (!ok)
+                    return;
+                if (configured() === mode)
+                    return self.refreshStatus();
+                if (!before)
+                    throw failure(_('Could not save the mode.'));
+
+                uci.set('geomate', 'global', 'operational_mode', mode);
+                // As in checkRegion: commit only when the reloaded configuration holds the change
+                return self.applyChange(function() {
+                    if (configured() !== mode)
+                        throw failure(_('Could not save the mode.'));
+                }).then(function() {
+                    text = self.serviceUp()
+                        ? _('Switched to %s. Geomate restarts.').format(modeTexts()[mode][0])
+                        : _('Saved. Geomate is not running.');
+                    self.showApplied('global', before, text);
+                    // The toast needs the map; without it the notification is the only feedback
+                    if (!self.mapReady)
+                        notify(text, 'info');
+                    self.modeChanged();
+                });
+            });
+        }, L.bind(this.notifyRefused, this), notify);
+    },
+
+    // Resolves true when the user confirms a switch from monitor mode to mode, which then blocks
+    confirmMode: function(mode) {
+        var strict = uci.get('geomate', 'global', 'strict_mode') === '1',
+            title = (mode === 'static') ? _('Switch to Static mode?') : _('Switch to Dynamic mode?'),
+            label = (mode === 'static') ? _('Switch to Static mode') : _('Switch to Dynamic mode');
+
+        return new Promise(function(resolve) {
+            var button = function(cls, text, ok) {
+                return E('button', { 'class': 'btn ' + cls, 'click': function() { ui.hideModal(); resolve(ok); } }, [ text ]);
+            };
+            // Cancel first: Escape clicks the first button of the dialog
+            var confirm = button('cbi-button-action', label, true);
+
+            ui.showModal(title, [
+                E('p', {}, [ _('Geomate will block servers outside your regions.') ]),
+                strict ? E('p', {}, [ _('Strict mode also blocks servers that are not geolocated yet.') ]) : '',
+                E('div', { 'class': 'right' }, [ button('', _('Cancel'), false), ' ', confirm ])
+            ]);
+            confirm.focus();
+        });
+    },
+
+    // The status reports the service running and enabled: a mode change restarts it
+    serviceUp: function() {
+        var st = this.status;
+        return !!(st && st.running && st.config_enabled !== false);
+    },
+
+    // After a mode change was committed: until a status reply shows that procd restarted the
+    // service, the status row shows it as loading (updateStatus). The connection tooltips
+    // depend on the configured mode
+    modeChanged: function() {
+        this.restartPid = this.serviceUp() ? this.status.pid : null;
+        this.restartAt = Date.now();
+        this.updateStatus();
+        this.updateActiveConnectionsList();
+        return this.refreshStatus();
     },
 
     /**
