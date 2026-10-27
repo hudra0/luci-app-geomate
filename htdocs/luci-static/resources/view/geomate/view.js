@@ -625,6 +625,21 @@ function readRecent() {
     return recent;
 }
 
+// Status of a row the last reply no longer has (entry e of the recent list): the verdict of the
+// last reply that had it, none when restored from sessionStorage. An Allow or Remove since then
+// wins: action (connectionAction) comes from the configuration, and no reply brings the new verdict
+function pastStatus(e, action) {
+    var whitelisted = !e.restored && !!e.conn.is_allowed_ip;
+
+    if (action === 'remove' && !whitelisted)
+        return [ 'whitelist', _('Whitelisted'), null ];
+    if (action === 'allow' && whitelisted && sidByName(e.conn.filter_name))
+        return [ 'unknown', _('Unknown'), _('Removed from the allowed IPs since last seen.') ];
+    if (e.restored)
+        return [ 'unknown', _('Unknown'), _('Seen before the page was loaded.') ];
+    return connectionStatus(e.conn);
+}
+
 // Last seen cell of a row: 'Now' for a server of the last reply (lastSeen null), else the age in
 // whole minutes, so the text changes once a minute. data-value: the age in seconds, for sorting
 function showSeen(node, lastSeen, now) {
@@ -1435,6 +1450,9 @@ return view.extend({
                         self.connectionsTable.update([], _('Connections unavailable'));
                         self.connectionsKey = null;
                     }
+                    // Past rows keep aging and expire; an old list shows its age (Last seen)
+                    if (self.connectionsAt != null)
+                        self.updateActiveConnectionsList();
                     return;
                 }
                 self.showConnections(list);
@@ -2565,8 +2583,8 @@ return view.extend({
     // Fill the connections table: the servers of the last reply ('Now'), then those of the
     // recent list that it no longer has, newest first. Country, city and ISP come from
     // luci.geomate's geo lookup; older backends and cache entries have none of them, the cells
-    // then show '–'. A past row keeps the verdict of the last reply that had it; restored from
-    // sessionStorage it has none. The button of a row comes from the configuration
+    // then show '–'. A past row keeps the verdict of the last reply that had it (pastStatus);
+    // restored from sessionStorage it has none. The button of a row comes from the configuration
     // (connectionAction). The table is rebuilt only when a row changed: ui.Table replaces every
     // row, and with it a button under the pointer. The Last seen cells change in place
     updateActiveConnectionsList: function() {
@@ -2601,18 +2619,21 @@ return view.extend({
             return !live[recent[key].conn.dst];
         }).map(function(key) { return recent[key]; }).sort(function(a, b) { return b.lastSeen - a.lastSeen; });
 
-        var entries = list.map(function(conn) { return { conn: conn, lastSeen: null }; }).concat(past);
+        // While the status row says the list is old, its rows show the age of the last reply
+        var liveSeen = (this.connectionsFailed >= CONNECTIONS_STALE_AFTER) ? this.connectionsAt : null;
+        var entries = list.map(function(conn) { return { conn: conn, lastSeen: liveSeen, live: true }; }).concat(past);
         var rows = entries.map(function(e) {
             var conn = e.conn,
+                action = self.connectionAction(conn),
                 // A failed lookup arrives as an empty array
                 geo = (conn.geo && typeof conn.geo == 'object' && !Array.isArray(conn.geo)) ? conn.geo : {};
 
             return {
                 ip: conn.dst,
                 filter: conn.filter_name,
-                status: e.restored ? [ 'unknown', _('Unknown'), _('Seen before the page was loaded.') ] : connectionStatus(conn),
+                status: e.live ? connectionStatus(conn) : pastStatus(e, action),
                 geo: [ geo.country, geo.countryCode, geo.city, geo.isp, geo.org ],
-                action: self.connectionAction(conn),
+                action: action,
                 past: e.lastSeen != null
             };
         });
