@@ -154,6 +154,32 @@ var callGetHealthCheck = rpc.declare({
     reject: true
 });
 
+// Known servers of a filter for the map, counted per position. On request only (legend button,
+// selected circle), never polled. An older rpcd ACL or luci.geomate rejects it
+var callKnownServers = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getKnownServers',
+    params: [ 'sid' ],
+    expect: { '': {} },
+    reject: true
+});
+
+// A getKnownServers answer as the map takes it: { total, approx, missing, points: [[lat, lon, n]] },
+// or null for an error or an answer of another form, which the map then shows as unknown
+function knownServersData(res) {
+    if (!res || res.error != null || typeof res.total != 'number' || !Array.isArray(res.points))
+        return null;
+    return {
+        total: res.total,
+        approx: res.approx === true,
+        missing: res.missing === true,
+        points: res.points.filter(function(p) {
+            return Array.isArray(p) && p.length == 3 && p.every(Number.isFinite) &&
+                Math.abs(p[0]) <= 90 && Math.abs(p[1]) <= 180 && p[2] > 0;
+        })
+    };
+}
+
 // LAN devices for the Source IP suggestions of the filter dialog (same calls as LuCI's Static
 // Leases page). The luci-app-geomate ACL grants both; a ubus error such as "Access denied"
 // resolves to {}
@@ -638,6 +664,7 @@ return view.extend({
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
     hostsLoad: null,        // promise of the Source IP suggestions (loadHostChoices)
+    serversLoads: {},       // running getKnownServers request per filter section
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
@@ -1411,7 +1438,35 @@ return view.extend({
             this.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
                 .format(this.filterName(d.sid), d.region));
             break;
+        case 'loadKnownServers':
+            this.loadKnownServers(String(d.sid || ''));
+            break;
         }
+    },
+
+    // Known servers of a filter for the map (message knownServers). Read only, also without
+    // write access. An error reaches the map as 'error', which it shows as unknown, never as
+    // 0 servers; the notification comes once per filter and page
+    loadKnownServers: function(sid) {
+        var self = this, loads = this.serversLoads;
+
+        if (!isGeoFilter(sid))
+            return this.sendMessageToMap('knownServers', { sid: sid, error: true });
+        if (!loads[sid])
+            loads[sid] = callKnownServers(sid).then(function(res) {
+                var data = knownServersData(res);
+
+                if (!data)
+                    throw new Error((res && typeof res.error == 'string') ? res.error : _('Unexpected answer'));
+                self.sendMessageToMap('knownServers', Object.assign(data, { sid: sid }));
+            }).catch(function(err) {
+                self.warnOnce(sid + ' servers', _('Could not load the known servers of %s: %s')
+                    .format(self.filterName(sid), errorText(err)));
+                self.sendMessageToMap('knownServers', { sid: sid, error: true });
+            }).finally(function() {
+                delete loads[sid];
+            });
+        return loads[sid];
     },
 
     // Run map actions one after another, each on the configuration as committed now (another
