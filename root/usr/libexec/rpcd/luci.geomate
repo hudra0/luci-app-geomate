@@ -498,12 +498,32 @@ end
 -- its inode, size and mtime (geolocate.sh replaces the file with mv)
 local KNOWN_SERVERS_CACHE = "/tmp/geomate_known_servers.json"
 
--- Above this many positions they are merged to 2 decimals (about 1 km) and the answer says approx
+-- Above this many positions they are merged to 2 decimals (about 1 km), then to 1 and 0 decimals
+-- while there are still more, and the answer says approx. 0 decimals leaves at most 181 * 361
 local KNOWN_SERVERS_MAX_POINTS = 3000
 
 -- A position as one key: tostring() of the two numbers. -0 + 0 is 0, so 0 and -0 share a key
 local function position_key(lat, lon)
     return tostring(lat + 0) .. "," .. tostring(lon + 0)
+end
+
+-- The points merged by their position rounded to the given number of decimals; counts add up
+local function merge_positions(points, decimals)
+    local fmt, merged, by_key = "%." .. decimals .. "f", {}, {}
+    for _, p in ipairs(points) do
+        local lat = tonumber(string.format(fmt, p[1])) + 0
+        local lon = tonumber(string.format(fmt, p[2])) + 0
+        local key = position_key(lat, lon)
+        local point = by_key[key]
+        if point then
+            point[3] = point[3] + p[3]
+        else
+            point = { lat, lon, p[3] }
+            by_key[key] = point
+            table.insert(merged, point)
+        end
+    end
+    return merged
 end
 
 -- One pass over a geo data file: { total, approx, points = { { lat, lon, n }, … } }, nil if it
@@ -535,23 +555,13 @@ local function count_positions(path)
     end
     f:close()
 
-    local approx = #points > KNOWN_SERVERS_MAX_POINTS
-    if approx then
-        local merged, by_key = {}, {}
-        for _, p in ipairs(points) do
-            local lat = tonumber(string.format("%.2f", p[1])) + 0
-            local lon = tonumber(string.format("%.2f", p[2])) + 0
-            local key = position_key(lat, lon)
-            local point = by_key[key]
-            if point then
-                point[3] = point[3] + p[3]
-            else
-                point = { lat, lon, p[3] }
-                by_key[key] = point
-                table.insert(merged, point)
-            end
+    local approx = false
+    for decimals = 2, 0, -1 do
+        if #points <= KNOWN_SERVERS_MAX_POINTS then
+            break
         end
-        points = merged
+        points = merge_positions(points, decimals)
+        approx = true
     end
     return { total = total, approx = approx, points = points }
 end
