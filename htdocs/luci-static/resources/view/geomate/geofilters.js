@@ -96,22 +96,24 @@ function formatRadius(meters) {
 
 // Entries of src_ip, src_port or dest_port as the config has them, split at white space like
 // the service does. A port 'any' is no restriction (an option that says only 'any' adds no
-// match to the rule). A Source IP address gets the name a host hint has for it, an exception
-// ('!' or '!=', also written apart from the address) reads 'except <address>'
+// match to the rule). A Source IP address gets the name a host hint has for it; the
+// exceptions ('!' or '!=', also written apart from the address) follow the other entries as
+// one 'except a, b', or 'any except a, b' without other entries
 function matchItems(section_id, option) {
-    var value = uci.get('geomate', section_id, option),
-        items = (option == 'src_ip') ? srcIpEntries(value) : L.toArray(L.toArray(value).join(' '));
+    var value = uci.get('geomate', section_id, option), items = [], except = [];
 
-    return items.filter(function(v) {
-        return v !== 'any' || option == 'src_ip';
-    }).map(function(v) {
-        var m = (option == 'src_ip') ? /^(!=?)?(.*)$/.exec(v) : null,
-            addr = m ? m[2] : v;
+    if (option != 'src_ip')
+        return L.toArray(L.toArray(value).join(' ')).filter(function(v) { return v !== 'any'; }).join(', ');
 
-        if (m && hosts.names.hasOwnProperty(addr))
-            addr = '%s (%s)'.format(addr, hosts.names[addr]);
-        return (m && m[1]) ? _('except %s').format(addr) : addr;
-    }).join(', ');
+    srcIpEntries(value).forEach(function(v) {
+        var m = /^(!=?)?(.*)$/.exec(v),
+            addr = hosts.names.hasOwnProperty(m[2]) ? '%s (%s)'.format(m[2], hosts.names[m[2]]) : m[2];
+
+        (m[1] ? except : items).push(addr);
+    });
+    if (except.length)
+        items.push((items.length ? _('except %s') : _('any except %s')).format(except.join(', ')));
+    return items.join(', ');
 }
 
 // The backend reports this feature token ('capabilities' of getGeolocationStatus, from
@@ -213,40 +215,57 @@ function checkSrcIp(value, saved, multi) {
     return true;
 }
 
-// Add the text typed into the custom input of a Source IP widget as Enter would: LuCI drops it
-// when the dropdown closes, so Save would store the field without it. Text that fails the
-// check stays in the input, keeps the field invalid and opens the dropdown to show its error
-// (same function in view.js)
+// Add the text typed into the input of a Source IP widget as Enter would: the custom input of
+// a dropdown loses it when the dropdown closes, and the plain input of a list without
+// suggestions keeps it as one unsplit entry. Text that fails the check stays in the input and
+// keeps the field invalid; a dropdown opens to show its error (same function in view.js)
 function takeTypedEntry(widget) {
-    var input = (widget && widget.node) ? widget.node.querySelector('.create-item-input') : null,
+    var node = widget ? widget.node : null,
+        input = node ? node.querySelector('.create-item-input, .add-item > input.cbi-input-text') : null,
         sb = input ? input.closest('.cbi-dropdown') : null;
 
-    if (!sb || !input.value.trim())
+    if (!input || !input.value.trim())
         return;
     // LuCI checks the input on keyup; the result also sets the valid state of the field
     input.dispatchEvent(new Event('keyup'));
     if (input.classList.contains('cbi-input-invalid')) {
         // After this click, which closes every dropdown
-        window.setTimeout(function() {
-            dom.findClassInstance(sb).openDropdown(sb);
-            input.focus();
-        }, 0);
+        if (sb)
+            window.setTimeout(function() {
+                var ul = sb.querySelector('ul'),
+                    reveal = function() {
+                        if (sb.hasAttribute('open') && input.classList.contains('cbi-input-invalid')) {
+                            input.scrollIntoView({ block: 'nearest' });
+                            input.focus();
+                        }
+                    };
+
+                dom.findClassInstance(sb).openDropdown(sb);
+                // openDropdown scrolls the list to the selected item in the next frame, and
+                // focuses that item when a theme's transition of the list ends
+                window.requestAnimationFrame(reveal);
+                ul.addEventListener('transitionend', reveal, { once: true });
+            }, 0);
         return;
     }
-    dom.findClassInstance(sb).createItems(sb, input.value);
+    if (sb)
+        dom.findClassInstance(sb).createItems(sb, input.value);
+    else
+        widget.addItem(node, input.value, null, true);
     input.value = '';
     widget.triggerValidation();
 }
 
 // Make a ui.DynamicList add pasted 'a b' as two entries, like CBIDynamicMultiValueList in
 // LuCI's tools/firewall.js (not loaded: luci-app-firewall is no dependency). A single entry
-// keeps its label, e.g. a picked suggestion (same function in view.js)
+// keeps its label, e.g. a picked suggestion, unless the stored entry reads differently: typed
+// '!= a.b.c.d' shows as '!=a.b.c.d' (same function in view.js)
 function splitEntries(widget) {
     widget.addItem = function(dl, value, text, flash) {
         var values = srcIpEntries(value);
 
         values.forEach(function(v) {
-            var label = (values.length == 1) ? text : (this.choices || {})[v];
+            var label = (values.length == 1 && v === String(value).trim()) ? text : (this.choices || {})[v];
 
             ui.DynamicList.prototype.addItem.call(this, dl, v, dom.elem(label) ? label.cloneNode(true) : label, flash);
         }, this);
