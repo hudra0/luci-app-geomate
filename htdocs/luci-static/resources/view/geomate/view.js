@@ -287,9 +287,9 @@ function textCell(value, title) {
     return E('span', (title && title !== text) ? { 'title': title } : {}, [ text ]);
 }
 
-// A dotted IPv4 address, every octet 0-255
+// A dotted IPv4 address, every octet 0-255 without a leading zero: nft reads 012 as octal
 function validIPv4(ip) {
-    return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ip.split('.').every(function(o) { return +o <= 255; });
+    return /^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(ip) && ip.split('.').every(function(o) { return +o <= 255; });
 }
 
 // The one geo_filter section with this name. null for none or several: a table action never
@@ -299,9 +299,16 @@ function sidByName(name) {
     return (found.length === 1) ? found[0]['.name'] : null;
 }
 
+// The allowed IPs of a filter as the service reads them: list entries only. A hand-written
+// 'option allowed_ip' (a string) allows nothing, like 'option allowed_region' (regionList)
+function allowedIpList(sid) {
+    var v = uci.get('geomate', sid, 'allowed_ip');
+    return Array.isArray(v) ? v : [];
+}
+
 // The filter's own allowed IPs list this exact address; a prefix or range around it does not count
 function filterAllowsIp(sid, ip) {
-    return L.toArray(uci.get('geomate', sid, 'allowed_ip')).indexOf(ip) > -1;
+    return allowedIpList(sid).indexOf(ip) > -1;
 }
 
 // An IPv4 address as a number, null for anything else
@@ -310,12 +317,13 @@ function ipNumber(ip) {
 }
 
 // A prefix (a.b.c.d/nn) or range (a.b.c.d-e.f.g.h) of the filter's allowed IPs covers the
-// address. Read like add_element in luci.geomate; other entries count as nothing
+// address. Read like add_element in luci.geomate; other entries count as nothing, also one with
+// a leading zero in an octet or the prefix length
 function rangeAllowsIp(sid, ip) {
     var n = ipNumber(ip);
 
-    return n != null && L.toArray(uci.get('geomate', sid, 'allowed_ip')).some(function(entry) {
-        var m = /^([\d.]+)\/(\d+)$/.exec(entry), lo, hi, size;
+    return n != null && allowedIpList(sid).some(function(entry) {
+        var m = /^([\d.]+)\/(0|[1-9]\d*)$/.exec(entry), lo, hi, size;
 
         if (m) {
             lo = ipNumber(m[1]);
@@ -2193,6 +2201,10 @@ return view.extend({
                     ? _('Not applied: several filters are named %s.').format(name)
                     : _('Filter %s not found.').format(name));
 
+            // The service ignores a hand-written option; never turn it into a list here
+            if (typeof uci.get('geomate', sid, 'allowed_ip') == 'string')
+                return notify(_('Filter %s has "option allowed_ip". Edit it on the Geo Filters page.').format(name));
+
             // Changed in another tab since the table showed the button
             if (filterAllowsIp(sid, ip) === allow) {
                 notify((allow ? _('%s is already in the allowed IPs of %s.') : _('%s is not in the allowed IPs of %s.')).format(ip, name), 'info');
@@ -2200,7 +2212,7 @@ return view.extend({
             }
 
             before = filterOptions(sid);
-            list = L.toArray(before.allowed_ip).filter(function(entry) { return entry !== ip; });
+            list = allowedIpList(sid).filter(function(entry) { return entry !== ip; });
             if (allow)
                 list.push(ip);
             uci.set('geomate', sid, 'allowed_ip', list.length ? list : null);
