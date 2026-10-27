@@ -311,6 +311,14 @@ function filterAllowsIp(sid, ip) {
     return allowedIpList(sid).indexOf(ip) > -1;
 }
 
+// The allowed IPs of a filter split at whitespace and commas, as luci.geomate (allowed_ip_list)
+// and the backend read them: the entry '1.2.3.4 5.6.7.8' allows both addresses
+function allowedIpTokens(sid) {
+    return allowedIpList(sid).reduce(function(tokens, entry) {
+        return tokens.concat(String(entry).split(/[\s,]+/).filter(function(t) { return t !== ''; }));
+    }, []);
+}
+
 // An IPv4 address as a number, null for anything else
 function ipNumber(ip) {
     return validIPv4(ip) ? ip.split('.').reduce(function(n, o) { return n * 256 + +o; }, 0) : null;
@@ -322,7 +330,7 @@ function ipNumber(ip) {
 function rangeAllowsIp(sid, ip) {
     var n = ipNumber(ip);
 
-    return n != null && allowedIpList(sid).some(function(entry) {
+    return n != null && allowedIpTokens(sid).some(function(entry) {
         var m = /^([\d.]+)\/(0|[1-9]\d*)$/.exec(entry), lo, hi, size;
 
         if (m) {
@@ -2146,10 +2154,11 @@ return view.extend({
     },
 
     // Button of a table row, from the configuration as loaded: 'remove' when the filter's own
-    // allowed IPs list the address, 'range' (no button) when only a prefix or range of them
-    // covers it, else 'allow'. null without write access. Not from the poll's is_allowed_ip:
-    // right after an action that is still the old verdict. A filter name that is not unique
-    // gets 'allow', and the click says why nothing happens (setIpAllowed)
+    // allowed IPs list the address as an entry of its own, 'entry' (no button) when a longer
+    // entry such as '1.2.3.4 5.6.7.8' lists it, 'range' (no button) when only a prefix or range
+    // of them covers it, else 'allow'. null without write access. Not from the poll's
+    // is_allowed_ip: right after an action that is still the old verdict. A filter name that is
+    // not unique gets 'allow', and the click says why nothing happens (setIpAllowed)
     connectionAction: function(conn) {
         var sid;
 
@@ -2158,10 +2167,14 @@ return view.extend({
         sid = sidByName(conn.filter_name);
         if (sid && filterAllowsIp(sid, conn.dst))
             return 'remove';
+        if (sid && allowedIpTokens(sid).indexOf(conn.dst) > -1)
+            return 'entry';
         return (sid && rangeAllowsIp(sid, conn.dst)) ? 'range' : 'allow';
     },
 
     renderConnectionAction: function(r) {
+        if (r.action === 'entry')
+            return textCell('', _('Part of a longer allowed IP entry. Edit it on the Geo Filters page.'));
         if (r.action === 'range')
             return textCell('', _('In an allowed IP range. Edit it on the Geo Filters page.'));
         if (r.action !== 'allow' && r.action !== 'remove')
