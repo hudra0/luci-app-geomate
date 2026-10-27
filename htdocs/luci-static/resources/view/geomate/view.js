@@ -412,6 +412,13 @@ function hasCapability(status, token) {
     return !!status && Array.isArray(status.capabilities) && status.capabilities.indexOf(token) > -1;
 }
 
+// The backend reloads a configuration change live, so a reload that finds nothing changed
+// restarts nothing. Known only from a backend that reports capabilities: all of them came after
+// the live reload (geomate PR #15). v1.2.0 restarts on every reload, and so may an unknown one
+function reloadsLive(status) {
+    return !!status && Array.isArray(status.capabilities) && status.capabilities.length > 0;
+}
+
 // Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
 // 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
 // 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
@@ -3217,11 +3224,13 @@ return view.extend({
     // a reply fetched after the commit: this.status may be up to STATUS_INTERVAL old, from before
     // an earlier restart. A reply later than procd's reload delay may already show the restarted
     // service, so its PID counts only when it is the one from before the commit. An Undo within
-    // that delay shares the switch's reload, which finds the configuration unchanged and
-    // restarts nothing: no wait. The connection tooltips depend on the configured mode
+    // that delay shares the switch's reload. A backend that reloads live (reloadsLive) then finds
+    // the configuration unchanged and restarts nothing: no wait. Any other backend may restart, so
+    // the wait stays, at most RESTART_WAIT. The connection tooltips depend on the configured mode
     modeChanged: function(undo) {
         var self = this, at = Date.now(),
-            merged = undo && this.restartPid != null && at - this.restartAt < PROCD_RELOAD_DELAY,
+            merged = undo && this.restartPid != null && at - this.restartAt < PROCD_RELOAD_DELAY &&
+                reloadsLive(this.status),
             before = (!merged && this.serviceUp()) ? this.status.pid : null;
 
         // Until the reply, the loading note shows from the PID known before
