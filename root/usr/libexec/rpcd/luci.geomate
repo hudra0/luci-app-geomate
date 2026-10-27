@@ -308,6 +308,16 @@ local function read_set(set_name)
     return set
 end
 
+-- Addresses in the elements block of a set, as the former grep counted them: a range counts
+-- both ends, a prefix its address
+local function count_set_addresses(set_name)
+    local count = 0
+    for _ in set_elements(set_name):gmatch("%d+%.%d+%.%d+%.%d+") do
+        count = count + 1
+    end
+    return count
+end
+
 -- allowed_ip of a filter section. The backend reads list entries only (config_list_foreach),
 -- so a hand-written 'option allowed_ip', which arrives as a string, whitelists nothing
 local function allowed_ip_list(s)
@@ -549,19 +559,9 @@ local function get_service_status()
 
         local set_name = filter_set_name(s.name)
         if filter_info.enabled and status.nft_active and set_name then
-            -- Count allowed IPs
-            local allowed_cmd = io.popen("nft list set inet geomate '" .. set_name .. "_allowed' 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | wc -l")
-            if allowed_cmd then
-                filter_info.allowed_count = tonumber(allowed_cmd:read("*l")) or 0
-                allowed_cmd:close()
-            end
-
-            -- Count blocked IPs
-            local blocked_cmd = io.popen("nft list set inet geomate '" .. set_name .. "_blocked' 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | wc -l")
-            if blocked_cmd then
-                filter_info.blocked_count = tonumber(blocked_cmd:read("*l")) or 0
-                blocked_cmd:close()
-            end
+            -- Count only the elements: the set header holds the filter name
+            filter_info.allowed_count = count_set_addresses(set_name .. "_allowed")
+            filter_info.blocked_count = count_set_addresses(set_name .. "_blocked")
         end
 
         table.insert(status.filters, filter_info)
