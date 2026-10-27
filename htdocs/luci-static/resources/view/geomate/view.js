@@ -977,9 +977,7 @@ return view.extend({
         n.state = E('span', { 'id': 'service-status-text', 'class': 'gm-status gm-status--neutral gm-muted' });
         // updateStatus() sets the mode name in modeLabel
         n.modeLabel = E('span');
-        n.mode = this.readonly
-            ? E('span', { 'id': 'operational-mode-text', 'class': 'gm-status gm-status--mode' }, [ n.modeLabel ])
-            : this.renderModeMenu();
+        n.mode = this.readonly ? this.renderModeLabel() : this.renderModeMenu();
         n.health = E('span', { 'id': 'health-check-status' });
         n.loading = E('span', { 'id': 'geomate-loading-indicator', 'class': 'gm-note' }, [ _('Loading GeoFilter data ...') ]);
         n.stale = E('span', { 'id': 'geomate-connections-stale', 'class': 'gm-note' });
@@ -1029,7 +1027,7 @@ return view.extend({
      * @returns {Node} The button; the menu is this.nodes.modeMenu.
      */
     renderModeMenu: function() {
-        var self = this, n = this.nodes, texts = modeTexts();
+        var self = this, n = this.nodes, texts = modeTexts(), spaceDown = false;
 
         n.modeMenu = E('div', {
             'id': 'gm-mode-menu',
@@ -1095,9 +1093,42 @@ return view.extend({
                 // No click and no toggle of the details either
                 ev.preventDefault();
                 ev.stopPropagation();
-                self.openModeMenu(ev.key === 'ArrowUp');
-            }
+                // Space opens on keyup, like the Draw circle button: otherwise the keyup
+                // reaches the entry that got the focus (Firefox would pick it)
+                if (ev.key === ' ')
+                    spaceDown = true;
+                else
+                    self.openModeMenu(ev.key === 'ArrowUp');
+            },
+            'keyup': function(ev) {
+                if (ev.key !== ' ' || !spaceDown)
+                    return;
+                ev.preventDefault();
+                ev.stopPropagation();
+                spaceDown = false;
+                self.openModeMenu(false);
+            },
+            'blur': function() { spaceDown = false; }
         }, [ n.modeLabel, ' ', E('span', { 'aria-hidden': 'true' }, [ '▾' ]) ]);
+    },
+
+    // The plain mode pill of a read-only page (no menu)
+    renderModeLabel: function() {
+        return E('span', { 'id': 'operational-mode-text', 'class': 'gm-status gm-status--mode' }, [ this.nodes.modeLabel ]);
+    },
+
+    // The page turned read-only after render (resync): the mode button becomes the plain pill
+    lockModeMenu: function() {
+        var n = this.nodes, button = n && n.modeMenu && n.mode, label;
+
+        if (!button || button.tagName !== 'BUTTON')
+            return;
+        this.closeModeMenu(false);
+        label = this.renderModeLabel();
+        label.hidden = button.hidden;
+        label.title = button.title;
+        button.parentNode.replaceChild(label, button);
+        n.mode = label;
     },
 
     // The mode the status reports: the committed configuration's, the one the service runs with
@@ -2117,6 +2148,7 @@ return view.extend({
         return L.resolveDefault(this.loadConfig(), null).then(function(loaded) {
             if (!loaded) {
                 self.readonly = true;
+                self.lockModeMenu();
                 self.sendMessageToMap('setReadonly', { readonly: true });
                 if (token)
                     self.sendMessageToMap('regionRejected', { token: token, reason: '' });
@@ -3070,8 +3102,8 @@ return view.extend({
     /**
      * Switch the operational mode (mode menu of the status row) and apply it like a map change:
      * a toast with Undo. A switch from monitor mode, after which geomate blocks, asks first.
-     * procd's reload trigger restarts geomate with the new mode; a stopped or disabled service
-     * stays stopped. Refusals and errors show as notifications.
+     * procd's reload trigger restarts geomate with the new mode; a disabled service stays
+     * stopped. Refusals and errors show as notifications.
      * @param {string} mode - 'dynamic', 'static' or 'monitor'.
      */
     switchMode: function(mode) {
@@ -3107,9 +3139,11 @@ return view.extend({
                     if (configured() !== mode)
                         throw failure(_('Could not save the mode.'));
                 }).then(function() {
-                    text = self.serviceUp()
-                        ? _('Switched to %s. Geomate restarts.').format(modeTexts()[mode][0])
-                        : _('Saved. Geomate is not running.');
+                    // Enabled but not running: the reload may start it (a run loop procd gave
+                    // up on) or not (service stopped), so the text makes no claim
+                    text = self.serviceUp() ? _('Switched to %s. Geomate restarts.').format(modeTexts()[mode][0])
+                        : (self.status && self.status.config_enabled === false) ? _('Saved. Geomate is not running.')
+                        : _('Switched to %s.').format(modeTexts()[mode][0]);
                     self.showApplied('global', before, text);
                     // The toast needs the map; without it the notification is the only feedback
                     if (!self.mapReady)
