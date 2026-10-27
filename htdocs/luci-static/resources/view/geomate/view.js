@@ -164,12 +164,16 @@ var callKnownServers = rpc.declare({
     reject: true
 });
 
-// A getKnownServers answer as the map takes it: { total, approx, missing, points: [[lat, lon, n]] },
-// or null for an error or an answer of another form, which the map then shows as unknown
+// A getKnownServers answer as the map takes it: { total, approx, decimals, missing, points:
+// [[lat, lon, n]] }, or null for an error or an answer of another form, which the map then shows
+// as unknown. decimals (how far merged positions were rounded) only when it is 0, 1 or 2: an older
+// backend or cache entry has none
 function knownServersData(res) {
+    var data;
+
     if (!res || res.error != null || typeof res.total != 'number' || !Array.isArray(res.points))
         return null;
-    return {
+    data = {
         total: res.total,
         approx: res.approx === true,
         missing: res.missing === true,
@@ -178,6 +182,9 @@ function knownServersData(res) {
                 Math.abs(p[0]) <= 90 && Math.abs(p[1]) <= 180 && p[2] > 0;
         })
     };
+    if (Number.isInteger(res.decimals) && res.decimals >= 0 && res.decimals <= 2)
+        data.decimals = res.decimals;
+    return data;
 }
 
 // LAN devices for the Source IP suggestions of the filter dialog (same calls as LuCI's Static

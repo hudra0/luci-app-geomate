@@ -599,10 +599,10 @@
 
         /*
          * Known servers per filter: sid -> { data, error, loading, at, shown, layer, timer }.
-         * data = { total, approx, missing, points: [[lat, lon, n]], latlngs } from the parent's
-         * knownServers answer; error: the parent could not load them (shown as unknown, never as
-         * 0 servers); shown: the legend button shows them as dots (layer). The selection bar
-         * counts them for the selected circle's filter, so selecting a circle loads them too.
+         * data = { total, approx, decimals, missing, points: [[lat, lon, n]], latlngs } from the
+         * parent's knownServers answer; error: the parent could not load them (shown as unknown,
+         * never as 0 servers); shown: the legend button shows them as dots (layer). The selection
+         * bar counts them for the selected circle's filter, so selecting a circle loads them too.
          */
         var servers = {};
         var serverRenderer = null;          // one canvas in the pane gmServers, below the circles
@@ -1864,9 +1864,10 @@
         }
 
         /**
-         * The parent's answer: { sid, total, approx, missing, points } or { sid, error }. An error
-         * keeps no data and turns the dots off, with a note while they are on (the parent tells
-         * why only once per filter). Dots for a filter without known servers turn off with a note.
+         * The parent's answer: { sid, total, approx, decimals, missing, points } or { sid, error }.
+         * An error keeps no data and turns the dots off, with a note while they are on (the parent
+         * tells why only once per filter). Dots for a filter without known servers turn off with a
+         * note.
          * @param {Object} d - The knownServers message data; timeout: the parent never answered.
          */
         function onServers(d) {
@@ -1886,6 +1887,8 @@
                 s.data = {
                     total: Number(d.total) || 0,
                     approx: d.approx === true,
+                    // How far merged positions were rounded; an older view.js or backend sends none
+                    decimals: [ 0, 1, 2 ].indexOf(d.decimals) < 0 ? null : d.decimals,
                     missing: d.missing === true,
                     points: d.points,
                     latlngs: d.points.map(function(p) { return L.latLng(p[0], p[1]); })
@@ -1973,9 +1976,16 @@
             if (!layer) return;
             d = (servers[layer.gm.sid] || {}).data;
             selBar.count.textContent = countText(layer);
-            selBar.count.title = (d && d.approx) ? 'Positions rounded to about 1 km' : '';
+            selBar.count.title = (d && d.approx) ? roundedText(d.decimals) : '';
             // The text can wrap the bar to one more line: the bottom controls move up with it
             if (!selBar.box.hidden && selBar.box.offsetHeight !== h) layoutBars();
+        }
+
+        // Tooltip of a counter from merged positions: 2 decimals are about 1 km, 1 about 10 km,
+        // 0 about 100 km; without decimals (null) only that they are rounded
+        function roundedText(decimals) {
+            return [ 'Positions rounded to about 100 km', 'Positions rounded to about 10 km',
+                'Positions rounded to about 1 km' ][decimals] || 'Positions rounded';
         }
 
         // Text of the counter for the selected circle (updateCount)
@@ -2648,7 +2658,7 @@
          *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
          *   toast             { text, actions: [{ label, name, sid, id }] }
          *   updateConnections [connection]
-         *   knownServers      { sid, total, approx, missing, points: [[lat, lon, n]] } or { sid, error }
+         *   knownServers      { sid, total, approx, decimals, missing, points: [[lat, lon, n]] } or { sid, error }
          */
         window.addEventListener('message', function(event) {
             if (event.origin !== location.origin || event.source !== window.parent || !event.data) return;

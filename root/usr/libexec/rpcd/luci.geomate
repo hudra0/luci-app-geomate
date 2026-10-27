@@ -499,7 +499,8 @@ end
 local KNOWN_SERVERS_CACHE = "/tmp/geomate_known_servers.json"
 
 -- Above this many positions they are merged to 2 decimals (about 1 km), then to 1 and 0 decimals
--- while there are still more, and the answer says approx. 0 decimals leaves at most 181 * 361
+-- while there are still more, and the answer says approx and the decimals of the last merge. 0
+-- decimals leaves at most 181 * 361
 local KNOWN_SERVERS_MAX_POINTS = 3000
 
 -- A position as one key: tostring() of the two numbers. -0 + 0 is 0, so 0 and -0 share a key
@@ -526,9 +527,10 @@ local function merge_positions(points, decimals)
     return merged
 end
 
--- One pass over a geo data file: { total, approx, points = { { lat, lon, n }, … } }, nil if it
--- cannot be read. The exact lat/lon text is the key; a line without a valid position counts
--- nowhere. Both fields come from separate matches, without a JSON parse per line
+-- One pass over a geo data file: { total, approx, decimals, points = { { lat, lon, n }, … } }
+-- (decimals only when approx), nil if it cannot be read. The exact lat/lon text is the key; a
+-- line without a valid position counts nowhere. Both fields come from separate matches, without
+-- a JSON parse per line
 local function count_positions(path)
     local f = io.open(path, "r")
     if not f then
@@ -555,18 +557,19 @@ local function count_positions(path)
     end
     f:close()
 
-    local approx = false
+    local approx, used = false
     for decimals = 2, 0, -1 do
         if #points <= KNOWN_SERVERS_MAX_POINTS then
             break
         end
         points = merge_positions(points, decimals)
-        approx = true
+        approx, used = true, decimals
     end
-    return { total = total, approx = approx, points = points }
+    return { total = total, approx = approx, decimals = used, points = points }
 end
 
--- The known servers cache: { [filter name] = { ino, size, mtime, total, approx, points } }
+-- The known servers cache: { [filter name] = { ino, size, mtime, total, approx, decimals,
+-- points } }. An entry written before decimals existed has none, and neither has its answer
 local function load_known_servers()
     local f = io.open(KNOWN_SERVERS_CACHE, "r")
     if not f then
@@ -591,9 +594,10 @@ local function save_known_servers(data)
     end
 end
 
--- getKnownServers: { total, approx, points = { { lat, lon, n }, … } } for the geo_filter section
--- sid. Without a geo data file { points = {}, total = 0, missing = true }; { error } for an
--- unknown section or a name the backend does not support. Read only, apart from the cache
+-- getKnownServers: { total, approx, decimals, points = { { lat, lon, n }, … } } for the
+-- geo_filter section sid. Without a geo data file { points = {}, total = 0, missing = true };
+-- { error } for an unknown section or a name the backend does not support. Read only, apart
+-- from the cache
 local function get_known_servers(sid)
     if type(sid) ~= "string" or not sid:match("^[%w_]+$") then
         return { error = "Invalid filter id" }
@@ -619,7 +623,8 @@ local function get_known_servers(sid)
     local entry = known[name]
     if type(entry) == "table" and entry.ino == st.ino and entry.size == st.size
         and entry.mtime == st.mtime and type(entry.points) == "table" then
-        return { total = entry.total, approx = entry.approx, points = entry.points }
+        return { total = entry.total, approx = entry.approx, decimals = entry.decimals,
+            points = entry.points }
     end
 
     local result = count_positions(path)
@@ -635,7 +640,8 @@ local function get_known_servers(sid)
         end
     end)
     keep[name] = { ino = st.ino, size = st.size, mtime = st.mtime,
-        total = result.total, approx = result.approx, points = result.points }
+        total = result.total, approx = result.approx, decimals = result.decimals,
+        points = result.points }
     save_known_servers(keep)
     return result
 end
