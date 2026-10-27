@@ -1864,10 +1864,10 @@
         }
 
         /**
-         * The parent's answer: { sid, total, approx, decimals, missing, points } or { sid, error }.
-         * An error keeps no data and turns the dots off, with a note while they are on (the parent
-         * tells why only once per filter). Dots for a filter without known servers turn off with a
-         * note.
+         * The parent's answer: { sid, total, approx, decimals, missing, points } or { sid, error, notified }.
+         * An error keeps no data and turns the dots off, with a note while they are on, unless the
+         * parent showed its notification for this error (notified; it tells why only once per
+         * filter). Dots for a filter without known servers turn off with a note.
          * @param {Object} d - The knownServers message data; timeout: the parent never answered.
          */
         function onServers(d) {
@@ -1876,7 +1876,7 @@
             clearTimeout(s.timer);
             s.loading = false;
             if (d.error || !Array.isArray(d.points)) {
-                if (s.shown) showToast(d.timeout ? 'Could not load the known servers. Reload the page.'
+                if (s.shown && d.notified !== true) showToast(d.timeout ? 'Could not load the known servers. Reload the page.'
                     : 'Could not load the known servers of ' + serversName(d.sid) + '.');
                 s.data = null;
                 s.error = true;
@@ -2658,7 +2658,7 @@
          *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
          *   toast             { text, actions: [{ label, name, sid, id }] }
          *   updateConnections [connection]
-         *   knownServers      { sid, total, approx, decimals, missing, points: [[lat, lon, n]] } or { sid, error }
+         *   knownServers      { sid, total, approx, decimals, missing, points: [[lat, lon, n]] } or { sid, error, notified }
          */
         window.addEventListener('message', function(event) {
             if (event.origin !== location.origin || event.source !== window.parent || !event.data) return;

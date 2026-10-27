@@ -1453,7 +1453,8 @@ return view.extend({
 
     // Known servers of a filter for the map (message knownServers). Read only, also without
     // write access. An error reaches the map as 'error', which it shows as unknown, never as
-    // 0 servers; the notification comes once per filter and page
+    // 0 servers; the notification comes once per filter and page, and 'notified' tells the map
+    // not to add its own note for the same failure
     loadKnownServers: function(sid) {
         var self = this, loads = this.serversLoads;
 
@@ -1479,11 +1480,16 @@ return view.extend({
                 }).catch(function() {
                     return false;
                 }) : Promise.resolve(false)).then(function(staged) {
+                    var text;
+
                     if (staged)
                         return self.sendMessageToMap('knownServers', { sid: sid, total: 0, approx: false, missing: true, points: [] });
-                    self.warnOnce(sid + ' servers', _('Could not load the known servers of %s: %s')
-                        .format(self.filterName(sid), errorText(err)));
-                    self.sendMessageToMap('knownServers', { sid: sid, error: true });
+                    // -32002 Access denied: the session's ACL has no getKnownServers, e.g. a login
+                    // from before an update of the web interface
+                    text = /\berror -32002\b/.test(errorText(err))
+                        ? _('Could not load the known servers of %s. Log in again after an update of the web interface.').format(self.filterName(sid))
+                        : _('Could not load the known servers of %s: %s').format(self.filterName(sid), errorText(err));
+                    self.sendMessageToMap('knownServers', { sid: sid, error: true, notified: self.warnOnce(sid + ' servers', text) });
                 });
             }).finally(function() {
                 delete loads[sid];
@@ -1771,12 +1777,14 @@ return view.extend({
     },
 
     // Show a warning about a filter's regions once per page load. It stays until dismissed:
-    // the user may act on it only later, when drawing a region for that filter
+    // the user may act on it only later, when drawing a region for that filter. Returns true
+    // when it showed the warning now
     warnOnce: function(key, text) {
         if (this.reported[key])
-            return;
+            return false;
         this.reported[key] = true;
         ui.addNotification(null, E('p', {}, [ text ]), 'warning');
+        return true;
     },
 
     // Copy of a filter's region list. A hand-written 'option allowed_region' (a string) counts as
