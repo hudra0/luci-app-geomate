@@ -1459,19 +1459,65 @@ return view.extend({
             .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
             #active-connections-container .gm-seen { white-space: nowrap; }
             #active-connections-container .gm-seen--past { opacity: 0.65; }
+            /* Compact rows: less cell padding than the themes give a table, a small button and pill.
+               Text never below 11px: Material's tables are 11.2px below 1367 px */
+            #geomate-connections .td, #geomate-connections .th { padding: 5px 10px; vertical-align: middle; }
+            #geomate-connections .td .cbi-button { padding: 1px 10px; line-height: 1.5; height: auto; min-height: 0; font-size: max(90%, 11px); }
+            #geomate-connections .gm-status { line-height: 1.4; }
+            /* OpenWrt2020 fades a stacked cell at 40% of its width (up to 800 px), where its own
+               padding started the text; with the compact padding the fade would cover the text */
+            #geomate-connections .td::after { content: none; }
+            /* Phones: each server is a card of two lines, IP, status and button above, filter,
+               country, ISP and last seen below; no city, no column titles, none of the theme's cell
+               labels. The placeholder row (one cell) keeps the theme's look. The themes stack table
+               rows below their own width (up to 1152 px); between that and 600 px their layout stays */
+            @media (max-width: 600px) {
+                #geomate-connections { display: block; }
+                #geomate-connections .tr:not(.placeholder) { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 0; padding: 6px 4px; border: 0; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }
+                /* After the row rule, which has the same weight */
+                #geomate-connections .tr.table-titles { display: none; }
+                /* Zero-height item that breaks the card into its two lines */
+                #geomate-connections .tr:not(.placeholder)::before { content: ""; order: 4; flex: 0 0 100%; height: 0; margin: 0; padding: 0; border: 0; }
+                #geomate-connections .tr:not(.placeholder) > .td { display: block; flex: none; align-self: auto; width: auto; max-width: none; margin: 0; padding: 0; border: 0; overflow: visible; text-align: left; white-space: nowrap; }
+                #geomate-connections .tr:not(.placeholder) > .td::before { content: none; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-ip { order: 1; flex: 1 1 auto; font-weight: bold; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-status { order: 2; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-action { order: 3; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-city { display: none; }
+                /* Second line, small and dimmed. A long name ends in "…" instead of wrapping the
+                   line: the ISP fills what is left, filter and country have a maximum width */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: max(85%, 11px); opacity: 0.75; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 40%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 30%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; }
+                /* "Filter · Country · ISP": the dot starts the next cell, so a cut name keeps it */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
+                /* Not dimmed: past rows dim the text themselves (.gm-seen--past) */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-seen { order: 8; margin-left: auto; font-size: max(85%, 11px); }
+            }
         `);
 
         // Sortable columns; the theme styles the table like every LuCI table. With write access a
         // last column without a title holds Allow/Remove, like the action column of LuCI tables.
-        // Last seen comes after the earlier columns: LuCI stores the sorted column by its index
+        // Last seen comes after the earlier columns: LuCI stores the sorted column by its index.
+        // A class per column for the phone layout; LuCI also gives the first one to the placeholder
         var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP'), _('Last seen') ],
-            options = { id: 'geomate-connections', sortable: true, placeholder: _('No active connections') };
+            columns = [ 'ip', 'filter', 'status', 'country', 'city', 'isp', 'seen' ],
+            options = {
+                id: 'geomate-connections',
+                sortable: true,
+                placeholder: _('No active connections'),
+                captionClasses: columns.map(function(c) { return 'gm-col-' + c; })
+            };
 
         this.connectionsActions = !this.readonly;
         if (this.connectionsActions) {
             captions.push('');
             options.sortable = captions.map(function(c, i) { return i < captions.length - 1; });
-            options.captionClasses = captions.map(function(c, i) { return (i < captions.length - 1) ? null : 'cbi-section-actions'; });
+            options.captionClasses.push([ 'cbi-section-actions', 'gm-col-action' ]);
         }
         this.connectionsTable = new ui.Table(captions, options, E('em', {}, [ _('Loading connections…') ]));
 
