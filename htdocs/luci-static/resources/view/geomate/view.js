@@ -1430,6 +1430,41 @@ return view.extend({
     renderConnections: function() {
         var n = this.nodes;
 
+        // Cards: each server is a card of two lines, IP, status and button above, filter, country,
+        // ISP and last seen below; no city, no column titles, none of the theme's cell labels. The
+        // placeholder row (one cell) keeps the theme's look
+        var cards = `
+                #geomate-connections { display: block; }
+                #geomate-connections .tr:not(.placeholder) { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 0; padding: 6px 4px; border: 0; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }
+                /* After the row rule, which has the same weight */
+                #geomate-connections .tr.table-titles { display: none; }
+                /* OpenWrt2020 positions the placeholder cell in its row, and above its own stacking
+                   width that row is a table row, which shrinks to a narrow column in a block table */
+                #geomate-connections .tr.placeholder { display: block; }
+                /* Zero-height item that breaks the card into its two lines */
+                #geomate-connections .tr:not(.placeholder)::before { content: ""; order: 4; flex: 0 0 100%; height: 0; margin: 0; padding: 0; border: 0; }
+                #geomate-connections .tr:not(.placeholder) > .td { display: block; flex: none; align-self: auto; width: auto; max-width: none; margin: 0; padding: 0; border: 0; overflow: visible; text-align: left; white-space: nowrap; }
+                #geomate-connections .tr:not(.placeholder) > .td::before { content: none; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-ip { order: 1; flex: 1 1 auto; font-weight: bold; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-status { order: 2; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-action { order: 3; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-city { display: none; }
+                /* Second line, small and dimmed. A long name ends in "…" instead of wrapping the
+                   line: filter and country have a maximum width, the ISP fills the rest with at least
+                   15%. The three add up to 70% as before, so last seen stays on the line */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: max(85%, 11px); opacity: 0.75; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 30%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 25%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 15%; }
+                /* "Filter · Country · ISP": the dot starts the next cell, so a cut name keeps it */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
+                /* Not dimmed: past rows dim the text themselves (.gm-seen--past) */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-seen { order: 8; margin-left: auto; font-size: max(85%, 11px); }
+        `;
+
         var style = E('style', {}, `
             /* No side margin, whatever the theme gives a section: the same edges as the map */
             #active-connections-container { margin: 12px 0 0; }
@@ -1467,37 +1502,27 @@ return view.extend({
             /* OpenWrt2020 fades a stacked cell at 40% of its width (up to 800 px), where its own
                padding started the text; with the compact padding the fade would cover the text */
             #geomate-connections .td::after { content: none; }
-            /* Phones: each server is a card of two lines, IP, status and button above, filter,
-               country, ISP and last seen below; no city, no column titles, none of the theme's cell
-               labels. The placeholder row (one cell) keeps the theme's look. The themes stack table
-               rows below their own width (up to 1152 px); between that and 600 px their layout stays */
-            @media (max-width: 600px) {
-                #geomate-connections { display: block; }
-                #geomate-connections .tr:not(.placeholder) { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; margin: 0; padding: 6px 4px; border: 0; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }
-                /* After the row rule, which has the same weight */
-                #geomate-connections .tr.table-titles { display: none; }
-                /* Zero-height item that breaks the card into its two lines */
-                #geomate-connections .tr:not(.placeholder)::before { content: ""; order: 4; flex: 0 0 100%; height: 0; margin: 0; padding: 0; border: 0; }
-                #geomate-connections .tr:not(.placeholder) > .td { display: block; flex: none; align-self: auto; width: auto; max-width: none; margin: 0; padding: 0; border: 0; overflow: visible; text-align: left; white-space: nowrap; }
-                #geomate-connections .tr:not(.placeholder) > .td::before { content: none; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-ip { order: 1; flex: 1 1 auto; font-weight: bold; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-status { order: 2; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-action { order: 3; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-city { display: none; }
-                /* Second line, small and dimmed. A long name ends in "…" instead of wrapping the
-                   line: filter and country have a maximum width, the ISP fills the rest with at least
-                   15%. The three add up to 70% as before, so last seen stays on the line */
-                #geomate-connections .tr:not(.placeholder) > .gm-col-filter,
-                #geomate-connections .tr:not(.placeholder) > .gm-col-country,
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: max(85%, 11px); opacity: 0.75; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 30%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 25%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 15%; }
-                /* "Filter · Country · ISP": the dot starts the next cell, so a cut name keeps it */
-                #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
-                /* Not dimmed: past rows dim the text themselves (.gm-seen--past) */
-                #geomate-connections .tr:not(.placeholder) > .gm-col-seen { order: 8; margin-left: auto; font-size: max(85%, 11px); }
+            /* The room of the table picks the layout, not the window: the themes stack the rows of
+               every table below a window width of their own (OpenWrt2020 800 px, OpenWrt.org 992 px,
+               Argon and Material 1152 px, Bootstrap on devices up to 600 px), however wide the table
+               is. Up to 900 px cards. Wider: a table, also where the theme stacks; from there a
+               typical row fits without scrolling in every theme (OpenWrt2020 needs the most room) */
+            #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; }
+            /* Table: rows, cells and column titles back to table display, none of the theme's cell
+               labels. IP, filter, status, last seen and button never wrap; country, city and ISP
+               may. Text alignment stays the theme's */
+            @container gm-connections (width > 900px) {
+                #geomate-connections { display: table; width: 100%; }
+                #geomate-connections .tr { display: table-row; }
+                #geomate-connections .tr > .th, #geomate-connections .tr > .td { display: table-cell; }
+                #geomate-connections .td::before { content: none; display: none; }
+                #geomate-connections .gm-col-ip, #geomate-connections .gm-col-filter, #geomate-connections .gm-col-status,
+                #geomate-connections .gm-col-seen, #geomate-connections .gm-col-action { white-space: nowrap; }
+            }
+            @container gm-connections (width <= 900px) {${cards}}
+            /* Browsers without container queries: cards up to a 600 px window, the theme's layout above */
+            @supports not (container-type: inline-size) {
+                @media (max-width: 600px) {${cards}}
             }
         `);
 
