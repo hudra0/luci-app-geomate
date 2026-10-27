@@ -1506,18 +1506,24 @@ return view.extend({
                every table below a window width of their own (OpenWrt2020 800 px, OpenWrt.org 992 px,
                Argon and Material 1152 px, Bootstrap on devices up to 600 px), however wide the table
                is. Up to 900 px cards. Wider: a table, also where the theme stacks; from there a
-               typical row fits without scrolling in every theme (OpenWrt2020 needs the most room) */
-            #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; }
+               typical row fits without scrolling in every theme (OpenWrt2020 needs the most room).
+               The gutter keeps the room of a vertical scrollbar, whether the box scrolls or not:
+               the query then measures the width the table gets, however many rows there are */
+            #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; scrollbar-gutter: stable; }
             /* Table: rows, cells and column titles back to table display, none of the theme's cell
-               labels. IP, filter, status, last seen and button never wrap; country, city and ISP
-               may. Text alignment stays the theme's */
+               labels. IP, status, last seen and button never wrap; filter, country, city and ISP
+               may. Text alignment stays the theme's, except the column titles where Material
+               aligns its stacked cells left (up to 1152 px) */
             @container gm-connections (width > 900px) {
                 #geomate-connections { display: table; width: 100%; }
                 #geomate-connections .tr { display: table-row; }
                 #geomate-connections .tr > .th, #geomate-connections .tr > .td { display: table-cell; }
                 #geomate-connections .td::before { content: none; display: none; }
-                #geomate-connections .gm-col-ip, #geomate-connections .gm-col-filter, #geomate-connections .gm-col-status,
+                #geomate-connections .gm-col-ip, #geomate-connections .gm-col-status,
                 #geomate-connections .gm-col-seen, #geomate-connections .gm-col-action { white-space: nowrap; }
+                @media (max-width: 1152px) {
+                    #geomate-connections .tr > .th { text-align: left; }
+                }
             }
             @container gm-connections (width <= 900px) {${cards}}
             /* Browsers without container queries: cards up to a 600 px window, the theme's layout above */
@@ -1529,7 +1535,8 @@ return view.extend({
         // Sortable columns; the theme styles the table like every LuCI table. With write access a
         // last column without a title holds Allow/Remove, like the action column of LuCI tables.
         // Last seen comes after the earlier columns: LuCI stores the sorted column by its index.
-        // A class per column for the phone layout; LuCI also gives the first one to the placeholder
+        // A class per column for the card layout and the table's wrapping; LuCI also gives the first
+        // one to the placeholder
         var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP'), _('Last seen') ],
             columns = [ 'ip', 'filter', 'status', 'country', 'city', 'isp', 'seen' ],
             options = {
