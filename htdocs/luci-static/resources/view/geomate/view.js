@@ -1454,15 +1454,30 @@ return view.extend({
             return this.sendMessageToMap('knownServers', { sid: sid, error: true });
         if (!loads[sid])
             loads[sid] = callKnownServers(sid).then(function(res) {
-                var data = knownServersData(res);
+                var data = knownServersData(res), err;
 
-                if (!data)
-                    throw new Error((res && typeof res.error == 'string') ? res.error : _('Unexpected answer'));
+                if (!data) {
+                    err = new Error((res && typeof res.error == 'string') ? res.error : _('Unexpected answer'));
+                    err.answered = !!(res && res.error != null);
+                    throw err;
+                }
                 self.sendMessageToMap('knownServers', Object.assign(data, { sid: sid }));
             }).catch(function(err) {
-                self.warnOnce(sid + ' servers', _('Could not load the known servers of %s: %s')
-                    .format(self.filterName(sid), errorText(err)));
-                self.sendMessageToMap('knownServers', { sid: sid, error: true });
+                // luci.geomate reads the committed configuration only: a filter added on the Geo
+                // Filters page and not applied yet is unknown to it and has no known servers yet
+                return (err && err.answered ? callUciChanges().then(function(changes) {
+                    return L.toArray(changes.geomate).some(function(c) {
+                        return c[0] == 'add' && c[1] == sid;
+                    });
+                }).catch(function() {
+                    return false;
+                }) : Promise.resolve(false)).then(function(staged) {
+                    if (staged)
+                        return self.sendMessageToMap('knownServers', { sid: sid, total: 0, approx: false, missing: true, points: [] });
+                    self.warnOnce(sid + ' servers', _('Could not load the known servers of %s: %s')
+                        .format(self.filterName(sid), errorText(err)));
+                    self.sendMessageToMap('knownServers', { sid: sid, error: true });
+                });
             }).finally(function() {
                 delete loads[sid];
             });
