@@ -1485,13 +1485,14 @@ return view.extend({
                 #geomate-connections .tr:not(.placeholder) > .gm-col-action { order: 3; }
                 #geomate-connections .tr:not(.placeholder) > .gm-col-city { display: none; }
                 /* Second line, small and dimmed. A long name ends in "…" instead of wrapping the
-                   line: the ISP fills what is left, filter and country have a maximum width */
+                   line: filter and country have a maximum width, the ISP fills the rest with at least
+                   15%. The three add up to 70% as before, so last seen stays on the line */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-filter,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-isp { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: max(85%, 11px); opacity: 0.75; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 40%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 30%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 30%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 25%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 15%; }
                 /* "Filter · Country · ISP": the dot starts the next cell, so a cut name keeps it */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
