@@ -132,30 +132,42 @@ local function lookup_geo(wanted)
     return next(own_file) ~= nil
 end
 
--- An IPv4 address as a number, nil for anything else
+-- A number with a leading zero ('012', '024'), which nft reads as octal: an entry with one is
+-- not the address or prefix it seems to be, so it counts as nothing
+local function has_leading_zero(s)
+    return s:find("^0%d") or s:find("%.0%d")
+end
+
+-- An IPv4 address as a number, nil for anything else (also for an octet with a leading zero)
 local function ip_number(ip)
     local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
     a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
-    if not a or a > 255 or b > 255 or c > 255 or d > 255 then
+    if not a or a > 255 or b > 255 or c > 255 or d > 255 or has_leading_zero(ip) then
         return nil
     end
     return ((a * 256 + b) * 256 + c) * 256 + d
 end
 
--- Address sets as nft holds them: { ips = { [number] = true }, ranges = { { lo, hi }, … } }
+-- Address sets as nft holds them: { ips = { [address] = true }, ranges = { { lo, hi }, … } }
 local function new_set()
     return { ips = {}, ranges = {} }
 end
 
 -- Adds a set element or an allowed_ip entry: an address, a prefix (a.b.c.d/nn) or a range
--- (a.b.c.d-e.f.g.h). Anything else ('!' entries, typos) is skipped
+-- (a.b.c.d-e.f.g.h). An address goes in as written, without a parse: set_has() looks up the
+-- dotted form nft prints, which an entry with a leading zero, a '!' or a typo never equals.
+-- A prefix or range that does not parse is skipped
 local function add_element(set, element)
+    if not element:find("[/%-]") then
+        set.ips[element] = true
+        return
+    end
+
     local addr, bits = element:match("^([%d%.]+)/(%d+)$")
     if addr then
         local n = ip_number(addr)
-        bits = tonumber(bits)
-        if n and bits <= 32 then
-            local size = 2 ^ (32 - bits)
+        if n and not has_leading_zero(bits) and tonumber(bits) <= 32 then
+            local size = 2 ^ (32 - tonumber(bits))
             local lo = n - n % size
             table.insert(set.ranges, { lo, lo + size - 1 })
         end
@@ -168,23 +180,18 @@ local function add_element(set, element)
         if lo and hi and lo <= hi then
             table.insert(set.ranges, { lo, hi })
         end
-        return
-    end
-
-    local n = ip_number(element)
-    if n then
-        set.ips[n] = true
     end
 end
 
--- Whether a set contains an address: the hash first, then the few prefixes and ranges
+-- Whether a set contains an address (dotted, as nft prints it): the hash first, then the few
+-- prefixes and ranges
 local function set_has(set, ip)
-    local n = ip_number(ip)
+    if set.ips[ip] then
+        return true
+    end
+    local n = next(set.ranges) and ip_number(ip)
     if not n then
         return false
-    end
-    if set.ips[n] then
-        return true
     end
     for _, r in ipairs(set.ranges) do
         if n >= r[1] and n <= r[2] then
@@ -286,11 +293,16 @@ local function geo_copy(geo, with_position)
     return copy
 end
 
+-- The 'elements = { ... }' block of a set, '' for an empty or missing one. Only the block: the
+-- header holds the set name, and a filter named e.g. 'Game 1.2.3.4' must not add an element
+local function set_elements(set_name)
+    return nft_list_set(set_name):match("elements = {(.-)}") or ""
+end
+
 -- Elements of an _allowed or _blocked set (flags interval): addresses, prefixes and ranges
 local function read_set(set_name)
     local set = new_set()
-    local elements = nft_list_set(set_name):match("elements = {(.-)}")
-    for element in (elements or ""):gmatch("[^%s,]+") do
+    for element in set_elements(set_name):gmatch("[^%s,]+") do
         add_element(set, element)
     end
     return set
@@ -325,7 +337,7 @@ local function get_ui_dynamic_ips()
         -- IPs this filter may still claim: new ones, and without strict_mode untracked ones of
         -- an earlier filter
         local candidates = {}
-        for ip in nft_list_set(set_name .. "_ui_dynamic"):gmatch("(%d+%.%d+%.%d+%.%d+)") do
+        for ip in set_elements(set_name .. "_ui_dynamic"):gmatch("(%d+%.%d+%.%d+%.%d+)") do
             local entry = by_ip[ip]
             if (not entry or (entry.allowed == nil and not strict)) and is_public_ip(ip, own) then
                 table.insert(candidates, ip)
