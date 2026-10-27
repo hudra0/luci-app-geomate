@@ -329,10 +329,20 @@ local function count_set_addresses(set_name)
     return count
 end
 
--- allowed_ip of a filter section. The backend reads list entries only (config_list_foreach),
--- so a hand-written 'option allowed_ip', which arrives as a string, whitelists nothing
+-- allowed_ip of a filter section, split like the backend splits it: list entries only
+-- (config_list_foreach), so a hand-written 'option allowed_ip', which arrives as a string,
+-- whitelists nothing; an entry can hold several addresses, prefixes or ranges, separated by
+-- whitespace or commas (the Allowed IPs field accepts '1.2.3.4 5.6.7.8' as one entry)
 local function allowed_ip_list(s)
-    return type(s.allowed_ip) == "table" and s.allowed_ip or {}
+    local tokens = {}
+    if type(s.allowed_ip) == "table" then
+        for _, entry in ipairs(s.allowed_ip) do
+            for token in tostring(entry):gmatch("[^%s,]+") do
+                table.insert(tokens, token)
+            end
+        end
+    end
+    return tokens
 end
 
 -- Servers the enabled filters see right now (_ui_dynamic), one entry per IP:
