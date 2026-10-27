@@ -673,6 +673,10 @@ var MODE_ORDER = [ 'dynamic', 'static', 'monitor' ];
 // After a mode change, the status row waits this long (ms) for the restart (modeChanged)
 var RESTART_WAIT = 60 * 1000;
 
+// procd runs geomate's reload trigger this long (ms) after a commit (PROCD_RELOAD_DELAY in
+// /lib/functions/procd.sh); commits within that time share one reload
+var PROCD_RELOAD_DELAY = 1000;
+
 // [ name, description ] per operational mode, for the status row and its mode menu
 function modeTexts() {
     return {
@@ -2255,7 +2259,7 @@ return view.extend({
                 self.updateActiveConnectionsList();
                 self.refreshConnections();
                 if (mode)
-                    self.modeChanged();
+                    self.modeChanged(true);
                 self.sendMessageToMap('toast', { text: _('Undone.') });
             });
         }, function(reason) {
@@ -3209,14 +3213,32 @@ return view.extend({
     },
 
     // After a mode change was committed: until a status reply shows that procd restarted the
-    // service, the status row shows it as loading (updateStatus). The connection tooltips
-    // depend on the configured mode
-    modeChanged: function() {
-        this.restartPid = this.serviceUp() ? this.status.pid : null;
-        this.restartAt = Date.now();
+    // service, the status row shows it as loading (updateStatus). The PID to wait for comes from
+    // a reply fetched after the commit: this.status may be up to STATUS_INTERVAL old, from before
+    // an earlier restart. A reply later than procd's reload delay may already show the restarted
+    // service, so its PID counts only when it is the one from before the commit. An Undo within
+    // that delay shares the switch's reload, which finds the configuration unchanged and
+    // restarts nothing: no wait. The connection tooltips depend on the configured mode
+    modeChanged: function(undo) {
+        var self = this, at = Date.now(),
+            merged = undo && this.restartPid != null && at - this.restartAt < PROCD_RELOAD_DELAY,
+            before = (!merged && this.serviceUp()) ? this.status.pid : null;
+
+        // Until the reply, the loading note shows from the PID known before
+        this.restartPid = before;
+        this.restartAt = at;
         this.updateStatus();
         this.updateActiveConnectionsList();
-        return this.refreshStatus();
+        return this.refreshStatus().then(function() {
+            var st = self.status;
+
+            // No restart to wait for, or a later mode change has taken over
+            if (merged || self.restartAt !== at)
+                return;
+            self.restartPid = (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before))
+                ? st.pid : null;
+            self.updateStatus();
+        });
     },
 
     /**
