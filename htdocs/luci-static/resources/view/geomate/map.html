@@ -1834,6 +1834,20 @@
             return servers[sid] || (servers[sid] = { data: null, error: false, loading: false, at: 0, shown: false, layer: null, timer: null });
         }
 
+        function serversName(sid) {
+            var f = filterBySid(sid);
+            return (f && f.name) || sid;
+        }
+
+        // Dots switched on for a filter whose loaded data has no position turn off with a note,
+        // also when that data came from the cache
+        function hideEmptyServers(sid) {
+            var s = servers[sid];
+            if (!s || !s.shown || s.loading || !s.data || s.data.points.length) return;
+            s.shown = false;
+            showToast('No known servers for ' + serversName(sid) + ' yet.');
+        }
+
         /**
          * Asks the parent for the known servers of a filter, unless they are on the way or were
          * loaded less than SERVERS_MAX_AGE ago. Older data stays in use until the answer.
@@ -1844,25 +1858,25 @@
             if (s.loading || (s.data && Date.now() - s.at < SERVERS_MAX_AGE)) return;
             s.loading = true;
             s.timer = setTimeout(function() {
-                if (!s.loading) return;
-                if (s.shown && !s.data) showToast('Could not load the known servers. Reload the page.');
-                onServers({ sid: sid, error: true });
+                if (s.loading) onServers({ sid: sid, error: true, timeout: true });
             }, SERVERS_TIMEOUT);
             post('loadKnownServers', { sid: sid });
         }
 
         /**
          * The parent's answer: { sid, total, approx, missing, points } or { sid, error }. An error
-         * keeps no data and turns the dots off; the parent has said why. Dots for a filter
-         * without known servers turn off with a note.
-         * @param {Object} d - The knownServers message data.
+         * keeps no data and turns the dots off, with a note while they are on (the parent tells
+         * why only once per filter). Dots for a filter without known servers turn off with a note.
+         * @param {Object} d - The knownServers message data; timeout: the parent never answered.
          */
         function onServers(d) {
-            var s = servers[d.sid], f = filterBySid(d.sid);
+            var s = servers[d.sid];
             if (!s) return;
             clearTimeout(s.timer);
             s.loading = false;
             if (d.error || !Array.isArray(d.points)) {
+                if (s.shown) showToast(d.timeout ? 'Could not load the known servers. Reload the page.'
+                    : 'Could not load the known servers of ' + serversName(d.sid) + '.');
                 s.data = null;
                 s.error = true;
                 s.shown = false;
@@ -1876,10 +1890,7 @@
                     points: d.points,
                     latlngs: d.points.map(function(p) { return L.latLng(p[0], p[1]); })
                 };
-                if (s.shown && !s.data.points.length) {
-                    s.shown = false;
-                    showToast('No known servers for ' + ((f && f.name) || d.sid) + ' yet.');
-                }
+                hideEmptyServers(d.sid);
             }
             drawServers(d.sid);
             renderLegendFilters();
@@ -1920,6 +1931,7 @@
             var s = serverState(sid);
             s.shown = !s.shown;
             if (s.shown) requestServers(sid);
+            hideEmptyServers(sid);
             drawServers(sid);
             renderLegendFilters();
         }
