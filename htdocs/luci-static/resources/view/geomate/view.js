@@ -745,6 +745,8 @@ return view.extend({
 
     knownChanges: '[]', // staged geomate changes at the last check, as JSON (stagedKey)
     notice: null,       // notification about staged geomate changes (showNotice)
+    noticeText: null,   // its text paragraph
+    stagedNotice: null, // its text while an action that is not a map change runs (enqueue)
     undo: null,         // { id, sid, before, after, extra } of the last applied change: Undo in the map toast
     undoSeq: 0,         // id of the last applied change
     generation: 0,      // counts the full map updates (pushFilters); older queued circle actions are dropped
@@ -908,7 +910,8 @@ return view.extend({
                 #geomate-status .gm-wide { display: none; }
             }
             /* With write access the mode pill is the button of the mode menu: the pill's look,
-               none of the theme's button styles */
+               none of the theme's button styles. Argon's dark mode sets every button's border
+               with !important; the ID selectors win once these are important too */
             #geomate-status button.gm-status {
                 -webkit-appearance: none;
                 appearance: none;
@@ -925,7 +928,7 @@ return view.extend({
                 text-shadow: none;
                 color: inherit;
                 background: none;
-                border: 1px solid var(--gm-status-color);
+                border: 1px solid var(--gm-status-color) !important;
                 border-radius: 999px;
                 box-shadow: none;
                 cursor: pointer;
@@ -957,7 +960,7 @@ return view.extend({
                 white-space: normal;
                 color: inherit;
                 background: none;
-                border: 0;
+                border: 0 !important;
                 border-radius: 0;
                 box-shadow: none;
                 cursor: pointer;
@@ -1983,33 +1986,43 @@ return view.extend({
     // circle. So is an action whose filter id sid names another filter now than at the click
     // (movedFilter; a resync queued before may have renamed the id in sidNames since). A failed
     // action shows the error, and the map shows the configuration again (resync). report(text):
-    // shows the error instead of the map toast (table actions)
-    enqueue: function(token, sid, fn, onRefuse, report) {
+    // shows the error instead of the map toast (table actions). notice: the text of the notice
+    // about unsaved changes while this action runs (showNotice), the map's by default
+    enqueue: function(token, sid, fn, onRefuse, report, notice) {
         var self = this, generation = this.generation, known = this.sidNames[sid];
 
         this.busy = Promise.resolve(this.busy).then(function() {
+            var loaded;
+
             if (self.readonly)
                 return token && self.sendMessageToMap('regionRejected', { token: token, reason: '' });
             if (token && generation !== self.generation)
                 return self.sendMessageToMap('toast', { text: _('Not applied: the map was reloaded.') });
-            return self.checkStaged().then(function(ok) {
-                var reason = (ok === null) ? _('Could not check for unsaved changes.')
+            self.stagedNotice = notice || null;
+            // Both reads in one request (LuCI sends the calls of one frame together), so e.g. the
+            // dialog of a mode switch comes one round trip sooner. A refused action has loaded the
+            // configuration as the session holds it, staged changes included, like a page load
+            loaded = self.loadConfig().then(function() { return null; }, function(err) { return err || new Error(); });
+            return Promise.all([ self.checkStaged(), loaded ]).then(function(r) {
+                var ok = r[0], reason = (ok === null) ? _('Could not check for unsaved changes.')
                     : _('Apply or revert the unsaved geomate changes first.');
 
+                if (r[1])
+                    throw r[1];
                 if (!ok) {
                     if (token)
                         return self.sendMessageToMap('regionRejected', { token: token, reason: reason });
                     return onRefuse ? onRefuse(reason, ok) : self.sendMessageToMap('toast', { text: reason });
                 }
-                return self.loadConfig().then(function() {
-                    if (self.movedFilter(sid, known))
-                        throw filtersChanged();
-                    return fn();
-                });
+                if (self.movedFilter(sid, known))
+                    throw filtersChanged();
+                return fn();
             });
         }).catch(function(err) {
             return self.resync((err && err.plain) ? err.message
                 : _('Could not apply the change: %s').format(errorText(err)), token, report);
+        }).finally(function() {
+            self.stagedNotice = null;
         });
         return this.busy;
     },
@@ -2107,14 +2120,20 @@ return view.extend({
         });
     },
 
-    // One notification about staged geomate changes, with a button to LuCI's changes dialog
+    // One notification about staged geomate changes, with a button to LuCI's changes dialog. It
+    // names what waits for them: the map, or the action that runs (stagedNotice of enqueue); a
+    // notice that shows already takes the new text
     showNotice: function() {
-        var n = this.notice;
+        var n = this.notice,
+            text = this.stagedNotice || _('Apply or revert the unsaved geomate changes before you change the map.');
 
-        if (n && n.parentNode && !n.classList.contains('fade-out'))
+        if (n && n.parentNode && !n.classList.contains('fade-out')) {
+            this.noticeText.textContent = text;
             return;
+        }
+        this.noticeText = E('p', {}, [ text ]);
         this.notice = ui.addNotification(null, [
-            E('p', {}, [ _('Apply or revert the unsaved geomate changes before you change the map.') ]),
+            this.noticeText,
             E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'showChanges') }, [ _('Show changes') ])
         ], 'info');
     },
@@ -2241,7 +2260,7 @@ return view.extend({
             });
         }, function(reason) {
             self.sendToast(reason, u);
-        });
+        }, null, (u.sid === 'global') ? _('Apply or revert the unsaved geomate changes before you change the mode.') : null);
     },
 
     filterName: function(sid) {
@@ -3151,18 +3170,25 @@ return view.extend({
                     self.modeChanged();
                 });
             });
-        }, L.bind(this.notifyRefused, this), notify);
+        }, L.bind(this.notifyRefused, this), notify, _('Apply or revert the unsaved geomate changes before you change the mode.'));
     },
 
-    // Resolves true when the user confirms a switch from monitor mode to mode, which then blocks
+    // Resolves true when the user confirms a switch from monitor mode to mode, which then blocks.
+    // Cancel and Escape put the focus back on the mode button; LuCI leaves it on the page
     confirmMode: function(mode) {
-        var strict = uci.get('geomate', 'global', 'strict_mode') === '1',
+        var n = this.nodes,
+            strict = uci.get('geomate', 'global', 'strict_mode') === '1',
             title = (mode === 'static') ? _('Switch to Static mode?') : _('Switch to Dynamic mode?'),
             label = (mode === 'static') ? _('Switch to Static mode') : _('Switch to Dynamic mode');
 
         return new Promise(function(resolve) {
             var button = function(cls, text, ok) {
-                return E('button', { 'class': 'btn ' + cls, 'click': function() { ui.hideModal(); resolve(ok); } }, [ text ]);
+                return E('button', { 'class': 'btn ' + cls, 'click': function() {
+                    ui.hideModal();
+                    if (!ok && n.mode)
+                        n.mode.focus();
+                    resolve(ok);
+                } }, [ text ]);
             };
             // Cancel first: Escape clicks the first button of the dialog
             var confirm = button('cbi-button-action', label, true);
