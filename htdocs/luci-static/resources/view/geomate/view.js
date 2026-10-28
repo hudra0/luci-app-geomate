@@ -724,6 +724,19 @@ function trafficRate(t) {
     return (last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
 }
 
+// Packets in total for a Traffic cell: exact below 10000, then rounded ('108k packets', '1.2M
+// packets'). The table never wraps the Traffic column, so a long session's total would widen
+// it; this way the text stays at most 12 characters. The tooltip keeps the exact count
+function packetsText(n) {
+    if (n < 10000)
+        return N_(n, '%d packet', '%d packets').format(n);
+    if (n < 999500)
+        return _('%dk packets').format(Math.round(n / 1000));
+    if (n < 9950000)
+        return _('%.1fM packets').format(n / 1000000);
+    return _('%dM packets').format(Math.round(n / 1000000));
+}
+
 // Traffic cell of a row (rec: its entry of the recent list): the packet rate of a live row, the
 // packets in total of a past row and of a live row before its rate is known, '–' without counters
 // (older backend, static mode, a row from before the page was loaded). The packets count those
@@ -738,7 +751,7 @@ function showTraffic(node, rec, live) {
 
     if (t) {
         if (rate == null)
-            text = N_(t.packets, '%d packet', '%d packets').format(t.packets);
+            text = packetsText(t.packets);
         else if (rate >= 10 || rate == 0)
             text = _('%d pkt/s').format(Math.round(rate));
         else if (rate >= 0.1)
@@ -1693,8 +1706,8 @@ return view.extend({
                every table below a window width of their own (OpenWrt2020 800 px, OpenWrt.org 992 px,
                Argon and Material 1152 px, Bootstrap on devices up to 600 px), however wide the table
                is. Up to 960 px cards, below 560 px with the country code. Wider: a table, also where
-               the theme stacks; from there a typical row with traffic fits without scrolling in every
-               theme (OpenWrt2020 needs the most room, about 940 px).
+               the theme stacks; from there a row with traffic fits without scrolling in every theme
+               (OpenWrt2020 needs the most room, about 940 px; packetsText keeps totals short).
                The gutter keeps the room of a vertical scrollbar, whether the box scrolls or not:
                the query then measures the width the table gets, however many rows there are */
             #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; scrollbar-gutter: stable; }
