@@ -1767,7 +1767,10 @@ return view.extend({
         }
         this.connectionsTable = new ui.Table(captions, options, E('em', {}, [ _('Loading connections…') ]));
         // A click on a column title sorts in ui.Table's handler on the title row, before this one
-        this.connectionsTable.render().addEventListener('click', L.bind(this.showSortChoice, this));
+        this.connectionsTable.render().addEventListener('click', L.bind(function(ev) {
+            if (ev.target.matches('th[data-sortable-row]'))
+                this.connectionsSorted();
+        }, this));
 
         // The search keeps its text over the polls; the select sorts like the column titles
         n.connectionsSearch = E('input', {
@@ -1824,6 +1827,15 @@ return view.extend({
             return;
         table.setActiveSortState(choice[0], choice[1]);
         table.update(table.data, table.placeholder);
+        this.connectionsSorted();
+    },
+
+    // After ui.Table sorted the shown rows anew. Sorted by traffic, the key of the last update
+    // holds the order of the rows: a changed one rebuilds the table now, while the pointer is on
+    // a column title or the select, not under a button at the next poll
+    connectionsSorted: function() {
+        this.updateActiveConnectionsList();
+        this.showSortChoice();
     },
 
     // Show the choice the table is sorted by in the "Sort by" select: its column in its direction.
