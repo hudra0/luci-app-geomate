@@ -130,10 +130,13 @@ function errorText(err) {
 // timeout, missing method, no permission) rejects instead of resolving to the expect default, so
 // L.resolveDefault() gives null: the connection list stays as it was, the status shows "unknown".
 // Whitelisted IPs reach the map through getGeomateConnections (is_allowed_ip): the map shows only
-// IPs with an active connection. nobatch: a slow geo lookup never delays the status batch
+// IPs with an active connection. nobatch: a slow geo lookup never delays the status batch.
+// counters: also packets and bytes per server, when the backend counts them (set_counters); an
+// older luci.geomate ignores the argument and sends none
 var callGeomateConnections = rpc.declare({
     object: 'luci.geomate',
     method: 'getGeomateConnections',
+    params: [ 'counters' ],
     expect: { connections: [] },
     reject: true,
     nobatch: true
@@ -665,6 +668,97 @@ function showSeen(node, lastSeen, now) {
         node.setAttribute('data-value', secs);
 }
 
+// Columns of the connections table that the code sorts by (sortConnections), by index: LuCI
+// stores the sorted column by its index
+var COLUMN_IP = 0, COLUMN_COUNTRY = 3, COLUMN_SEEN = 6, COLUMN_TRAFFIC = 7;
+
+// Choices of the "Sort by" select of the card layout: [ column, descending ]. Last seen from the
+// newest, traffic from the most packets
+var SORT_CHOICES = [ [ COLUMN_SEEN, false ], [ COLUMN_TRAFFIC, true ], [ COLUMN_IP, false ], [ COLUMN_COUNTRY, false ] ];
+
+// The packet rate of a server is taken over the replies of the last RATE_WINDOW ms, once they
+// span RATE_MIN_SPAN ms
+var RATE_WINDOW = 20 * 1000,
+    RATE_MIN_SPAN = 4 * 1000;
+
+// A packet or byte count of luci.geomate: a whole number from 0 on
+function isCount(n) {
+    return typeof n == 'number' && n >= 0 && Math.floor(n) === n;
+}
+
+// Counters of a server in a reply (packets and bytes its filter's _dynamic set counted), with the
+// earlier ones (prev) for the rate: { packets, bytes, samples: [ [ time, packets ], … ] }. A
+// smaller count than before means the set was built again, as after a service restart: the
+// samples start over. A sample from after now (the clock was set back) is dropped. null when
+// the reply has none
+function trafficOf(prev, conn, now) {
+    var samples = [];
+
+    if (!isCount(conn.packets) || !isCount(conn.bytes))
+        return null;
+    if (prev && conn.packets >= prev.packets)
+        samples = prev.samples.filter(function(s) { return s[0] < now && now - s[0] <= RATE_WINDOW; });
+    samples.push([ now, conn.packets ]);
+    return { packets: conn.packets, bytes: conn.bytes, samples: samples };
+}
+
+// Packets per second of trafficOf() samples, null while they span less than RATE_MIN_SPAN
+function trafficRate(t) {
+    var first = t.samples[0], last = t.samples[t.samples.length - 1];
+
+    return (last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
+}
+
+// Traffic cell of a row (rec: its entry of the recent list): the packet rate of a live row, the
+// packets in total of a past row and of a live row before its rate is known, '–' without counters
+// (older backend, static mode, a row from before the page was loaded). The packets count those
+// the devices of the filter sent to the server since its first packet after the last service
+// start or after an hour without one. data-value: the packets, for sorting. The tooltip adds the
+// bytes, the average packet size and how long this page has seen the server
+function showTraffic(node, rec, live) {
+    var t = rec && rec.traffic,
+        rate = (t && live) ? trafficRate(t) : null,
+        secs = (rec && rec.firstSeen) ? Math.round((rec.lastSeen - rec.firstSeen) / 1000) : 0,
+        text = '–', title = [];
+
+    if (t) {
+        if (rate == null)
+            text = N_(t.packets, '%d packet', '%d packets').format(t.packets);
+        else if (rate >= 10 || rate == 0)
+            text = _('%d pkt/s').format(Math.round(rate));
+        else if (rate >= 0.1)
+            text = _('%.1f pkt/s').format(rate);
+        else
+            text = _('%.2f pkt/s').format(rate);
+
+        title.push(N_(t.packets, '%d packet sent to the server, %s', '%d packets sent to the server, %s')
+            .format(t.packets, '%1024.1mB'.format(t.bytes)));
+        if (t.packets > 0)
+            title.push(_('%d bytes per packet').format(Math.round(t.bytes / t.packets)));
+        if (secs > 0)
+            title.push(_('Seen for %s while this page was open').format('%t'.format(secs)));
+    }
+
+    if (node.textContent !== text)
+        node.textContent = text;
+    node.classList.toggle('gm-traffic--none', !t);
+    node.classList.toggle('gm-traffic--past', !live);
+    node.setAttribute('data-value', t ? t.packets : 0);
+    if (title.length)
+        node.setAttribute('title', title.join('\n'));
+    else
+        node.removeAttribute('title');
+}
+
+// The texts of a connection the search looks in: IP, filter, country, city and ISP, lowercase
+function searchText(conn) {
+    var geo = geoText(conn.geo);
+
+    return [ conn.dst, conn.filter_name, geo.country, geo.city, geo.isp ].filter(function(s) {
+        return typeof s == 'string';
+    }).join('\n').toLowerCase();
+}
+
 // check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
 // IP. The browser keeps the last result ({ stdout, stderr, code, at, ui, installed }) and shows it
 // again on page load and in the hourly poll: a success for VERSION_INTERVAL, a failure for
@@ -827,10 +921,12 @@ return view.extend({
     connectionsTable: null, // ui.Table of the active connections
     connectionsActions: false,  // the table has the Allow/Remove column (write access at render)
     connectionsKey: null,   // rows of the last table update, as JSON
-    recent: null,           // servers of recent replies: { 'filter\0ip': { conn, lastSeen, restored } }
+    recent: null,           // servers of recent replies: { 'filter\0ip': { conn, lastSeen, restored, firstSeen, traffic } }
     recentSaved: null,      // recent list as last written to sessionStorage, as JSON
     recentSavedAt: 0,       // time of the last write
-    seenCells: [],          // Last seen cells of the table: [{ node, lastSeen }], updated in place
+    seenCells: [],          // Last seen and Traffic cells of the table: [{ node, lastSeen, traffic }], updated in place
+    connectionsQuery: '',   // text of the search field, lowercase
+    withCounters: false,    // the backend counts packets per server (set_counters), as the last status reply said
     configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
@@ -1497,18 +1593,25 @@ return view.extend({
                 #geomate-connections .tr:not(.placeholder) > .gm-col-city { display: none; }
                 /* Second line, small and dimmed. A long name ends in "…" instead of wrapping the
                    line: filter and country have a maximum width, the ISP fills the rest with at least
-                   15%. The three add up to 70% as before, so last seen stays on the line */
+                   10%. The three add up to 53%, so last seen and the traffic stay on the line */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-filter,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-isp { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: max(85%, 11px); opacity: 0.75; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 30%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 25%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 15%; }
-                /* "Filter · Country · ISP": the dot starts the next cell, so a cut name keeps it */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 25%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 18%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 10%; }
+                /* "Filter · Country · ISP" and "Last seen · Traffic": the dot starts the next cell,
+                   so a cut name keeps it */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
-                /* Not dimmed: past rows dim the text themselves (.gm-seen--past) */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before,
+                #geomate-connections .tr:not(.placeholder) > .gm-col-traffic::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
+                /* Not dimmed: past rows dim the text themselves (.gm-seen--past, .gm-traffic--past) */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-seen { order: 8; margin-left: auto; font-size: max(85%, 11px); }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-traffic { order: 9; font-size: max(85%, 11px); }
+                /* No "· –" for a server without counters */
+                #geomate-connections .tr:not(.placeholder) > .gm-col-traffic:has(.gm-traffic--none) { display: none; }
+                /* The column titles are hidden: the select sorts like them */
+                #active-connections-container .gm-connections-sort { display: flex; }
         `;
 
         var style = E('style', {}, `
@@ -1524,6 +1627,15 @@ return view.extend({
             /* Themes that uppercase headings leave the label as it is */
             #active-connections-container .gm-connections-toggle { flex: none; font-size: 13px; font-weight: normal; opacity: 0.7; white-space: nowrap; text-transform: none; letter-spacing: normal; }
             #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
+            /* Search field and, in the card layout, the "Sort by" select above the table. The bar
+               is a container of the same name and width as the table's box (below), so the card
+               query shows the select exactly when the table shows cards. Its items keep a margin
+               for the theme's focus ring: the container clips at its edges */
+            #active-connections-container .gm-connections-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 0 8px; margin-top: 6px; container: gm-connections / inline-size; overflow: hidden; scrollbar-gutter: stable; }
+            #active-connections-container .gm-connections-tools > * { margin: 3px; }
+            #active-connections-container .gm-connections-search { flex: 1 1 12em; width: auto; min-width: 0; max-width: 24em; }
+            #active-connections-container .gm-connections-sort { display: none; flex: none; align-items: center; gap: 6px; white-space: nowrap; }
+            #active-connections-container .gm-connections-sort select { width: auto; min-width: 0; margin: 0; }
             /* Argon and Material set overflow-y: hidden on .table, which would make the table the
                scroll box of the sticky title cells below and let them scroll away with the rows */
             #active-connections-container .table { margin: 0; overflow: visible; }
@@ -1538,8 +1650,8 @@ return view.extend({
             .gm-status--blocked { --gm-status-color: var(--gm-danger); }
             .gm-status--whitelist { --gm-status-color: var(--gm-primary); }
             .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
-            #active-connections-container .gm-seen { white-space: nowrap; }
-            #active-connections-container .gm-seen--past { opacity: 0.65; }
+            #active-connections-container .gm-seen, #active-connections-container .gm-traffic { white-space: nowrap; }
+            #active-connections-container .gm-seen--past, #active-connections-container .gm-traffic--past { opacity: 0.65; }
             /* Compact rows: less cell padding than the themes give a table, a small button and pill.
                Text never below 11px: Material's tables are 11.2px below 1367 px */
             #geomate-connections .td, #geomate-connections .th { padding: 5px 10px; vertical-align: middle; }
@@ -1557,16 +1669,17 @@ return view.extend({
                the query then measures the width the table gets, however many rows there are */
             #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; scrollbar-gutter: stable; }
             /* Table: rows, cells and column titles back to table display, none of the theme's cell
-               labels. IP, status, last seen and button never wrap; filter, country, city and ISP
-               may. Text alignment stays the theme's, except the column titles where Material
-               aligns its stacked cells left (up to 1152 px) */
+               labels. IP, status, last seen, traffic and button never wrap; filter, country, city
+               and ISP may. Text alignment stays the theme's, except the column titles where
+               Material aligns its stacked cells left (up to 1152 px) */
             @container gm-connections (width > 900px) {
                 #geomate-connections { display: table; width: 100%; }
                 #geomate-connections .tr { display: table-row; }
                 #geomate-connections .tr > .th, #geomate-connections .tr > .td { display: table-cell; }
                 #geomate-connections .td::before { content: none; display: none; }
                 #geomate-connections .gm-col-ip, #geomate-connections .gm-col-status,
-                #geomate-connections .gm-col-seen, #geomate-connections .gm-col-action { white-space: nowrap; }
+                #geomate-connections .gm-col-seen, #geomate-connections .gm-col-traffic,
+                #geomate-connections .gm-col-action { white-space: nowrap; }
                 @media (max-width: 1152px) {
                     #geomate-connections .tr > .th { text-align: left; }
                 }
@@ -1580,11 +1693,11 @@ return view.extend({
 
         // Sortable columns; the theme styles the table like every LuCI table. With write access a
         // last column without a title holds Allow/Remove, like the action column of LuCI tables.
-        // Last seen comes after the earlier columns: LuCI stores the sorted column by its index.
-        // A class per column for the card layout and the table's wrapping; LuCI also gives the first
-        // one to the placeholder
-        var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP'), _('Last seen') ],
-            columns = [ 'ip', 'filter', 'status', 'country', 'city', 'isp', 'seen' ],
+        // Last seen and Traffic come after the earlier columns: LuCI stores the sorted column by its
+        // index (COLUMN_*). A class per column for the card layout and the table's wrapping; LuCI
+        // also gives the first one to the placeholder
+        var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP'), _('Last seen'), _('Traffic') ],
+            columns = [ 'ip', 'filter', 'status', 'country', 'city', 'isp', 'seen', 'traffic' ],
             options = {
                 id: 'geomate-connections',
                 sortable: true,
@@ -1599,6 +1712,27 @@ return view.extend({
             options.captionClasses.push([ 'cbi-section-actions', 'gm-col-action' ]);
         }
         this.connectionsTable = new ui.Table(captions, options, E('em', {}, [ _('Loading connections…') ]));
+        // A click on a column title sorts in ui.Table's handler on the title row, before this one
+        this.connectionsTable.render().addEventListener('click', L.bind(this.showSortChoice, this));
+
+        // The search keeps its text over the polls; the select sorts like the column titles
+        n.connectionsSearch = E('input', {
+            'type': 'search',
+            'class': 'cbi-input-text gm-connections-search',
+            'placeholder': _('Search'),
+            'aria-label': _('Search'),
+            'input': L.bind(function(ev) {
+                this.connectionsQuery = ev.target.value.trim().toLowerCase();
+                this.updateActiveConnectionsList();
+            }, this)
+        });
+        n.connectionsSort = E('select', {
+            'class': 'cbi-input-select',
+            'change': L.bind(function(ev) { this.sortConnections(+ev.target.value); }, this)
+        }, SORT_CHOICES.map(function(c) {
+            return E('option', { 'value': c[0] }, [ captions[c[0]] ]);
+        }));
+        this.showSortChoice();
 
         // updateActiveConnectionsList() sets the count in the title span
         n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
@@ -1616,10 +1750,37 @@ return view.extend({
                     E('span', { 'class': 'gm-connections-toggle' }, [ n.connectionsToggle, ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
                 ])
             ]),
+            E('div', { 'class': 'gm-connections-tools' }, [
+                n.connectionsSearch,
+                E('label', { 'class': 'gm-connections-sort' }, [ _('Sort by'), n.connectionsSort ])
+            ]),
             n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ])
         ]);
 
         return n.connections;
+    },
+
+    // Sort the connections by a column of SORT_CHOICES (the "Sort by" select), as a click on its
+    // column title would: ui.Table keeps the order for the page
+    sortConnections: function(column) {
+        var table = this.connectionsTable,
+            choice = SORT_CHOICES.find(function(c) { return c[0] === column; });
+
+        if (!choice)
+            return;
+        table.setActiveSortState(choice[0], choice[1]);
+        table.update(table.data, table.placeholder);
+    },
+
+    // Show the column the table is sorted by in the "Sort by" select; empty for a column that it
+    // does not offer. Unsorted, the table lists the servers by last seen
+    showSortChoice: function() {
+        var select = this.nodes.connectionsSort,
+            state = this.connectionsTable.getActiveSortState(),
+            column = state ? state[0] : COLUMN_SEEN;
+
+        if (select)
+            select.value = SORT_CHOICES.some(function(c) { return c[0] === column; }) ? String(column) : '';
     },
 
     // Fill of the sticky column titles: the first opaque background from a title cell up. Argon
@@ -1884,6 +2045,9 @@ return view.extend({
             ]).then(function(r) {
                 self.status = r[0];
                 self.health = r[1];
+                // A failed request keeps the last answer, so the counters do not start over
+                if (r[0])
+                    self.withCounters = hasCapability(r[0], 'set_counters');
                 self.statusLoaded = true;
                 self.updateStatus(true);
                 self.showVersions();
@@ -1895,12 +2059,13 @@ return view.extend({
         return this.statusBusy;
     },
 
-    // One request at a time: a direct call while the poll's request runs shares it
+    // One request at a time: a direct call while the poll's request runs shares it. Counters only
+    // once a status reply said the backend has them: the first request of the page goes without
     pollConnections: function() {
         var self = this;
 
         if (!this.connectionsBusy)
-            this.connectionsBusy = L.resolveDefault(callGeomateConnections(), null).then(function(list) {
+            this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(function(list) {
                 var failed = self.connectionsFailed;
 
                 self.connectionsFailed = list ? 0 : failed + 1;
@@ -1937,8 +2102,9 @@ return view.extend({
         this.updateActiveConnectionsList();
     },
 
-    // Note the servers of a reply as seen at now. One row per server, as in the reply: a server
-    // that another filter has now drops its entry of the earlier filter
+    // Note the servers of a reply as seen at now, with their counters (trafficOf) and the time this
+    // page first saw them. One row per server, as in the reply: a server that another filter has
+    // now drops its entry of the earlier filter, whose counters were another set's
     recordRecent: function(list, now) {
         var recent = this.recent, live = {};
 
@@ -1953,7 +2119,14 @@ return view.extend({
                 delete recent[key];
         });
         Object.keys(live).forEach(function(ip) {
-            recent[recentKey(live[ip])] = { conn: live[ip], lastSeen: now };
+            var key = recentKey(live[ip]), old = recent[key];
+
+            recent[key] = {
+                conn: live[ip],
+                lastSeen: now,
+                firstSeen: (old && old.firstSeen) || now,
+                traffic: trafficOf(old && old.traffic, live[ip], now)
+            };
         });
         this.pruneRecent(now);
     },
@@ -3078,12 +3251,14 @@ return view.extend({
     },
 
     // Fill the connections table: the servers of the last reply ('Now'), then those of the
-    // recent list that it no longer has, newest first. Country, city and ISP come from
+    // recent list that it no longer has, newest first; with text in the search field only those
+    // whose IP, filter, country, city or ISP contain it. Country, city and ISP come from
     // luci.geomate's geo lookup; older backends and cache entries have none of them, the cells
     // then show '–'. A past row keeps the verdict of the last reply that had it (pastStatus);
     // restored from sessionStorage it has none. The button of a row comes from the configuration
     // (connectionAction). The table is rebuilt only when a row changed: ui.Table replaces every
-    // row, and with it a button under the pointer. The Last seen cells change in place
+    // row, and with it a button under the pointer. The Last seen and Traffic cells change in
+    // place; sorted by traffic, the table is rebuilt when the order of the packets changes
     updateActiveConnectionsList: function() {
         var self = this, table = this.connectionsTable, recent = this.recent, now = Date.now();
         if (!table || !this.nodes.connectionsTitle || this.configLoads) return;
@@ -3117,9 +3292,14 @@ return view.extend({
         }).map(function(key) { return recent[key]; }).sort(function(a, b) { return b.lastSeen - a.lastSeen; });
 
         // While the status row says the list is old, its rows show the age of the last reply and,
-        // like past rows, an Allow or Remove since then (pastStatus)
+        // like past rows, an Allow or Remove since then (pastStatus). rec: the entry of the recent
+        // list, with the counters
         var liveSeen = (this.connectionsFailed >= CONNECTIONS_STALE_AFTER) ? this.connectionsAt : null;
-        var entries = list.map(function(conn) { return { conn: conn, lastSeen: liveSeen, live: true }; }).concat(past);
+        var all = list.map(function(conn) {
+            return { conn: conn, lastSeen: liveSeen, live: true, rec: recent[recentKey(conn)] };
+        }).concat(past.map(function(e) { return Object.assign({ rec: e }, e); }));
+        var query = this.connectionsQuery;
+        var entries = query ? all.filter(function(e) { return searchText(e.conn).indexOf(query) > -1; }) : all;
         var rows = entries.map(function(e) {
             var conn = e.conn,
                 action = self.connectionAction(conn),
@@ -3135,12 +3315,21 @@ return view.extend({
                 past: e.lastSeen != null
             };
         });
-        var key = JSON.stringify(rows);
+        var placeholder = (all.length && !entries.length) ? _('No matching connections') : null;
+        var sorting = table.getActiveSortState();
+        var key = JSON.stringify([ rows, placeholder ]);
+
+        if (sorting && sorting[0] === COLUMN_TRAFFIC)
+            key += JSON.stringify(entries.map(function(e, i) { return i; }).sort(function(a, b) {
+                var ta = entries[a].rec && entries[a].rec.traffic, tb = entries[b].rec && entries[b].rec.traffic;
+                return ((ta ? ta.packets : 0) - (tb ? tb.packets : 0)) || (a - b);
+            }));
 
         if (key === this.connectionsKey) {
             this.seenCells.forEach(function(c, i) {
                 c.lastSeen = entries[i].lastSeen;
                 showSeen(c.node, c.lastSeen, now);
+                showTraffic(c.traffic, entries[i].rec, !rows[i].past);
             });
             return;
         }
@@ -3150,12 +3339,17 @@ return view.extend({
         table.update(rows.map(function(r, i) {
             var status = r.status,
                 attrs = { 'class': 'gm-status gm-status--' + status[0], 'data-value': status[0] },
-                seen = { node: E('span', { 'class': r.past ? 'gm-seen gm-seen--past' : 'gm-seen' }), lastSeen: entries[i].lastSeen },
+                seen = {
+                    node: E('span', { 'class': r.past ? 'gm-seen gm-seen--past' : 'gm-seen' }),
+                    lastSeen: entries[i].lastSeen,
+                    traffic: E('span', { 'class': 'gm-traffic' })
+                },
                 cells;
 
             if (status[2])
                 attrs.title = status[2];
             showSeen(seen.node, seen.lastSeen, now);
+            showTraffic(seen.traffic, entries[i].rec, !r.past);
             self.seenCells.push(seen);
 
             // Every cell is an element: names and provider strings never run as markup
@@ -3166,12 +3360,14 @@ return view.extend({
                 textCell(r.geo[0], r.geo[1]),
                 textCell(r.geo[2]),
                 textCell(r.geo[3], r.geo[4]),
-                seen.node
+                seen.node,
+                seen.traffic
             ];
             if (self.connectionsActions)
                 cells.push(self.renderConnectionAction(r));
             return cells;
-        }));
+        }), placeholder);
+        this.showSortChoice();
     },
 
     // Button of a table row, from the configuration as loaded: 'remove' when the filter's own

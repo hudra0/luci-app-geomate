@@ -310,6 +310,29 @@ local function set_elements(set_name)
     return nft_list_set(set_name):match("elements = {(.-)}") or ""
 end
 
+-- Packets and bytes of an address in the 'nft list set' output of a set with the counter flag,
+-- where each element reads '<ip> counter packets N bytes M'; nil when the address has none.
+-- Plain finds from the elements block on, only for the IPs a reply shows: a pattern pass over
+-- 2000 elements takes about 7 ms on an Intel N100
+local function element_counter(listing, ip)
+    local needle = ip .. " counter packets "
+    local from = listing:find("elements = {", 1, true)
+
+    while from do
+        local p = listing:find(needle, from, true)
+        if not p then
+            return nil
+        end
+        -- '45.6.7.8' contains '5.6.7.8': an element starts after a blank or the '{'
+        if listing:find("^[%s{]", p - 1) then
+            local packets, bytes = listing:match("^(%d+) bytes (%d+)", p + #needle)
+            return tonumber(packets), tonumber(bytes)
+        end
+        from = p + 1
+    end
+    return nil
+end
+
 -- Elements of an _allowed or _blocked set (flags interval): addresses, prefixes and ranges
 local function read_set(set_name)
     local set = new_set()
@@ -352,9 +375,11 @@ end
 -- config order: the first filter with a verdict wins. With strict_mode the first filter that
 -- sees the IP decides, because its catch-all drop stops an untracked server before any later
 -- filter. strict_mode counts in monitor mode too: the table shows what the rules would do.
--- Private and reserved addresses and the router's own addresses are left out
-local function get_ui_dynamic_ips()
-    local entries, by_ip = {}, {}
+-- Private and reserved addresses and the router's own addresses are left out.
+-- with_counters: also the 'nft list set' output of the _dynamic set of each filter that sees a
+-- server, as { [section] = text }; nft lists it while the _allowed and _blocked sets are read
+local function get_ui_dynamic_ips(with_counters)
+    local entries, by_ip, pipes, listings = {}, {}, {}, {}
     local own = router_addresses()
 
     uci:load('geomate')
@@ -378,6 +403,9 @@ local function get_ui_dynamic_ips()
             return
         end
 
+        if with_counters then
+            pipes[s['.name']] = io.popen("nft list set inet geomate '" .. set_name .. "_dynamic' 2>/dev/null")
+        end
         local allowed = read_set(set_name .. "_allowed")
         local blocked = read_set(set_name .. "_blocked")
         for _, ip in ipairs(candidates) do
@@ -399,17 +427,25 @@ local function get_ui_dynamic_ips()
         end
     end)
 
-    return entries
+    for sid, handle in pairs(pipes) do
+        listings[sid] = handle:read("*a") or ""
+        handle:close()
+    end
+    return entries, listings
 end
 
 -- Connections from the _ui_dynamic sets of the enabled filters (previously also from conntrack)
 -- with the verdict of the filter's nft sets. is_allowed_ip: the IP is in _allowed and in the
 -- filter's own allowed_ip, as an address or inside a prefix or range. The set has to agree:
 -- nft rejects the whole allowed_ip batch for one '!' entry, and a saved change counts only
--- after the next service start
-local function get_all_connections()
+-- after the next service start.
+-- with_counters (the page asks for them when the backend reports set_counters): packets and
+-- bytes the kernel counted for the server in the filter's _dynamic set, since its first packet
+-- after the last service start or after an hour without one. Left out when the set has none,
+-- as in static mode, which has no _dynamic set
+local function get_all_connections(with_counters)
     load_cache()
-    local entries = get_ui_dynamic_ips()
+    local entries, listings = get_ui_dynamic_ips(with_counters)
 
     local wanted = {}
     for _, e in ipairs(entries) do
@@ -438,6 +474,11 @@ local function get_all_connections()
         -- No position for an untracked server: older map.html versions draw a connection
         -- without 'allowed' as a blocked marker
         local geo = geo_copy(cache[e.ip] or {}, e.allowed ~= nil)
+        local listing = listings[s['.name']]
+        local packets, bytes
+        if listing then
+            packets, bytes = element_counter(listing, e.ip)
+        end
 
         table.insert(connections, {
             src = "unknown",
@@ -449,7 +490,9 @@ local function get_all_connections()
             geo = geo,
             filter_name = s.name,
             is_dynamic = true,        -- Indicates the connection is from a dynamic set
-            is_allowed_ip = whitelisted
+            is_allowed_ip = whitelisted,
+            packets = packets,
+            bytes = bytes
         })
     end
 
@@ -986,8 +1029,10 @@ end
 -- Main function of the RPC script
 local methods = {
     getGeomateConnections = {
-        call = function()
-            local connections = get_all_connections()
+        -- rpcd takes the type of an argument from the sample value: a boolean
+        args = { counters = true },
+        call = function(args)
+            local connections = get_all_connections(type(args) == "table" and args.counters == true)
             return { connections = connections }
         end
     },
