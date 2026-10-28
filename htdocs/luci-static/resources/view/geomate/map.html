@@ -356,6 +356,8 @@
         .gm-sel-radius input:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: 1px; }
         .gm-sel-radius input[aria-invalid="true"] { border-color: var(--gm-danger); outline-color: var(--gm-danger); }
         .gm-sel-center { font-weight: 400; font-variant-numeric: tabular-nums; color: var(--gm-muted); }
+        .gm-sel-count { font-weight: 400; font-variant-numeric: tabular-nums; }
+        .gm-sel-count:empty { display: none; }
         .gm-sel-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
         .gm-sel-delete { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
         .gm-bar-btn {
@@ -376,9 +378,11 @@
         @media (pointer: coarse) {
             .gm-bar-btn, .gm-sel-radius input { min-height: 40px; }
         }
-        /* Phones: the buttons get a row of their own below filter, radius and centre */
+        /* Phones: the server counter and the buttons each get a row of their own below filter,
+           radius and centre */
         @media (max-width: 479px) {
             .gm-sel-bar { gap: 6px 10px; padding: 6px 8px; }
+            .gm-sel-count { flex-basis: 100%; font-size: 12px; }
             .gm-sel-actions { flex-basis: 100%; margin-left: 0; }
             .gm-sel-actions > .gm-bar-btn { flex: 1 1 auto; }
             .gm-sel-center { font-size: 12px; }
@@ -501,6 +505,8 @@
         .gm-icon-btn:hover { background: var(--gm-hover); border-color: var(--gm-border); }
         .gm-icon-btn:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: 0; }
         .gm-icon-btn[disabled] { color: var(--gm-disabled-fg); background: transparent; border-color: transparent; cursor: not-allowed; }
+        .gm-icon-btn.gm-icon-btn--on, .gm-icon-btn.gm-icon-btn--on:hover { color: var(--gm-accent-fg); background: var(--gm-accent); border-color: var(--gm-accent); }
+        .gm-legend-server { box-sizing: border-box; width: 11px; height: 11px; border: 1px solid #ffffff; border-radius: 50%; background: var(--gm-muted); box-shadow: 0 0 0 1px var(--gm-muted); }
         .gm-legend-switch { display: flex; align-items: center; gap: 8px; margin: 4px 0; cursor: pointer; }
         .gm-legend-switch input { width: 16px; height: 16px; margin: 0; accent-color: var(--gm-accent); }
         @media (pointer: coarse) {
@@ -590,6 +596,19 @@
         // null until the parent has sent them
         var filters = null;
         var hiddenSids = {};    // filters whose circles the legend hides
+
+        /*
+         * Known servers per filter: sid -> { data, error, loading, at, shown, layer, timer }.
+         * data = { total, approx, decimals, missing, points: [[lat, lon, n]], latlngs } from the
+         * parent's knownServers answer; error: the parent could not load them (shown as unknown,
+         * never as 0 servers); shown: the legend button shows them as dots (layer). The selection
+         * bar counts them for the selected circle's filter, so selecting a circle loads them too.
+         */
+        var servers = {};
+        var serverRenderer = null;          // one canvas in the pane gmServers, below the circles
+        var SERVERS_MAX_AGE = 5 * 60000;    // loaded data older than this is asked for again
+        var SERVERS_TIMEOUT = 60000;        // no answer by then (an older view.js): unknown
+        var countFrame = 0;                 // requestAnimationFrame of the next counter update
 
         /*
          * Region identity lives in layer.gm, never in layer.options: Leaflet.draw's edit toolbar
@@ -1535,6 +1554,8 @@
             layer.editing.enable();
             applyState(layer);
             showModeBar('Drag the centre to move, the edge to resize. Esc cancels.', [], color);
+            // Before the bar is shown: its counter needs them
+            requestServers(gm.sid);
             showSelectionBar();
             holdLegend(true);
             updateEditVisuals(layer);
@@ -1578,6 +1599,8 @@
             if (layer.editing && layer.editing.enabled()) layer.editing.disable();
             map.removeLayer(s.ghost);
             map.removeLayer(s.spoke);
+            cancelAnimationFrame(countFrame);
+            countFrame = 0;
             hidePill();
             layer.gm.selected = false;
             if (!commit) {
@@ -1661,6 +1684,8 @@
 
             selBar.center = L.DomUtil.create('span', 'gm-sel-center', box);
             selBar.center.title = 'Latitude, longitude';
+            // Known servers in the circle and in all circles of the filter (updateCount)
+            selBar.count = L.DomUtil.create('span', 'gm-sel-count', box);
 
             actions = L.DomUtil.create('span', 'gm-sel-actions', box);
             barButton(actions, 'Done', 'gm-bar-btn--primary', function() { endSelection(true); },
@@ -1675,6 +1700,7 @@
         function showSelectionBar() {
             selBar.name.textContent = filterLabel(selection.layer.gm);
             renderDeleteButton(false);
+            updateCount();
             selBar.box.hidden = false;
             layoutBars();
         }
@@ -1692,6 +1718,7 @@
                 selBar.radius.removeAttribute('aria-invalid');
             }
             selBar.center.textContent = c.lat.toFixed(4) + ', ' + c.lng.toFixed(4);
+            scheduleCount();
         }
 
         // The radius field applies at once; values outside 1 m .. 20000 km are marked, not applied
@@ -1803,6 +1830,185 @@
             return !!bounds;
         }
 
+        function serverState(sid) {
+            return servers[sid] || (servers[sid] = { data: null, error: false, loading: false, at: 0, shown: false, layer: null, timer: null });
+        }
+
+        function serversName(sid) {
+            var f = filterBySid(sid);
+            return (f && f.name) || sid;
+        }
+
+        // Dots switched on for a filter whose loaded data has no position turn off with a note,
+        // also when that data came from the cache
+        function hideEmptyServers(sid) {
+            var s = servers[sid];
+            if (!s || !s.shown || s.loading || !s.data || s.data.points.length) return;
+            s.shown = false;
+            showToast('No known servers for ' + serversName(sid) + ' yet.');
+        }
+
+        /**
+         * Asks the parent for the known servers of a filter, unless they are on the way or were
+         * loaded less than SERVERS_MAX_AGE ago. Older data stays in use until the answer.
+         * @param {string} sid - The UCI section of the filter.
+         */
+        function requestServers(sid) {
+            var s = serverState(sid);
+            if (s.loading || (s.data && Date.now() - s.at < SERVERS_MAX_AGE)) return;
+            s.loading = true;
+            s.timer = setTimeout(function() {
+                if (s.loading) onServers({ sid: sid, error: true, timeout: true });
+            }, SERVERS_TIMEOUT);
+            post('loadKnownServers', { sid: sid });
+        }
+
+        /**
+         * The parent's answer: { sid, total, approx, decimals, missing, points } or { sid, error, notified }.
+         * An error keeps no data and turns the dots off, with a note while they are on, unless the
+         * parent showed its notification for this error (notified; it tells why only once per
+         * filter). Dots for a filter without known servers turn off with a note.
+         * @param {Object} d - The knownServers message data; timeout: the parent never answered.
+         */
+        function onServers(d) {
+            var s = servers[d.sid];
+            if (!s) return;
+            clearTimeout(s.timer);
+            s.loading = false;
+            if (d.error || !Array.isArray(d.points)) {
+                if (s.shown && d.notified !== true) showToast(d.timeout ? 'Could not load the known servers. Reload the page.'
+                    : 'Could not load the known servers of ' + serversName(d.sid) + '.');
+                s.data = null;
+                s.error = true;
+                s.shown = false;
+            } else {
+                s.error = false;
+                s.at = Date.now();
+                s.data = {
+                    total: Number(d.total) || 0,
+                    approx: d.approx === true,
+                    // How far merged positions were rounded; an older view.js or backend sends none
+                    decimals: [ 0, 1, 2 ].indexOf(d.decimals) < 0 ? null : d.decimals,
+                    missing: d.missing === true,
+                    points: d.points,
+                    latlngs: d.points.map(function(p) { return L.latLng(p[0], p[1]); })
+                };
+                hideEmptyServers(d.sid);
+            }
+            drawServers(d.sid);
+            renderLegendFilters();
+            if (selection && selection.layer.gm.sid === d.sid) scheduleCount();
+        }
+
+        // Dot radius in pixels: 3 for one server, 2 more per factor 10, at most 12
+        function serverRadius(n) {
+            return Math.min(12, 3 + 2 * Math.log10(n));
+        }
+
+        /**
+         * Shows the known servers of a filter as dots in its color, or removes them. The dots
+         * take no clicks: their pane has pointer-events none and lies below the circles, so a
+         * click reaches the circle or the map.
+         * @param {string} sid - The UCI section of the filter.
+         */
+        function drawServers(sid) {
+            var s = servers[sid], f = filterBySid(sid), color;
+            if (!s) return;
+            if (s.layer) {
+                map.removeLayer(s.layer);
+                s.layer = null;
+            }
+            if (!s.shown || !s.data || !f) return;
+            color = f.color || DEFAULT_COLOR;
+            s.layer = L.layerGroup(s.data.points.map(function(p, i) {
+                return L.circleMarker(s.data.latlngs[i], {
+                    renderer: serverRenderer, pane: 'gmServers', interactive: false,
+                    radius: serverRadius(p[2]), weight: 1, color: '#ffffff', opacity: 0.9,
+                    fillColor: color, fillOpacity: 0.85
+                });
+            })).addTo(map);
+        }
+
+        // Server button in the legend: dots on or off; the first time loads them
+        function toggleServers(sid) {
+            var s = serverState(sid);
+            s.shown = !s.shown;
+            if (s.shown) requestServers(sid);
+            hideEmptyServers(sid);
+            drawServers(sid);
+            renderLegendFilters();
+        }
+
+        // After setFilters and updateFilter: dots of removed filters go, the others take the
+        // filter color again
+        function refreshServers() {
+            Object.keys(servers).forEach(function(sid) {
+                if (filterBySid(sid)) {
+                    drawServers(sid);
+                    return;
+                }
+                clearTimeout(servers[sid].timer);
+                if (servers[sid].layer) map.removeLayer(servers[sid].layer);
+                delete servers[sid];
+            });
+        }
+
+        function formatCount(n) {
+            return n.toLocaleString('en-US');
+        }
+
+        // The counter in the selection bar follows a moved or resized circle at most once a frame
+        function scheduleCount() {
+            if (!countFrame) countFrame = requestAnimationFrame(function() {
+                countFrame = 0;
+                updateCount();
+            });
+        }
+
+        /**
+         * Counter in the selection bar: the known servers of the filter inside the selected
+         * circle, and inside any of the filter's circles (the firewall allows the union) of all
+         * known servers of the filter. Distances with map.distance (Haversine, R = 6371000 m, as
+         * in the backend).
+         */
+        function updateCount() {
+            var layer = selection && selection.layer, h = selBar.box.offsetHeight, d;
+            if (!layer) return;
+            d = (servers[layer.gm.sid] || {}).data;
+            selBar.count.textContent = countText(layer);
+            selBar.count.title = (d && d.approx) ? roundedText(d.decimals) : '';
+            // The text can wrap the bar to one more line: the bottom controls move up with it
+            if (!selBar.box.hidden && selBar.box.offsetHeight !== h) layoutBars();
+        }
+
+        // Tooltip of a counter from merged positions: 2 decimals are about 1 km, 1 about 10 km,
+        // 0 about 100 km; without decimals (null) only that they are rounded
+        function roundedText(decimals) {
+            return [ 'Positions rounded to about 100 km', 'Positions rounded to about 10 km',
+                'Positions rounded to about 1 km' ][decimals] || 'Positions rounded';
+        }
+
+        // Text of the counter for the selected circle (updateCount)
+        function countText(layer) {
+            var s = servers[layer.gm.sid], d = s && s.data, others = [], inCircle = 0, inFilter = 0;
+            if (!d) return (s && s.error) ? 'Known servers unknown' : (s && s.loading) ? 'Counting known servers…' : '';
+            if (!d.total) return 'No known servers yet';
+            eachCircle(layer.gm.sid, function(c) {
+                if (c !== layer && !c.gm.deleting) others.push(c);
+            });
+            d.latlngs.forEach(function(ll, i) {
+                var n = d.points[i][2];
+                if (map.distance(layer.getLatLng(), ll) <= layer.getRadius()) {
+                    inCircle += n;
+                    inFilter += n;
+                } else if (others.some(function(c) { return map.distance(c.getLatLng(), ll) <= c.getRadius(); })) {
+                    inFilter += n;
+                }
+            });
+            return formatCount(inCircle) + ' in circle · ' + formatCount(inFilter) + ' / ' +
+                formatCount(d.total) + ' in this filter';
+        }
+
         function iconButton(parent, icon, label, key, fn) {
             var b = L.DomUtil.create('button', 'gm-icon-btn', parent);
             b.type = 'button';
@@ -1814,7 +2020,8 @@
             return b;
         }
 
-        // Filter list of the legend: color, name, circle count, state, eye and magnifier
+        // Filter list of the legend: color, name, circle count, state, known servers while shown,
+        // eye, magnifier and the server button. The server button works without circles too
         function renderLegendFilters() {
             var ul, counts = {}, focused = null;
             if (!legend || !filters) return;
@@ -1833,7 +2040,7 @@
             filters.forEach(function(f) {
                 var li = L.DomUtil.create('li', 'gm-legend-filter', ul),
                     n = counts[f.sid] || 0, hidden = !!hiddenSids[f.sid], name = f.name || f.sid,
-                    color = f.color || DEFAULT_COLOR, dot, text, meta, eye, fit;
+                    color = f.color || DEFAULT_COLOR, sv = servers[f.sid] || {}, dot, text, meta, eye, fit, srv;
 
                 if (hidden) L.DomUtil.addClass(li, 'gm-legend-filter--hidden');
                 dot = L.DomUtil.create('span', 'gm-legend-dot' + (f.enabled ? '' : ' gm-legend-dot--disabled'), li);
@@ -1843,7 +2050,9 @@
                 L.DomUtil.create('span', 'gm-legend-name', text).textContent = name;
                 meta = L.DomUtil.create('span', 'gm-legend-meta', text);
                 L.DomUtil.create('span', '', meta).textContent =
-                    (n === 1 ? '1 circle' : n + ' circles') + (f.enabled ? '' : ' (disabled)');
+                    (n === 1 ? '1 circle' : n + ' circles') + (f.enabled ? '' : ' (disabled)') +
+                    (sv.shown && sv.data ? ' · ' + formatCount(sv.data.total) + (sv.data.total === 1 ? ' server' : ' servers') : '') +
+                    (sv.error ? ' · servers unknown' : '');
                 eye = iconButton(li, hidden ? 'fa-eye-slash' : 'fa-eye',
                     (hidden ? 'Show ' : 'Hide ') + name, f.sid + ' eye',
                     function() { setFilterVisible(f.sid, hidden); });
@@ -1851,6 +2060,11 @@
                 fit = iconButton(li, 'fa-magnifying-glass', 'Zoom to ' + name, f.sid + ' fit',
                     function() { fitFilter(f.sid); });
                 eye.disabled = fit.disabled = !n;
+                srv = iconButton(li, (sv.shown && sv.loading) ? 'fa-spinner fa-spin' : 'fa-server',
+                    (sv.shown ? 'Hide known servers of ' : 'Show known servers of ') + name, f.sid + ' servers',
+                    function() { toggleServers(f.sid); });
+                srv.setAttribute('aria-pressed', sv.shown ? 'true' : 'false');
+                if (sv.shown) L.DomUtil.addClass(srv, 'gm-icon-btn--on');
             });
 
             if (focused) {
@@ -1925,6 +2139,8 @@
                     var swatch = legendItem(body, s[1]);
                     L.DomUtil.create('span', 'gm-legend-ring gm-legend-ring--' + s[0], swatch);
                 });
+                // Dots of the server button in the filter list, in the filter color
+                L.DomUtil.create('span', 'gm-legend-server', legendItem(body, 'Known servers (bigger: more)'));
 
                 L.DomUtil.create('h3', '', body).textContent = 'Connections';
                 [
@@ -1991,6 +2207,13 @@
                 noWrap: true,
                 bounds: [[-90, -180], [90, 180]]
             }).addTo(map);
+
+            // Known servers: a canvas in a pane of their own below the circles (overlayPane, 400),
+            // which takes no pointer events, so circle clicks and map clicks still arrive
+            map.createPane('gmServers');
+            map.getPane('gmServers').style.zIndex = 350;
+            map.getPane('gmServers').style.pointerEvents = 'none';
+            serverRenderer = L.canvas({ pane: 'gmServers' });
 
             // The lowest zoom first: the MarkerCluster group takes it when it is added
             updateMinZoom();
@@ -2247,6 +2470,7 @@
                     addRegion(filter, region);
                 });
             });
+            refreshServers();
             renderLegendFilters();
 
             sortCircles();
@@ -2293,6 +2517,8 @@
             }
             // An enabled or disabled filter moves its circles in the stacking order
             sortCircles();
+            // Dots in a changed filter color
+            if (servers[sid]) drawServers(sid);
             renderLegendFilters();
             refreshDrawMenu();
         }
@@ -2419,6 +2645,7 @@
          *   regionInvalid     { sid, region }
          *   toastAction       { name, sid, id }                button in a toast: undo, enableFilter
          *   fullscreen        { on }                           fullscreen button or Escape asks for it
+         *   loadKnownServers  { sid }                          server button in the legend, or a circle selected
          * parent -> map:
          *   theme             { dark, bg, fg, border, accent, accentFg, danger, dangerFg, success }
          *   fullscreen        { on }                           the state the view has set
@@ -2431,6 +2658,7 @@
          *   regionRemoved, regionDiscarded { token }; regionRejected { token, reason }
          *   toast             { text, actions: [{ label, name, sid, id }] }
          *   updateConnections [connection]
+         *   knownServers      { sid, total, approx, decimals, missing, points: [[lat, lon, n]] } or { sid, error, notified }
          */
         window.addEventListener('message', function(event) {
             if (event.origin !== location.origin || event.source !== window.parent || !event.data) return;
@@ -2443,6 +2671,8 @@
                 if (viewFitted) fitStartView();  // late: the start view has been fitted already
             } else if (type === 'updateConnections') {
                 updateConnections(data || []);
+            } else if (type === 'knownServers' && data && data.sid) {
+                onServers(data);
             } else if (type === 'theme' && data) {
                 setTheme(data);
             } else if (type === 'fullscreen' && data) {

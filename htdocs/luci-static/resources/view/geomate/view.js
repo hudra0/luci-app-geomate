@@ -154,6 +154,39 @@ var callGetHealthCheck = rpc.declare({
     reject: true
 });
 
+// Known servers of a filter for the map, counted per position. On request only (legend button,
+// selected circle), never polled. An older rpcd ACL or luci.geomate rejects it
+var callKnownServers = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getKnownServers',
+    params: [ 'sid' ],
+    expect: { '': {} },
+    reject: true
+});
+
+// A getKnownServers answer as the map takes it: { total, approx, decimals, missing, points:
+// [[lat, lon, n]] }, or null for an error or an answer of another form, which the map then shows
+// as unknown. decimals (how far merged positions were rounded) only when it is 0, 1 or 2: an older
+// backend or cache entry has none
+function knownServersData(res) {
+    var data;
+
+    if (!res || res.error != null || typeof res.total != 'number' || !Array.isArray(res.points))
+        return null;
+    data = {
+        total: res.total,
+        approx: res.approx === true,
+        missing: res.missing === true,
+        points: res.points.filter(function(p) {
+            return Array.isArray(p) && p.length == 3 && p.every(Number.isFinite) &&
+                Math.abs(p[0]) <= 90 && Math.abs(p[1]) <= 180 && p[2] > 0;
+        })
+    };
+    if (Number.isInteger(res.decimals) && res.decimals >= 0 && res.decimals <= 2)
+        data.decimals = res.decimals;
+    return data;
+}
+
 // LAN devices for the Source IP suggestions of the filter dialog (same calls as LuCI's Static
 // Leases page). The luci-app-geomate ACL grants both; a ubus error such as "Access denied"
 // resolves to {}
@@ -638,6 +671,7 @@ return view.extend({
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
     hostsLoad: null,        // promise of the Source IP suggestions (loadHostChoices)
+    serversLoads: {},       // running getKnownServers request per filter section
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
@@ -1411,7 +1445,56 @@ return view.extend({
             this.warnOnce(d.sid + ' ' + d.region, _('Filter %s has an invalid circle "%s". Fix it on the Geo Filters page.')
                 .format(this.filterName(d.sid), d.region));
             break;
+        case 'loadKnownServers':
+            this.loadKnownServers(String(d.sid || ''));
+            break;
         }
+    },
+
+    // Known servers of a filter for the map (message knownServers). Read only, also without
+    // write access. An error reaches the map as 'error', which it shows as unknown, never as
+    // 0 servers; the notification comes once per filter and page, and 'notified' tells the map
+    // not to add its own note for the same failure
+    loadKnownServers: function(sid) {
+        var self = this, loads = this.serversLoads;
+
+        if (!isGeoFilter(sid))
+            return this.sendMessageToMap('knownServers', { sid: sid, error: true });
+        if (!loads[sid])
+            loads[sid] = callKnownServers(sid).then(function(res) {
+                var data = knownServersData(res), err;
+
+                if (!data) {
+                    err = new Error((res && typeof res.error == 'string') ? res.error : _('Unexpected answer'));
+                    err.answered = !!(res && res.error != null);
+                    throw err;
+                }
+                self.sendMessageToMap('knownServers', Object.assign(data, { sid: sid }));
+            }).catch(function(err) {
+                // luci.geomate reads the committed configuration only: a filter added on the Geo
+                // Filters page and not applied yet is unknown to it and has no known servers yet
+                return (err && err.answered ? callUciChanges().then(function(changes) {
+                    return L.toArray(changes.geomate).some(function(c) {
+                        return c[0] == 'add' && c[1] == sid;
+                    });
+                }).catch(function() {
+                    return false;
+                }) : Promise.resolve(false)).then(function(staged) {
+                    var text;
+
+                    if (staged)
+                        return self.sendMessageToMap('knownServers', { sid: sid, total: 0, approx: false, missing: true, points: [] });
+                    // -32002 Access denied: the session's ACL has no getKnownServers, e.g. a login
+                    // from before an update of the web interface
+                    text = /\berror -32002\b/.test(errorText(err))
+                        ? _('Could not load the known servers of %s. Log in again after an update of the web interface.').format(self.filterName(sid))
+                        : _('Could not load the known servers of %s: %s').format(self.filterName(sid), errorText(err));
+                    self.sendMessageToMap('knownServers', { sid: sid, error: true, notified: self.warnOnce(sid + ' servers', text) });
+                });
+            }).finally(function() {
+                delete loads[sid];
+            });
+        return loads[sid];
     },
 
     // Run map actions one after another, each on the configuration as committed now (another
@@ -1694,12 +1777,14 @@ return view.extend({
     },
 
     // Show a warning about a filter's regions once per page load. It stays until dismissed:
-    // the user may act on it only later, when drawing a region for that filter
+    // the user may act on it only later, when drawing a region for that filter. Returns true
+    // when it showed the warning now
     warnOnce: function(key, text) {
         if (this.reported[key])
-            return;
+            return false;
         this.reported[key] = true;
         ui.addNotification(null, E('p', {}, [ text ]), 'warning');
+        return true;
     },
 
     // Copy of a filter's region list. A hand-written 'option allowed_region' (a string) counts as
