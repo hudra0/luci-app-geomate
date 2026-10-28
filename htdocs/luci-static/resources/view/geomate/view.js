@@ -340,6 +340,21 @@ function textCell(value, title) {
     return E('span', (title && title !== text) ? { 'title': title } : {}, [ text ]);
 }
 
+// Country cell: the name with the code as tooltip, in narrow cards the code with the name as
+// tooltip (.gm-country-code). Without a code the name everywhere. data-value: the name, for
+// sorting: ui.Table otherwise takes the text the layout shows
+function countryCell(name, code) {
+    var cell = textCell(name, code), key = cell.textContent;
+
+    if (typeof code == 'string' && code !== '') {
+        cell.className = 'gm-country-name';
+        cell = E('span', {}, [ cell, textCell(code, name) ]);
+        cell.lastChild.className = 'gm-country-code';
+    }
+    cell.setAttribute('data-value', key);
+    return cell;
+}
+
 // A dotted IPv4 address, every octet 0-255 without a leading zero: nft reads 012 as octal
 function validIPv4(ip) {
     return /^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(ip) && ip.split('.').every(function(o) { return +o <= 255; });
@@ -750,11 +765,12 @@ function showTraffic(node, rec, live) {
         node.removeAttribute('title');
 }
 
-// The texts of a connection the search looks in: IP, filter, country, city and ISP, lowercase
+// The texts of a connection the search looks in: IP, filter, country with its code (what narrow
+// cards show), city and ISP, lowercase
 function searchText(conn) {
     var geo = geoText(conn.geo);
 
-    return [ conn.dst, conn.filter_name, geo.country, geo.city, geo.isp ].filter(function(s) {
+    return [ conn.dst, conn.filter_name, geo.country, geo.countryCode, geo.city, geo.isp ].filter(function(s) {
         return typeof s == 'string';
     }).join('\n').toLowerCase();
 }
@@ -1619,6 +1635,13 @@ return view.extend({
                 #active-connections-container .gm-connections-sort { display: flex; }
         `;
 
+        // Narrow cards show the country code instead of the name (countryCell), so the ISP keeps
+        // its room next to last seen and traffic
+        var codes = `
+                #geomate-connections .gm-country-name { display: none; }
+                #geomate-connections .gm-country-code { display: inline; }
+        `;
+
         var style = E('style', {}, `
             /* No side margin, whatever the theme gives a section: the same edges as the map */
             #active-connections-container { margin: 12px 0 0; }
@@ -1657,6 +1680,7 @@ return view.extend({
             .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
             #active-connections-container .gm-seen, #active-connections-container .gm-traffic { white-space: nowrap; }
             #active-connections-container .gm-seen--past, #active-connections-container .gm-traffic--past { opacity: 0.65; }
+            #geomate-connections .gm-country-code { display: none; }
             /* Compact rows: less cell padding than the themes give a table, a small button and pill.
                Text never below 11px: Material's tables are 11.2px below 1367 px */
             #geomate-connections .td, #geomate-connections .th { padding: 5px 10px; vertical-align: middle; }
@@ -1668,8 +1692,9 @@ return view.extend({
             /* The room of the table picks the layout, not the window: the themes stack the rows of
                every table below a window width of their own (OpenWrt2020 800 px, OpenWrt.org 992 px,
                Argon and Material 1152 px, Bootstrap on devices up to 600 px), however wide the table
-               is. Up to 900 px cards. Wider: a table, also where the theme stacks; from there a
-               typical row fits without scrolling in every theme (OpenWrt2020 needs the most room).
+               is. Up to 960 px cards, below 560 px with the country code. Wider: a table, also where
+               the theme stacks; from there a typical row with traffic fits without scrolling in every
+               theme (OpenWrt2020 needs the most room, about 940 px).
                The gutter keeps the room of a vertical scrollbar, whether the box scrolls or not:
                the query then measures the width the table gets, however many rows there are */
             #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; scrollbar-gutter: stable; }
@@ -1677,7 +1702,7 @@ return view.extend({
                labels. IP, status, last seen, traffic and button never wrap; filter, country, city
                and ISP may. Text alignment stays the theme's, except the column titles where
                Material aligns its stacked cells left (up to 1152 px) */
-            @container gm-connections (width > 900px) {
+            @container gm-connections (width > 960px) {
                 #geomate-connections { display: table; width: 100%; }
                 #geomate-connections .tr { display: table-row; }
                 #geomate-connections .tr > .th, #geomate-connections .tr > .td { display: table-cell; }
@@ -1689,10 +1714,12 @@ return view.extend({
                     #geomate-connections .tr > .th { text-align: left; }
                 }
             }
-            @container gm-connections (width <= 900px) {${cards}}
-            /* Browsers without container queries: cards up to a 600 px window, the theme's layout above */
+            @container gm-connections (width <= 960px) {${cards}}
+            @container gm-connections (width < 560px) {${codes}}
+            /* Browsers without container queries: cards with the code up to a 600 px window, the
+               theme's layout above */
             @supports not (container-type: inline-size) {
-                @media (max-width: 600px) {${cards}}
+                @media (max-width: 600px) {${cards}${codes}}
             }
         `);
 
@@ -3362,7 +3389,7 @@ return view.extend({
                 textCell(r.ip),
                 textCell(r.filter),
                 E('span', attrs, [ status[1] ]),
-                textCell(r.geo[0], r.geo[1]),
+                countryCell(r.geo[0], r.geo[1]),
                 textCell(r.geo[2]),
                 textCell(r.geo[3], r.geo[4]),
                 seen.node,
