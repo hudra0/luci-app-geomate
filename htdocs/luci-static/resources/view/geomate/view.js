@@ -749,12 +749,13 @@ function showTraffic(node, rec, live) {
         secs = (rec && rec.firstSeen) ? Math.round((rec.lastSeen - rec.firstSeen) / 1000) : 0,
         text = '–', title = [];
 
+    // The format follows the rounded rate: 9.96 is '10 pkt/s', not '10.0 pkt/s'
     if (t) {
         if (rate == null)
             text = packetsText(t.packets);
-        else if (rate >= 10 || rate == 0)
+        else if (+rate.toFixed(1) >= 10 || rate == 0)
             text = _('%d pkt/s').format(Math.round(rate));
-        else if (rate >= 0.1)
+        else if (+rate.toFixed(2) >= 0.1)
             text = _('%.1f pkt/s').format(rate);
         else
             text = _('%.2f pkt/s').format(rate);
