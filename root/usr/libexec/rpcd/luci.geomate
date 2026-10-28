@@ -503,6 +503,25 @@ function table_contains(tbl, element)
     return false
 end
 
+-- Feature tokens of the installed backend: '/etc/geomate.sh capabilities' prints one line of
+-- space-separated tokens (fixed command, no input). An older geomate.sh prints its usage and
+-- exits 1; any line that is not lowercase tokens counts as no capabilities. Tokens are only
+-- added, never renamed. src_ip_multi: Source IP takes several entries and exceptions
+local function backend_capabilities()
+    local caps = {}
+    local handle = io.popen("/etc/geomate.sh capabilities 2>/dev/null")
+    if handle then
+        local line = handle:read("*l")
+        handle:close()
+        if line and line:match("^[%l%d_ ]*$") then
+            for token in line:gmatch("[%l%d_]+") do
+                table.insert(caps, token)
+            end
+        end
+    end
+    return caps
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -603,6 +622,8 @@ local function get_service_status()
             table.insert(status.nft_errors, lines[i])
         end
     end
+
+    status.capabilities = backend_capabilities()
 
     return status
 end
@@ -844,6 +865,9 @@ local methods = {
                     end
                 end
             end
+            
+            -- The Geo Filters page offers several Source IP entries only with src_ip_multi
+            data.capabilities = backend_capabilities()
             
             return { status = data }
         end

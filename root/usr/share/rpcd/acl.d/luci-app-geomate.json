@@ -5,6 +5,7 @@
             "ubus": {
                 "luci": [ "getInitList", "setInitAction" ],
                 "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus" ],
+                "luci-rpc": [ "getHostHints", "getNetworkDevices" ],
                 "uci": [ "get", "state" ]
             },
             "uci": [ "geomate" ],
