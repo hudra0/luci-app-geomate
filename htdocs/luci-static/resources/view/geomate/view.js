@@ -3369,10 +3369,12 @@ return view.extend({
         var sorting = table.getActiveSortState();
         var key = JSON.stringify([ rows, placeholder ]);
 
+        // The order ui.Table gives the rows: descending negates the comparison, equal packets
+        // keep the order of the rows (stable sort)
         if (sorting && sorting[0] === COLUMN_TRAFFIC)
             key += JSON.stringify(entries.map(function(e, i) { return i; }).sort(function(a, b) {
                 var ta = entries[a].rec && entries[a].rec.traffic, tb = entries[b].rec && entries[b].rec.traffic;
-                return ((ta ? ta.packets : 0) - (tb ? tb.packets : 0)) || (a - b);
+                return (sorting[1] ? -1 : 1) * ((ta ? ta.packets : 0) - (tb ? tb.packets : 0)) || (a - b);
             }));
 
         if (key === this.connectionsKey) {
