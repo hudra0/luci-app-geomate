@@ -3,15 +3,19 @@
         "description": "Grant access to Geomate configuration",
         "read": {
             "ubus": {
-                "luci": [ "getInitList", "setInitAction" ],
+                "file": [ "exec" ],
+                "luci": [ "getInitList" ],
                 "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers" ],
                 "luci-rpc": [ "getHostHints", "getNetworkDevices" ],
                 "uci": [ "get", "state" ]
             },
             "uci": [ "geomate" ],
             "file": {
-                "/etc/init.d/geomate": [ "read", "exec" ],
-                "/etc/geolocate.sh": [ "read", "exec" ],
+                "/etc/init.d/geomate": [ "read" ],
+                "/etc/init.d/geomate check_version": [ "exec" ],
+                "/etc/init.d/geomate check_version -i": [ "exec" ],
+                "/etc/init.d/geomate status": [ "exec" ],
+                "/etc/geolocate.sh": [ "read" ],
                 "/var/run/geomate.pid": [ "read" ],
                 "/etc/geomate.d/*": [ "read" ],
                 "/etc/geomate.d/runtime/*": [ "read" ],
@@ -26,6 +30,8 @@
             },
             "uci": [ "geomate" ],
             "file": {
+                "/etc/init.d/geomate": [ "exec" ],
+                "/etc/geolocate.sh": [ "exec" ],
                 "/etc/geomate.d/*": [ "write" ]
             }
         }
