@@ -702,10 +702,10 @@ function isCount(n) {
 }
 
 // Counters of a server in a reply (packets and bytes its filter's _dynamic set counted), with
-// those of the previous reply (prev, recordRecent) for the rate: { packets, bytes, samples: [
-// [ time, packets ], … ] }. Without prev, or with a smaller count than before (the set was built
-// again, as after a service restart), the samples start over. A sample from after now (the
-// clock was set back) is dropped. null when the reply has none
+// its earlier ones from the same run of Geomate (prev, recordRecent) for the rate: { packets,
+// bytes, samples: [ [ time, packets ], … ] }. Without prev (another run, see recordRecent), or
+// with a smaller count than before (the set was built again), the samples start over. A sample
+// from after now (the clock was set back) is dropped. null when the reply has none
 function trafficOf(prev, conn, now) {
     var samples = [];
 
