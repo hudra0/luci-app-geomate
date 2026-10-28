@@ -701,11 +701,11 @@ function isCount(n) {
     return typeof n == 'number' && n >= 0 && Math.floor(n) === n;
 }
 
-// Counters of a server in a reply (packets and bytes its filter's _dynamic set counted), with the
-// earlier ones (prev) for the rate: { packets, bytes, samples: [ [ time, packets ], … ] }. A
-// smaller count than before means the set was built again, as after a service restart: the
-// samples start over. A sample from after now (the clock was set back) is dropped. null when
-// the reply has none
+// Counters of a server in a reply (packets and bytes its filter's _dynamic set counted), with
+// those of the previous reply (prev, recordRecent) for the rate: { packets, bytes, samples: [
+// [ time, packets ], … ] }. Without prev, or with a smaller count than before (the set was built
+// again, as after a service restart), the samples start over. A sample from after now (the
+// clock was set back) is dropped. null when the reply has none
 function trafficOf(prev, conn, now) {
     var samples = [];
 
@@ -2120,7 +2120,7 @@ return view.extend({
 
         if (!this.connectionsBusy)
             this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(function(list) {
-                var failed = self.connectionsFailed;
+                var failed = self.connectionsFailed, last = self.connectionsAt;
 
                 self.connectionsFailed = list ? 0 : failed + 1;
                 if (list)
@@ -2138,7 +2138,8 @@ return view.extend({
                         self.updateActiveConnectionsList();
                     return;
                 }
-                self.showConnections(list);
+                // The counters go on from the last reply only when no request failed since
+                self.showConnections(list, self.connectionsAt, failed ? null : last);
             }).finally(function() {
                 self.connectionsBusy = null;
             });
@@ -2146,11 +2147,12 @@ return view.extend({
         return this.connectionsBusy;
     },
 
-    // A getGeomateConnections reply: the live rows of the table and the markers of the map, which
-    // gets only these. Every server in it counts as seen now (recordRecent)
-    showConnections: function(list) {
+    // A getGeomateConnections reply that arrived at now: the live rows of the table and the
+    // markers of the map, which gets only these. Every server in it counts as seen now
+    // (recordRecent); prevAt: as there
+    showConnections: function(list, now, prevAt) {
         this.connections = list;
-        this.recordRecent(list, Date.now());
+        this.recordRecent(list, now, prevAt);
         this.saveRecent(false);
         this.sendMessageToMap('updateConnections', list);
         this.updateActiveConnectionsList();
@@ -2158,8 +2160,11 @@ return view.extend({
 
     // Note the servers of a reply as seen at now, with their counters (trafficOf) and the time this
     // page first saw them. One row per server, as in the reply: a server that another filter has
-    // now drops its entry of the earlier filter, whose counters were another set's
-    recordRecent: function(list, now) {
+    // now drops its entry of the earlier filter, whose counters were another set's. The counters
+    // go on only for a server of the previous reply, which arrived at prevAt (null: none, or a
+    // request failed since). A server it lacked may count from 0 again: every service restart
+    // builds the sets again, and _ui_dynamic drops a server after 10 s without a packet
+    recordRecent: function(list, now, prevAt) {
         var recent = this.recent, live = {};
 
         list.forEach(function(conn) {
@@ -2179,7 +2184,7 @@ return view.extend({
                 conn: live[ip],
                 lastSeen: now,
                 firstSeen: (old && old.firstSeen) || now,
-                traffic: trafficOf(old && old.traffic, live[ip], now)
+                traffic: trafficOf((old && old.lastSeen === prevAt) ? old.traffic : null, live[ip], now)
             };
         });
         this.pruneRecent(now);
