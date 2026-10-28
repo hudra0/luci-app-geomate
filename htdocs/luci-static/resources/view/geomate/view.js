@@ -951,12 +951,14 @@ return view.extend({
     connectionsTable: null, // ui.Table of the active connections
     connectionsActions: false,  // the table has the Allow/Remove column (write access at render)
     connectionsKey: null,   // rows of the last table update, as JSON
-    recent: null,           // servers of recent replies: { 'filter\0ip': { conn, lastSeen, restored, firstSeen, traffic } }
+    recent: null,           // servers of recent replies: { 'filter\0ip': { conn, lastSeen, restored, firstSeen, traffic, run } }
     recentSaved: null,      // recent list as last written to sessionStorage, as JSON
     recentSavedAt: 0,       // time of the last write
     seenCells: [],          // Last seen and Traffic cells of the table: [{ node, lastSeen, traffic }], updated in place
     connectionsQuery: '',   // text of the search field, lowercase
     withCounters: false,    // the backend counts packets per server (set_counters), as the last status reply said
+    backendPid: undefined,  // PID of the last status reply (null: not running, undefined: no reply yet)
+    backendRuns: 0,         // PID changes since the page was loaded: each restart counts from 0 again
     configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
@@ -2111,9 +2113,16 @@ return view.extend({
             ]).then(function(r) {
                 self.status = r[0];
                 self.health = r[1];
-                // A failed request keeps the last answer, so the counters do not start over
-                if (r[0])
+                // A failed request keeps the last answer, so the counters do not start over. Another
+                // PID: Geomate was restarted and built its sets again, every count starts from 0
+                if (r[0]) {
+                    var pid = r[0].pid || null;
+
                     self.withCounters = hasCapability(r[0], 'set_counters');
+                    if (self.backendPid !== undefined && pid !== self.backendPid)
+                        self.backendRuns++;
+                    self.backendPid = pid;
+                }
                 self.statusLoaded = true;
                 self.updateStatus(true);
                 self.showVersions();
@@ -2132,7 +2141,7 @@ return view.extend({
 
         if (!this.connectionsBusy)
             this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(function(list) {
-                var failed = self.connectionsFailed, last = self.connectionsAt;
+                var failed = self.connectionsFailed;
 
                 self.connectionsFailed = list ? 0 : failed + 1;
                 if (list)
@@ -2150,8 +2159,7 @@ return view.extend({
                         self.updateActiveConnectionsList();
                     return;
                 }
-                // The counters go on from the last reply only when no request failed since
-                self.showConnections(list, self.connectionsAt, failed ? null : last);
+                self.showConnections(list, self.connectionsAt);
             }).finally(function() {
                 self.connectionsBusy = null;
             });
@@ -2161,10 +2169,10 @@ return view.extend({
 
     // A getGeomateConnections reply that arrived at now: the live rows of the table and the
     // markers of the map, which gets only these. Every server in it counts as seen now
-    // (recordRecent); prevAt: as there
-    showConnections: function(list, now, prevAt) {
+    // (recordRecent)
+    showConnections: function(list, now) {
         this.connections = list;
-        this.recordRecent(list, now, prevAt);
+        this.recordRecent(list, now);
         this.saveRecent(false);
         this.sendMessageToMap('updateConnections', list);
         this.updateActiveConnectionsList();
@@ -2173,11 +2181,11 @@ return view.extend({
     // Note the servers of a reply as seen at now, with their counters (trafficOf) and the time this
     // page first saw them. One row per server, as in the reply: a server that another filter has
     // now drops its entry of the earlier filter, whose counters were another set's. The counters
-    // go on only for a server of the previous reply, which arrived at prevAt (null: none, or a
-    // request failed since). A server it lacked may count from 0 again: every service restart
-    // builds the sets again, and _ui_dynamic drops a server after 10 s without a packet
-    recordRecent: function(list, now, prevAt) {
-        var recent = this.recent, live = {};
+    // go on within one run of Geomate (backendRuns, a smaller count in trafficOf): every restart
+    // builds the sets again and counts from 0. A server missing from some replies keeps them:
+    // _ui_dynamic drops a server after 10 s without a packet, its _dynamic element stays an hour
+    recordRecent: function(list, now) {
+        var recent = this.recent, live = {}, run = this.backendRuns;
 
         list.forEach(function(conn) {
             if (conn && conn.filter_name && typeof conn.dst == 'string')
@@ -2196,7 +2204,8 @@ return view.extend({
                 conn: live[ip],
                 lastSeen: now,
                 firstSeen: (old && old.firstSeen) || now,
-                traffic: trafficOf((old && old.lastSeen === prevAt) ? old.traffic : null, live[ip], now)
+                traffic: trafficOf((old && old.run === run) ? old.traffic : null, live[ip], now),
+                run: run
             };
         });
         this.pruneRecent(now);
