@@ -1706,8 +1706,10 @@ return view.extend({
                every table below a window width of their own (OpenWrt2020 800 px, OpenWrt.org 992 px,
                Argon and Material 1152 px, Bootstrap on devices up to 600 px), however wide the table
                is. Up to 960 px cards, below 560 px with the country code. Wider: a table, also where
-               the theme stacks; from there a row with traffic fits without scrolling in every theme
-               (OpenWrt2020 needs the most room, about 940 px; packetsText keeps totals short).
+               the theme stacks, up to 1040 px without the city as in the cards. From there a row
+               with traffic fits without scrolling in every theme: OpenWrt2020, with 16 px text,
+               needs the most room (about 890 px without the city, 1000 px with it; packetsText
+               keeps totals short).
                The gutter keeps the room of a vertical scrollbar, whether the box scrolls or not:
                the query then measures the width the table gets, however many rows there are */
             #active-connections-container .gm-connections-wrap { container: gm-connections / inline-size; scrollbar-gutter: stable; }
@@ -1726,6 +1728,9 @@ return view.extend({
                 @media (max-width: 1152px) {
                     #geomate-connections .tr > .th { text-align: left; }
                 }
+            }
+            @container gm-connections (960px < width <= 1040px) {
+                #geomate-connections .tr > .gm-col-city { display: none; }
             }
             @container gm-connections (width <= 960px) {${cards}}
             @container gm-connections (width < 560px) {${codes}}
