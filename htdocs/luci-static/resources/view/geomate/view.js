@@ -1630,19 +1630,22 @@ return view.extend({
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 25%; }
                 #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 15%; }
                 /* A row with traffic makes room for it: filter and country get narrower, the ISP
-                   gets only what is left */
+                   gets only what is left. Browsers without :has() (Firefox before 121) keep the
+                   wider names, and the line may wrap */
                 #geomate-connections .tr:has(.gm-traffic:not(.gm-traffic--none)) > .gm-col-filter { max-width: 25%; }
                 #geomate-connections .tr:has(.gm-traffic:not(.gm-traffic--none)) > .gm-col-country { max-width: 18%; }
                 #geomate-connections .tr:has(.gm-traffic:not(.gm-traffic--none)) > .gm-col-isp { min-width: 0; }
                 /* "Filter · Country · ISP" and "Last seen · Traffic": the dot starts the next cell,
-                   so a cut name keeps it */
+                   so a cut name keeps it. Traffic has it in its text, which is hidden without
+                   counters: no "· –" */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-isp::before,
-                #geomate-connections .tr:not(.placeholder) > .gm-col-traffic::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
+                #geomate-connections .tr:not(.placeholder) .gm-traffic::before { content: "·"; display: inline; position: static; width: auto; margin: 0 8px 0 0; padding: 0; border: 0; background: none; font-weight: inherit; }
+                #geomate-connections .tr:not(.placeholder) .gm-traffic--none { display: none; }
                 /* Not dimmed: past rows dim the text themselves (.gm-seen--past, .gm-traffic--past) */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-seen { order: 8; margin-left: auto; font-size: max(85%, 11px); }
                 #geomate-connections .tr:not(.placeholder) > .gm-col-traffic { order: 9; font-size: max(85%, 11px); }
-                /* No "· –" for a server without counters */
+                /* The empty cell would still add a gap */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-traffic:has(.gm-traffic--none) { display: none; }
                 /* The column titles are hidden: the select sorts like them */
                 #active-connections-container .gm-connections-sort { display: flex; }
