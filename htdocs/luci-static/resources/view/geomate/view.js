@@ -263,9 +263,10 @@ function textOn(color) {
 // Status of a connection for the table: [ sort key, label, tooltip ]. luci.geomate takes
 // 'allowed' from the filter's nft sets: true in _allowed, false in _blocked, missing when the
 // server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs.
-// A row the map cannot show gets the tooltip of notOnMapNote; an untracked one has its own
-function connectionStatus(conn) {
-    var note = hasPosition(conn.geo) ? null : notOnMapNote();
+// A row the map cannot show gets the tooltip of notOnMapNote, unless it is a past row (offMap): the
+// map never shows those. An untracked row has its own tooltip
+function connectionStatus(conn, offMap) {
+    var note = (offMap || hasPosition(conn.geo)) ? null : notOnMapNote();
 
     if (conn.is_allowed_ip)
         return [ 'whitelist', _('Whitelisted'), note ];
@@ -568,6 +569,95 @@ var CONNECTIONS_INTERVAL = 5,
     // Failed getGeomateConnections requests in a row before the status row says the list is old
     CONNECTIONS_STALE_AFTER = 3;
 
+// A server stays in the connections table (column Last seen) for RECENT_WINDOW ms after the last
+// reply that had it, under the 1-hour timeout of the _dynamic sets; at most RECENT_MAX servers.
+// sessionStorage keeps them for the tab, only as a convenience (readRecent, saveRecent)
+var RECENT_WINDOW = 30 * 60 * 1000,
+    RECENT_MAX = 300,
+    RECENT_SAVE_INTERVAL = 30 * 1000,
+    RECENT_STORAGE_KEY = 'geomate-connections-recent';
+
+// Geo fields a connection row shows, the only ones the recent list stores
+var GEO_TEXT_FIELDS = [ 'country', 'countryCode', 'city', 'isp', 'org' ];
+
+// The geo text of a connection: string fields only. A failed lookup arrives as an empty array
+function geoText(geo) {
+    var copy = {};
+
+    if (L.isObject(geo) && !Array.isArray(geo))
+        GEO_TEXT_FIELDS.forEach(function(k) {
+            if (typeof geo[k] == 'string')
+                copy[k] = geo[k];
+        });
+    return copy;
+}
+
+// Key of a server in the recent list
+function recentKey(conn) {
+    return conn.filter_name + '\0' + conn.dst;
+}
+
+// The recent list sessionStorage holds for this tab, as { key: { conn, lastSeen, restored } }.
+// Stored are only dst, filter_name, lastSeen and the geo text; an entry of another form is left
+// out, a broken value gives an empty list. Of two entries for one address the newer counts. A
+// restored entry has no verdict: the table shows it as unknown until a reply has the server again
+function readRecent() {
+    var list = null, recent = {}, byIp = {};
+
+    try { list = JSON.parse(window.sessionStorage.getItem(RECENT_STORAGE_KEY) || '[]'); } catch (e) {}
+    if (!Array.isArray(list))
+        return recent;
+
+    list.forEach(function(item) {
+        var conn, old;
+
+        if (!L.isObject(item) || typeof item.dst != 'string' || !validIPv4(item.dst) ||
+            typeof item.filter_name != 'string' || !FILTER_NAME_RE.test(item.filter_name) ||
+            typeof item.lastSeen != 'number' || !isFinite(item.lastSeen) || item.lastSeen <= 0)
+            return;
+        old = byIp[item.dst];
+        if (old && old.lastSeen >= item.lastSeen)
+            return;
+        if (old)
+            delete recent[recentKey(old.conn)];
+        conn = { dst: item.dst, filter_name: item.filter_name, geo: geoText(item.geo) };
+        recent[recentKey(conn)] = byIp[item.dst] = { conn: conn, lastSeen: item.lastSeen, restored: true };
+    });
+    return recent;
+}
+
+// Status of a row the last reply no longer has (entry e of the recent list), or of a live row while
+// the list is old (e.live): the verdict of the last reply that had it, none when restored from
+// sessionStorage. An Allow or Remove since then wins: action (connectionAction) comes from the
+// configuration, and no reply brings the new verdict
+function pastStatus(e, action) {
+    var whitelisted = !e.restored && !!e.conn.is_allowed_ip;
+
+    if (action === 'remove' && !whitelisted)
+        return [ 'whitelist', _('Whitelisted'), null ];
+    if (action === 'allow' && whitelisted && sidByName(e.conn.filter_name))
+        return [ 'unknown', _('Unknown'), _('Removed from the allowed IPs since last seen.') ];
+    if (e.restored)
+        return [ 'unknown', _('Unknown'), _('Seen before the page was loaded.') ];
+    return connectionStatus(e.conn, !e.live);
+}
+
+// Last seen cell of a row: 'Now' for a server of the last reply (lastSeen null), else the age in
+// whole minutes, from 60 minutes on in whole hours, so the text changes at most once a minute.
+// Past rows expire after RECENT_WINDOW (pruneRecent); a live row of an old list can be older.
+// data-value: the age in seconds, for sorting
+function showSeen(node, lastSeen, now) {
+    var secs = (lastSeen == null) ? 0 : Math.max(1, Math.floor((now - lastSeen) / 1000)),
+        mins = Math.ceil(secs / 60),
+        text = (lastSeen == null) ? _('Now') : (mins < 60) ? _('%d min ago').format(mins)
+            : _('%d h ago').format(Math.floor(mins / 60));
+
+    if (node.textContent !== text)
+        node.textContent = text;
+    if (node.getAttribute('data-value') !== String(secs))
+        node.setAttribute('data-value', secs);
+}
+
 // check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
 // IP. The browser keeps the last result ({ stdout, stderr, code, at, ui }) and shows it again on page load
 // and in the hourly poll: a success for VERSION_INTERVAL, a failure for VERSION_RETRY seconds
@@ -667,6 +757,10 @@ return view.extend({
     connectionsTable: null, // ui.Table of the active connections
     connectionsActions: false,  // the table has the Allow/Remove column (write access at render)
     connectionsKey: null,   // rows of the last table update, as JSON
+    recent: null,           // servers of recent replies: { 'filter\0ip': { conn, lastSeen, restored } }
+    recentSaved: null,      // recent list as last written to sessionStorage, as JSON
+    recentSavedAt: 0,       // time of the last write
+    seenCells: [],          // Last seen cells of the table: [{ node, lastSeen }], updated in place
     configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
     themeKey: null,         // last theme sent to the map, as JSON
     fullscreen: false,      // the map covers the window
@@ -693,6 +787,7 @@ return view.extend({
         this.readonly = !L.hasViewPermission() || !configLoaded;
         this.nodes = {};
         this.focusSid = this.takeFocusHash();
+        this.recent = readRecent();
 
         if (!configLoaded)
             ui.addNotification(null, E('p', {}, [
@@ -1054,11 +1149,14 @@ return view.extend({
             .gm-status--blocked { --gm-status-color: var(--gm-danger); }
             .gm-status--whitelist { --gm-status-color: var(--gm-primary); }
             .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
+            #active-connections-container .gm-seen { white-space: nowrap; }
+            #active-connections-container .gm-seen--past { opacity: 0.65; }
         `);
 
         // Sortable columns; the theme styles the table like every LuCI table. With write access a
-        // last column without a title holds Allow/Remove, like the action column of LuCI tables
-        var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP') ],
+        // last column without a title holds Allow/Remove, like the action column of LuCI tables.
+        // Last seen comes after the earlier columns: LuCI stores the sorted column by its index
+        var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP'), _('Last seen') ],
             options = { id: 'geomate-connections', sortable: true, placeholder: _('No active connections') };
 
         this.connectionsActions = !this.readonly;
@@ -1302,12 +1400,14 @@ return view.extend({
         this.checkForUpdates();
 
         document.addEventListener('visibilitychange', L.bind(this.handleVisibilityChange, this));
+        window.addEventListener('pagehide', L.bind(this.saveRecent, this, true));
     },
 
     // No connection requests while the tab is hidden
     handleVisibilityChange: function() {
         if (document.hidden) {
             poll.remove(this.pollFns.connections);
+            this.saveRecent(true);
         } else {
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
             // Fresh data at once, unless the user paused LuCI's auto refresh
@@ -1355,16 +1455,86 @@ return view.extend({
                         self.connectionsTable.update([], _('Connections unavailable'));
                         self.connectionsKey = null;
                     }
+                    // Past rows keep aging and expire; an old list shows its age (Last seen)
+                    if (self.connectionsAt != null)
+                        self.updateActiveConnectionsList();
                     return;
                 }
-                self.connections = list;
-                self.sendMessageToMap('updateConnections', list);
-                self.updateActiveConnectionsList();
+                self.showConnections(list);
             }).finally(function() {
                 self.connectionsBusy = null;
             });
 
         return this.connectionsBusy;
+    },
+
+    // A getGeomateConnections reply: the live rows of the table and the markers of the map, which
+    // gets only these. Every server in it counts as seen now (recordRecent)
+    showConnections: function(list) {
+        this.connections = list;
+        this.recordRecent(list, Date.now());
+        this.saveRecent(false);
+        this.sendMessageToMap('updateConnections', list);
+        this.updateActiveConnectionsList();
+    },
+
+    // Note the servers of a reply as seen at now. One row per server, as in the reply: a server
+    // that another filter has now drops its entry of the earlier filter
+    recordRecent: function(list, now) {
+        var recent = this.recent, live = {};
+
+        list.forEach(function(conn) {
+            if (conn && conn.filter_name && typeof conn.dst == 'string')
+                live[conn.dst] = conn;
+        });
+        Object.keys(recent).forEach(function(key) {
+            var conn = live[recent[key].conn.dst];
+
+            if (conn && recentKey(conn) !== key)
+                delete recent[key];
+        });
+        Object.keys(live).forEach(function(ip) {
+            recent[recentKey(live[ip])] = { conn: live[ip], lastSeen: now };
+        });
+        this.pruneRecent(now);
+    },
+
+    // Drop the servers last seen more than RECENT_WINDOW ago, then the oldest beyond RECENT_MAX.
+    // A time after now (the clock was set back) counts as now
+    pruneRecent: function(now) {
+        var recent = this.recent, keys;
+
+        Object.keys(recent).forEach(function(key) {
+            if (recent[key].lastSeen > now)
+                recent[key].lastSeen = now;
+            else if (now - recent[key].lastSeen > RECENT_WINDOW)
+                delete recent[key];
+        });
+        keys = Object.keys(recent);
+        if (keys.length > RECENT_MAX)
+            keys.sort(function(a, b) { return recent[b].lastSeen - recent[a].lastSeen; })
+                .slice(RECENT_MAX).forEach(function(key) { delete recent[key]; });
+    },
+
+    // Keep the recent list in sessionStorage for this tab (readRecent): at most every
+    // RECENT_SAVE_INTERVAL, and whenever the page is hidden or left (force). Only a convenience:
+    // a failed write changes nothing on the page
+    saveRecent: function(force) {
+        var now = Date.now(), recent = this.recent, text;
+
+        if (!recent || (force !== true && Math.abs(now - this.recentSavedAt) < RECENT_SAVE_INTERVAL))
+            return;
+        this.recentSavedAt = now;
+        text = JSON.stringify(Object.keys(recent).map(function(key) {
+            var e = recent[key];
+            return { dst: e.conn.dst, filter_name: e.conn.filter_name, lastSeen: e.lastSeen, geo: geoText(e.conn.geo) };
+        }));
+        if (text === this.recentSaved)
+            return;
+        try {
+            window.sessionStorage.setItem(RECENT_STORAGE_KEY, text);
+            this.recentSaved = text;
+        } catch (e) {}
     },
 
     // Ask for the connections again after a table action: a request already running may have
@@ -2415,12 +2585,15 @@ return view.extend({
         });
     },
 
-    // Fill the connections table. Country, city and ISP come from luci.geomate's geo lookup;
-    // older backends and cache entries have none of them, the cells then show '–'. The button
-    // of a row comes from the configuration (connectionAction). The table is rebuilt only when
-    // a row changed: ui.Table replaces every row, and with it a button under the pointer
+    // Fill the connections table: the servers of the last reply ('Now'), then those of the
+    // recent list that it no longer has, newest first. Country, city and ISP come from
+    // luci.geomate's geo lookup; older backends and cache entries have none of them, the cells
+    // then show '–'. A past row keeps the verdict of the last reply that had it (pastStatus);
+    // restored from sessionStorage it has none. The button of a row comes from the configuration
+    // (connectionAction). The table is rebuilt only when a row changed: ui.Table replaces every
+    // row, and with it a button under the pointer. The Last seen cells change in place
     updateActiveConnectionsList: function() {
-        var self = this, table = this.connectionsTable;
+        var self = this, table = this.connectionsTable, recent = this.recent, now = Date.now();
         if (!table || !this.nodes.connectionsTitle || this.configLoads) return;
 
         // Skip any connection object lacking filter_name to avoid errors
@@ -2430,31 +2603,68 @@ return view.extend({
 
         this.nodes.connectionsTitle.textContent = _('Active connections (%d)').format(list.length);
 
-        var rows = list.map(function(conn) {
-            // A failed lookup arrives as an empty array
-            var geo = (conn.geo && typeof conn.geo == 'object' && !Array.isArray(conn.geo)) ? conn.geo : {};
+        // Past rows of a filter that is gone or disabled are dropped; without a loaded
+        // configuration nothing tells, and they stay
+        var live = {}, filters = null, past;
+
+        list.forEach(function(conn) { live[conn.dst] = true; });
+        if (uci.sections('geomate').length) {
+            filters = {};
+            uci.sections('geomate', 'geo_filter').forEach(function(s) {
+                if (s.enabled === '1')
+                    filters[s.name] = true;
+            });
+        }
+        this.pruneRecent(now);
+        past = Object.keys(recent).filter(function(key) {
+            if (filters && !filters[recent[key].conn.filter_name]) {
+                delete recent[key];
+                return false;
+            }
+            return !live[recent[key].conn.dst];
+        }).map(function(key) { return recent[key]; }).sort(function(a, b) { return b.lastSeen - a.lastSeen; });
+
+        // While the status row says the list is old, its rows show the age of the last reply and,
+        // like past rows, an Allow or Remove since then (pastStatus)
+        var liveSeen = (this.connectionsFailed >= CONNECTIONS_STALE_AFTER) ? this.connectionsAt : null;
+        var entries = list.map(function(conn) { return { conn: conn, lastSeen: liveSeen, live: true }; }).concat(past);
+        var rows = entries.map(function(e) {
+            var conn = e.conn,
+                action = self.connectionAction(conn),
+                // A failed lookup arrives as an empty array
+                geo = (conn.geo && typeof conn.geo == 'object' && !Array.isArray(conn.geo)) ? conn.geo : {};
 
             return {
                 ip: conn.dst,
                 filter: conn.filter_name,
-                status: connectionStatus(conn),
+                status: (e.live && liveSeen == null) ? connectionStatus(conn) : pastStatus(e, action),
                 geo: [ geo.country, geo.countryCode, geo.city, geo.isp, geo.org ],
-                action: self.connectionAction(conn)
+                action: action,
+                past: e.lastSeen != null
             };
         });
         var key = JSON.stringify(rows);
 
-        if (key === this.connectionsKey)
+        if (key === this.connectionsKey) {
+            this.seenCells.forEach(function(c, i) {
+                c.lastSeen = entries[i].lastSeen;
+                showSeen(c.node, c.lastSeen, now);
+            });
             return;
+        }
         this.connectionsKey = key;
+        this.seenCells = [];
 
-        table.update(rows.map(function(r) {
+        table.update(rows.map(function(r, i) {
             var status = r.status,
                 attrs = { 'class': 'gm-status gm-status--' + status[0], 'data-value': status[0] },
+                seen = { node: E('span', { 'class': r.past ? 'gm-seen gm-seen--past' : 'gm-seen' }), lastSeen: entries[i].lastSeen },
                 cells;
 
             if (status[2])
                 attrs.title = status[2];
+            showSeen(seen.node, seen.lastSeen, now);
+            self.seenCells.push(seen);
 
             // Every cell is an element: names and provider strings never run as markup
             cells = [
@@ -2463,7 +2673,8 @@ return view.extend({
                 E('span', attrs, [ status[1] ]),
                 textCell(r.geo[0], r.geo[1]),
                 textCell(r.geo[2]),
-                textCell(r.geo[3], r.geo[4])
+                textCell(r.geo[3], r.geo[4]),
+                seen.node
             ];
             if (self.connectionsActions)
                 cells.push(self.renderConnectionAction(r));
