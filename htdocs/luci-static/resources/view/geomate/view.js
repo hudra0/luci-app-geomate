@@ -211,17 +211,50 @@ function textOn(color) {
     return (c && luminance(c) > 0.4) ? 'rgb(31, 35, 40)' : 'rgb(255, 255, 255)';
 }
 
-// Status of a connection for the table: [ sort key, label ]
-function connectionStatus(conn, geo) {
+// Status of a connection for the table: [ sort key, label, tooltip ]. luci.geomate takes
+// 'allowed' from the filter's nft sets: true in _allowed, false in _blocked, missing when the
+// server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs
+function connectionStatus(conn) {
     if (conn.is_allowed_ip)
         return [ 'whitelist', _('Whitelisted') ];
     if (conn.allowed === true)
         return [ 'allowed', _('Allowed') ];
-    if (!geo.lat || !geo.lon)
-        return [ 'untracked', _('Untracked') ];
     if (conn.allowed === false)
         return [ 'blocked', _('Blocked') ];
+    if (conn.allowed == null)
+        return [ 'untracked', _('Untracked'), untrackedNote(conn.filter_name) ];
     return [ 'unknown', _('Unknown') ];
+}
+
+// Tooltip of an untracked server of a filter: what the configured mode does with it until it
+// is geolocated. Defaults as in geomate.sh and geomate_trigger.sh
+function untrackedNote(filterName) {
+    var mode = uci.get('geomate', 'global', 'operational_mode') || 'dynamic',
+        sec = uci.sections('geomate', 'geo_filter').find(function(s) { return s.name === filterName; }),
+        effect, next;
+
+    if (mode === 'monitor')
+        effect = _('Monitor mode blocks nothing.');
+    else if (uci.get('geomate', 'global', 'strict_mode') === '1')
+        effect = _('Strict mode blocks it.');
+    else
+        effect = _('Not filtered.');
+
+    // Without regions the service start puts no server in a set, geolocated or not. Like the
+    // service start, a hand-written 'option allowed_region' counts as no region
+    if (sec && !(Array.isArray(sec.allowed_region) && sec.allowed_region.length))
+        return _('Filter has no regions.') + ' ' + effect;
+
+    // Static mode collects no new servers, daily geolocation looks them up once a day. Frequent
+    // updates run every 30 minutes, every hour while there was nothing to look up
+    if (mode === 'static')
+        next = _('Static mode does not add it to the IP list.');
+    else if (uci.get('geomate', 'global', 'geolocation_mode') === 'daily')
+        next = _('Geolocated with the next daily update.');
+    else
+        next = _('Geolocated with one of the next automatic updates.');
+
+    return _('Not geolocated yet.') + ' ' + effect + ' ' + next;
 }
 
 // A table cell as an element: ui.Table puts a plain string in as HTML. Missing values show '–'
@@ -1946,13 +1979,17 @@ return view.extend({
         table.update(list.map(function(conn) {
             // A failed lookup arrives as an empty array
             var geo = (conn.geo && typeof conn.geo == 'object' && !Array.isArray(conn.geo)) ? conn.geo : {},
-                status = connectionStatus(conn, geo);
+                status = connectionStatus(conn),
+                attrs = { 'class': 'gm-status gm-status--' + status[0], 'data-value': status[0] };
+
+            if (status[2])
+                attrs.title = status[2];
 
             // Every cell is an element: names and provider strings never run as markup
             return [
                 textCell(conn.dst),
                 textCell(conn.filter_name),
-                E('span', { 'class': 'gm-status gm-status--' + status[0], 'data-value': status[0] }, [ status[1] ]),
+                E('span', attrs, [ status[1] ]),
                 textCell(geo.country, geo.countryCode),
                 textCell(geo.city),
                 textCell(geo.isp, geo.org)

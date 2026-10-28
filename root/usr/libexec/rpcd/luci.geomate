@@ -30,66 +30,212 @@ end
 -- Additive: cache entries written before they existed carry lat/lon only and stay valid
 local GEO_TEXT_FIELDS = { "country", "countryCode", "city", "isp", "org" }
 
--- Searches one geo data file (JSON lines from ip-api) for an IP. The plain-text find skips
--- the JSON parse of every other line; geolocate.sh writes the compact "query":"<ip>" form
-local function find_in_geo_file(filepath, ip)
-    local f = io.open(filepath, "r")
-    if not f then
-        return nil
-    end
-
-    local needle = '"query":"' .. ip .. '"'
-    for line in f:lines() do
-        if line:find(needle, 1, true) then
-            local data = jsonc.parse(line)
-            if data and data.query == ip and data.lat and data.lon then
-                f:close()
-                local entry = { lat = data.lat, lon = data.lon }
-                for _, k in ipairs(GEO_TEXT_FIELDS) do
-                    if type(data[k]) == "string" and data[k] ~= "" then
-                        entry[k] = data[k]
-                    end
-                end
-                return entry
-            end
-        end
-    end
-    f:close()
-    return nil
-end
+-- Geo data of the filters: <filter name>_geo_data.json, JSON lines from ip-api
+local GEO_DATA_DIR = "/etc/geomate.d"
 
 -- Filter names the backend supports in nft set names and geo data file names. A name that
 -- matches contains no '/' and no shell quote
 local FILTER_NAME_PATTERN = "^[%w_ .%-]+$"
 
--- Geolocate an IP address from the geo data in /etc/geomate.d: first the file of the
--- filter the IP belongs to (filter_name, optional), then the other files
-local function geolocate_ip(ip, filter_name)
-    if cache[ip] then
-        return cache[ip]
+-- Cache entry of one geo data line for an IP, or nil if the line has no position
+local function geo_entry(line, ip)
+    local data = jsonc.parse(line)
+    if not (data and data.query == ip and data.lat and data.lon) then
+        return nil
     end
 
-    local geodata_dir = "/etc/geomate.d"
-    -- No '/' can leave the directory
-    local own = (type(filter_name) == "string" and filter_name:match(FILTER_NAME_PATTERN))
-        and (filter_name .. "_geo_data.json") or nil
-    local found = own and find_in_geo_file(geodata_dir .. "/" .. own, ip)
+    local entry = { lat = data.lat, lon = data.lon }
+    for _, k in ipairs(GEO_TEXT_FIELDS) do
+        if type(data[k]) == "string" and data[k] ~= "" then
+            entry[k] = data[k]
+        end
+    end
+    return entry
+end
 
-    local files = not found and nixio.fs.dir(geodata_dir)
-    if files then
-        for file in files do
-            if file ~= own and file:match("_geo_data%.json$") then
-                found = find_in_geo_file(geodata_dir .. "/" .. file, ip)
-                if found then
-                    break
-                end
+-- One pass over the geo data file of a filter for the IPs in 'wanted' ({ [ip] = true }).
+-- A hit is cached and leaves 'wanted'. Only a line whose "query" is wanted gets a JSON parse;
+-- geolocate.sh writes the compact "query":"<ip>" form, at the end of the line. Plain finds
+-- only, an unanchored pattern would be tried at every position of the line: for one IP its
+-- whole key, else the key name and the address right behind it
+local function scan_geo_file(name, wanted)
+    -- A matching name contains no '/', so the path stays in the directory
+    local f = next(wanted) and type(name) == "string" and name:match(FILTER_NAME_PATTERN)
+        and io.open(GEO_DATA_DIR .. "/" .. name .. "_geo_data.json", "r")
+    if not f then
+        return
+    end
+
+    local only = next(wanted, next(wanted)) == nil and next(wanted)
+    local needle = only and ('"query":"' .. only .. '"')
+    for line in f:lines() do
+        local ip
+        if needle then
+            ip = line:find(needle, 1, true) and only
+        else
+            local p = line:find('"query":"', 1, true)
+            ip = p and line:match('^([%d%.]+)"', p + 9)
+        end
+        local entry = ip and wanted[ip] and geo_entry(line, ip)
+        if entry then
+            cache[ip] = entry
+            wanted[ip] = nil
+            if not next(wanted) then
+                break
             end
         end
     end
+    f:close()
+end
 
-    -- Misses are cached too, until the next service start or geolocation batch empties the cache
-    cache[ip] = found or { lat = nil, lon = nil }
-    return cache[ip]
+-- Looks up the IPs without a cache entry, all of one request together: wanted is
+-- { [filter name] = { [ip] = true } }. First each filter's own geo data file for its IPs, then
+-- the files of the other enabled filters for what is still missing, until all are found; an
+-- untracked server is a miss in almost every file, so files of disabled or removed filters are
+-- not read. Each file is read at most twice per request. Misses are cached too, until the
+-- next service start or frequent geolocation batch deletes the cache file.
+-- The caller loads the geomate config. Returns true if the cache changed
+local function lookup_geo(wanted)
+    local missing, own_file = {}, {}
+
+    for name, ips in pairs(wanted) do
+        local todo = {}
+        for ip in pairs(ips) do
+            if not cache[ip] and not own_file[ip] then
+                todo[ip] = true
+                own_file[ip] = name
+            end
+        end
+        scan_geo_file(name, todo)
+        for ip in pairs(todo) do
+            missing[ip] = true
+        end
+    end
+
+    if next(missing) then
+        local scanned = {}
+        uci:foreach('geomate', 'geo_filter', function(s)
+            local name = s.name
+            if s.enabled ~= '1' or type(name) ~= "string" or scanned[name] or not next(missing) then
+                return
+            end
+            scanned[name] = true
+
+            -- The own file of an IP was read above
+            local todo = {}
+            for ip in pairs(missing) do
+                if own_file[ip] ~= name then
+                    todo[ip] = true
+                end
+            end
+            scan_geo_file(name, todo)
+            for ip in pairs(missing) do
+                if cache[ip] then
+                    missing[ip] = nil
+                end
+            end
+        end)
+    end
+
+    for ip in pairs(missing) do
+        cache[ip] = {}
+    end
+    return next(own_file) ~= nil
+end
+
+-- A number with a leading zero ('012', '024'), which nft reads as octal: an entry with one is
+-- not the address or prefix it seems to be, so it counts as nothing
+local function has_leading_zero(s)
+    return s:find("^0%d") or s:find("%.0%d")
+end
+
+-- An IPv4 address as a number, nil for anything else (also for an octet with a leading zero)
+local function ip_number(ip)
+    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if not a or a > 255 or b > 255 or c > 255 or d > 255 or has_leading_zero(ip) then
+        return nil
+    end
+    return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+-- Address sets as nft holds them: { ips = { [address] = true }, ranges = { { lo, hi }, … } }
+local function new_set()
+    return { ips = {}, ranges = {} }
+end
+
+-- Adds a set element or an allowed_ip entry: an address, a prefix (a.b.c.d/nn) or a range
+-- (a.b.c.d-e.f.g.h). An address goes in as written, without a parse: set_has() looks up the
+-- dotted form nft prints, which an entry with a leading zero, a '!' or a typo never equals.
+-- A prefix or range that does not parse is skipped
+local function add_element(set, element)
+    if not element:find("[/%-]") then
+        set.ips[element] = true
+        return
+    end
+
+    local addr, bits = element:match("^([%d%.]+)/(%d+)$")
+    if addr then
+        local n = ip_number(addr)
+        if n and not has_leading_zero(bits) and tonumber(bits) <= 32 then
+            local size = 2 ^ (32 - tonumber(bits))
+            local lo = n - n % size
+            table.insert(set.ranges, { lo, lo + size - 1 })
+        end
+        return
+    end
+
+    local from, to = element:match("^([%d%.]+)%-([%d%.]+)$")
+    if from then
+        local lo, hi = ip_number(from), ip_number(to)
+        if lo and hi and lo <= hi then
+            table.insert(set.ranges, { lo, hi })
+        end
+    end
+end
+
+-- Whether a set contains an address (dotted, as nft prints it): the hash first, then the few
+-- prefixes and ranges
+local function set_has(set, ip)
+    if set.ips[ip] then
+        return true
+    end
+    local n = next(set.ranges) and ip_number(ip)
+    if not n then
+        return false
+    end
+    for _, r in ipairs(set.ranges) do
+        if n >= r[1] and n <= r[2] then
+            return true
+        end
+    end
+    return false
+end
+
+-- Public IPv4 addresses as geomate.sh's is_valid_public_ip sees them (CGNAT 100.64/10 counts
+-- as public), without the router's own addresses (own: { [ip] = true })
+local function is_public_ip(ip, own)
+    local a, b = ip:match("^(%d+)%.(%d+)%.")
+    a, b = tonumber(a), tonumber(b)
+    if not a or own[ip] then
+        return false
+    end
+    return not (a == 0 or a == 10 or a == 127 or a >= 224
+        or (a == 169 and b == 254)
+        or (a == 172 and b >= 16 and b <= 31)
+        or (a == 192 and b == 168))
+end
+
+-- IPv4 addresses of the router's interfaces, read without a fork. A filter without Source IP
+-- also sees traffic to the router itself, e.g. to its WAN address
+local function router_addresses()
+    local own = {}
+    for _, ifa in ipairs(nixio.getifaddrs() or {}) do
+        if ifa.family == "inet" and ifa.addr then
+            own[ifa.addr] = true
+        end
+    end
+    return own
 end
 
 -- Helper function to parse port lists and ranges
@@ -126,50 +272,6 @@ local function port_matches(port, port_set)
     return port_set[tonumber(port)] or false
 end
 
--- Checks if a given position is within **any** allowed region
-local function is_within_any_allowed_region(lat, lon, allowed_regions)
-    if not lat or not lon or not allowed_regions then
-        return false
-    end
-    -- A hand-written 'option allowed_region' arrives as a string. The service start ignores it
-    -- (config_list_foreach reads list entries only), so the map verdict does the same; only the
-    -- harvest between restarts applies it (config_get in process_dynamic_set)
-    if type(allowed_regions) ~= "table" then
-        return false
-    end
-
-    for _, allowed_region in ipairs(allowed_regions) do
-        local region_type, center_lat, center_lon, radius = allowed_region:match("([^:]+):([^:]+):([^:]+):([^:]+)")
-        center_lat, center_lon, radius = tonumber(center_lat), tonumber(center_lon), tonumber(radius)
-        -- A region whose numbers do not parse is skipped instead of failing the whole call
-        if region_type == "circle" and center_lat and center_lon and radius then
-            -- Haversine formula to calculate distance
-            local rad_lat1 = math.rad(lat)
-            local rad_lon1 = math.rad(lon)
-            local rad_lat2 = math.rad(center_lat)
-            local rad_lon2 = math.rad(center_lon)
-
-            local dlat = rad_lat2 - rad_lat1
-            local dlon = rad_lon2 - rad_lon1
-
-            local a = math.sin(dlat / 2)^2 + math.cos(rad_lat1) * math.cos(rad_lat2) * math.sin(dlon / 2)^2
-            local c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-            local earth_radius = 6371000 -- in meters
-            local distance = earth_radius * c
-
-            if distance <= radius then
-                return true
-            end
-        else
-            -- Other region types can be added here
-            -- For example, rectangles, polygons, etc.
-        end
-    end
-
-    return false
-end
-
 -- nft set name prefix of a filter, or nil if the name must not reach a shell command.
 -- The pattern covers what the backend supports in nft set names and file names
 local function filter_set_name(name)
@@ -179,166 +281,216 @@ local function filter_set_name(name)
     return "geomate_" .. (name:gsub(' ', '_'))
 end
 
--- Function to retrieve the allowlist IPs as a set
-local function get_allowed_ips_set()
-    local allowed_ips_set = {}
-
-    uci:load('geomate')
-    uci:foreach('geomate', 'geo_filter', function(s)
-        if s.enabled == '1' and s.allowed_ip then
-            for _, ip in ipairs(s.allowed_ip) do
-                allowed_ips_set[ip] = true
-            end
-        end
-    end)
-
-    return allowed_ips_set
-end
-
--- Function to read IPs from dynamic nftables sets
-local function get_ui_dynamic_ips()
-    local dynamic_ips = {}
-    local processed_ips = {}
-
-    uci:load('geomate')
-
-    -- First pass: Get blocked IPs for each filter
-    local filter_blocked_ips = {}
-    local filter_allowed_ips = {}
-
-    uci:foreach('geomate', 'geo_filter', function(s)
-        local name = s.name
-        local set_name = filter_set_name(name)
-        if s.enabled == '1' and set_name then
-            filter_blocked_ips[name] = {}
-            filter_allowed_ips[name] = {}  
-
-            -- Get blocked IPs
-            local cmd = "nft list set inet geomate '" .. set_name .. "_blocked'"
-            local handle = io.popen(cmd)
-            local result = handle:read("*a")
-            handle:close()
-
-            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
-                filter_blocked_ips[name][ip] = true
-            end
-
-            -- Get allowed IPs
-            cmd = "nft list set inet geomate '" .. set_name .. "_allowed'"
-            handle = io.popen(cmd)
-            result = handle:read("*a")
-            handle:close()
-
-            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
-                filter_allowed_ips[name][ip] = true
-            end
-        end
-    end)
-
-    -- Second pass: Get dynamic IPs and match them to their filters
-    uci:foreach('geomate', 'geo_filter', function(s)
-        local name = s.name
-        local enabled = s.enabled
-        local set_name = filter_set_name(name)
-        if enabled == '1' and set_name then
-            local cmd = "nft list set inet geomate '" .. set_name .. "_ui_dynamic'"
-            local handle = io.popen(cmd)
-            local result = handle:read("*a")
-            handle:close()
-
-            for ip in result:gmatch('(%d+%.%d+%.%d+%.%d+)') do
-                if not processed_ips[ip] then
-                    -- Check if this IP is in the blocked or allowed set for this filter
-                    if filter_blocked_ips[name][ip] or filter_allowed_ips[name][ip] then
-                        processed_ips[ip] = true
-                        -- Each dynamic IP gets inserted; in get_all_connections() 
-                        -- we'll finalize whether it's actually blocked or allowed
-                        table.insert(dynamic_ips, { ip = ip, filter = s })
-                    end
-                end
-            end
-        end
-    end)
-
-    return dynamic_ips
-end
-
--- Function to check if an IP is allowed or blocked
-local function is_ip_allowed(ip, filter, allowed_ips_set)
-    -- First, check if the IP is on the allowlist
-    if allowed_ips_set[ip] then
-        return true, true  -- allowed = true, is_allowed_ip = true
+-- Output of 'nft list set inet geomate <set>', '' if there is none. Only names built by
+-- filter_set_name() reach the shell
+local function nft_list_set(set_name)
+    local handle = io.popen("nft list set inet geomate '" .. set_name .. "' 2>/dev/null")
+    if not handle then
+        return ""
     end
-
-    -- Check if the IP is within **any** allowed region
-    local geo = geolocate_ip(ip, filter.name)
-    local allowed = is_within_any_allowed_region(geo.lat, geo.lon, filter.allowed_region)
-
-    return allowed, false  -- allowed, is_allowed_ip = false
+    local result = handle:read("*a") or ""
+    handle:close()
+    return result
 end
 
--- Main function to retrieve all connections, only those from dynamic ui sets (previously also loaded from conntrack)
+-- A cache entry for one row of an answer, with or without lat/lon. Rows never share a table:
+-- luci.jsonc writes a table that appears twice in one answer as null, and an IP can be an
+-- allowed IP of several filters
+local function geo_copy(geo, with_position)
+    local copy = with_position and { lat = geo.lat, lon = geo.lon } or {}
+    for _, k in ipairs(GEO_TEXT_FIELDS) do
+        copy[k] = geo[k]
+    end
+    return copy
+end
+
+-- The 'elements = { ... }' block of a set, '' for an empty or missing one. Only the block: the
+-- header holds the set name, and a filter named e.g. 'Game 1.2.3.4' must not add an element
+local function set_elements(set_name)
+    return nft_list_set(set_name):match("elements = {(.-)}") or ""
+end
+
+-- Elements of an _allowed or _blocked set (flags interval): addresses, prefixes and ranges
+local function read_set(set_name)
+    local set = new_set()
+    for element in set_elements(set_name):gmatch("[^%s,]+") do
+        add_element(set, element)
+    end
+    return set
+end
+
+-- Addresses in the elements block of a set, as the former grep counted them: a range counts
+-- both ends, a prefix its address
+local function count_set_addresses(set_name)
+    local count = 0
+    for _ in set_elements(set_name):gmatch("%d+%.%d+%.%d+%.%d+") do
+        count = count + 1
+    end
+    return count
+end
+
+-- allowed_ip of a filter section, split like the backend splits it: list entries only
+-- (config_list_foreach), so a hand-written 'option allowed_ip', which arrives as a string,
+-- whitelists nothing; an entry can hold several addresses, prefixes or ranges, separated by
+-- whitespace or commas (the Allowed IPs field accepts '1.2.3.4 5.6.7.8' as one entry)
+local function allowed_ip_list(s)
+    local tokens = {}
+    if type(s.allowed_ip) == "table" then
+        for _, entry in ipairs(s.allowed_ip) do
+            for token in tostring(entry):gmatch("[^%s,]+") do
+                table.insert(tokens, token)
+            end
+        end
+    end
+    return tokens
+end
+
+-- Servers the enabled filters see right now (_ui_dynamic), one entry per IP:
+-- { ip, filter = <section>, allowed = true (in _allowed), false (in _blocked) or nil }.
+-- nil means untracked: not geolocated yet, or the filter has no circles. _allowed wins because
+-- the accept rule comes before the drop rule. If several filters see an IP, their rules run in
+-- config order: the first filter with a verdict wins. With strict_mode the first filter that
+-- sees the IP decides, because its catch-all drop stops an untracked server before any later
+-- filter. strict_mode counts in monitor mode too: the table shows what the rules would do.
+-- Private and reserved addresses and the router's own addresses are left out
+local function get_ui_dynamic_ips()
+    local entries, by_ip = {}, {}
+    local own = router_addresses()
+
+    uci:load('geomate')
+    local strict = uci:get('geomate', 'global', 'strict_mode') == '1'
+    uci:foreach('geomate', 'geo_filter', function(s)
+        local set_name = filter_set_name(s.name)
+        if s.enabled ~= '1' or not set_name then
+            return
+        end
+
+        -- IPs this filter may still claim: new ones, and without strict_mode untracked ones of
+        -- an earlier filter
+        local candidates = {}
+        for ip in set_elements(set_name .. "_ui_dynamic"):gmatch("(%d+%.%d+%.%d+%.%d+)") do
+            local entry = by_ip[ip]
+            if (not entry or (entry.allowed == nil and not strict)) and is_public_ip(ip, own) then
+                table.insert(candidates, ip)
+            end
+        end
+        if #candidates == 0 then
+            return
+        end
+
+        local allowed = read_set(set_name .. "_allowed")
+        local blocked = read_set(set_name .. "_blocked")
+        for _, ip in ipairs(candidates) do
+            local verdict = nil
+            if set_has(allowed, ip) then
+                verdict = true
+            elseif set_has(blocked, ip) then
+                verdict = false
+            end
+
+            local entry = by_ip[ip]
+            if not entry then
+                entry = { ip = ip, filter = s, allowed = verdict }
+                by_ip[ip] = entry
+                table.insert(entries, entry)
+            elseif verdict ~= nil then
+                entry.filter, entry.allowed = s, verdict
+            end
+        end
+    end)
+
+    return entries
+end
+
+-- Connections from the _ui_dynamic sets of the enabled filters (previously also from conntrack)
+-- with the verdict of the filter's nft sets. is_allowed_ip: the IP is in _allowed and in the
+-- filter's own allowed_ip, as an address or inside a prefix or range. The set has to agree:
+-- nft rejects the whole allowed_ip batch for one '!' entry, and a saved change counts only
+-- after the next service start
 local function get_all_connections()
     load_cache()
-    local connections = {}
-    local dynamic_ips = get_ui_dynamic_ips()
-    local allowed_ips_set = get_allowed_ips_set()
+    local entries = get_ui_dynamic_ips()
 
-    -- Create a quick lookup for existing connections
-    local processed_ips = {}
-    for _, conn in ipairs(connections) do
-        processed_ips[conn.dst] = true
+    local wanted = {}
+    for _, e in ipairs(entries) do
+        local name = e.filter.name
+        wanted[name] = wanted[name] or {}
+        wanted[name][e.ip] = true
     end
+    local changed = lookup_geo(wanted)
 
-    -- Add IPs from dynamic sets
-    for _, entry in ipairs(dynamic_ips) do
-        local ip = entry.ip
-        local filter = entry.filter
-        local filter_name = filter.name
-
-        if not processed_ips[ip] then
-            local allowed, is_allowed_ip = is_ip_allowed(ip, filter, allowed_ips_set)
-            local geo = geolocate_ip(ip, filter_name)
-
-            local conn = {
-                src = "unknown",
-                dst = ip,
-                protocol = "unknown",
-                sport = "unknown",
-                dport = "unknown",
-                allowed = allowed,
-                geo = geo,
-                filter_name = filter_name,
-                is_dynamic = true,        -- Indicates the connection is from a dynamic set
-                is_allowed_ip = is_allowed_ip  -- Indicates if the IP is on the allowlist
-            }
-
-            table.insert(connections, conn)
-            processed_ips[ip] = true
+    local connections, whitelists = {}, {}
+    for _, e in ipairs(entries) do
+        local s = e.filter
+        local whitelisted = false
+        if e.allowed == true then
+            local whitelist = whitelists[s['.name']]
+            if not whitelist then
+                whitelist = new_set()
+                for _, entry in ipairs(allowed_ip_list(s)) do
+                    add_element(whitelist, entry)
+                end
+                whitelists[s['.name']] = whitelist
+            end
+            whitelisted = set_has(whitelist, e.ip)
         end
+
+        -- No position for an untracked server: older map.html versions draw a connection
+        -- without 'allowed' as a blocked marker
+        local geo = geo_copy(cache[e.ip] or {}, e.allowed ~= nil)
+
+        table.insert(connections, {
+            src = "unknown",
+            dst = e.ip,
+            protocol = "unknown",
+            sport = "unknown",
+            dport = "unknown",
+            allowed = e.allowed,
+            geo = geo,
+            filter_name = s.name,
+            is_dynamic = true,        -- Indicates the connection is from a dynamic set
+            is_allowed_ip = whitelisted
+        })
     end
 
-    save_cache()
+    if changed then
+        save_cache()
+    end
     return connections
 end
 
--- Retrieve allowlist IPs
+-- Retrieve allowlist IPs with their geo data; entries without a position are left out
 local function get_allowed_ips()
-    local allowed_ips = {}
+    local filters, wanted = {}, {}
 
     uci:load('geomate')
     uci:foreach('geomate', 'geo_filter', function(s)
-        if s.enabled == '1' and s.allowed_ip then
-            for _, ip in ipairs(s.allowed_ip) do
-                local geo = geolocate_ip(ip, s.name)
-                if geo.lat and geo.lon then
-                    table.insert(allowed_ips, { ip = ip, geo = geo, filter = s.name })
+        -- A hand-written 'list name' arrives as a table and names no filter
+        if s.enabled == '1' and type(s.name or "") == "string" then
+            local name, ips = s.name or "", {}
+            for _, ip in ipairs(allowed_ip_list(s)) do
+                if ip_number(ip) then
+                    table.insert(ips, ip)
+                    wanted[name] = wanted[name] or {}
+                    wanted[name][ip] = true
                 end
             end
+            table.insert(filters, { name = s.name, ips = ips })
         end
     end)
+    local changed = lookup_geo(wanted)
 
-    return allowed_ips
+    local allowed_ips = {}
+    for _, f in ipairs(filters) do
+        for _, ip in ipairs(f.ips) do
+            local geo = cache[ip] or {}
+            if geo.lat and geo.lon then
+                table.insert(allowed_ips, { ip = ip, geo = geo_copy(geo, true), filter = f.name })
+            end
+        end
+    end
+
+    return allowed_ips, changed
 end
 
 -- Function to check if an element is in a table
@@ -429,19 +581,9 @@ local function get_service_status()
 
         local set_name = filter_set_name(s.name)
         if filter_info.enabled and status.nft_active and set_name then
-            -- Count allowed IPs
-            local allowed_cmd = io.popen("nft list set inet geomate '" .. set_name .. "_allowed' 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | wc -l")
-            if allowed_cmd then
-                filter_info.allowed_count = tonumber(allowed_cmd:read("*l")) or 0
-                allowed_cmd:close()
-            end
-
-            -- Count blocked IPs
-            local blocked_cmd = io.popen("nft list set inet geomate '" .. set_name .. "_blocked' 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | wc -l")
-            if blocked_cmd then
-                filter_info.blocked_count = tonumber(blocked_cmd:read("*l")) or 0
-                blocked_cmd:close()
-            end
+            -- Count only the elements: the set header holds the filter name
+            filter_info.allowed_count = count_set_addresses(set_name .. "_allowed")
+            filter_info.blocked_count = count_set_addresses(set_name .. "_blocked")
         end
 
         table.insert(status.filters, filter_info)
@@ -616,8 +758,10 @@ local methods = {
     getAllowedIPs = {
         call = function()
             load_cache()
-            local allowed_ips = get_allowed_ips()
-            save_cache()
+            local allowed_ips, changed = get_allowed_ips()
+            if changed then
+                save_cache()
+            end
             return { allowed_ips = allowed_ips }
         end
     },
