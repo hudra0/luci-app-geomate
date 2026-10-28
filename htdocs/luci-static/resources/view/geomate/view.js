@@ -1822,15 +1822,15 @@ return view.extend({
         table.update(table.data, table.placeholder);
     },
 
-    // Show the column the table is sorted by in the "Sort by" select; empty for a column that it
-    // does not offer. Unsorted, the table lists the servers by last seen
+    // Show the choice the table is sorted by in the "Sort by" select: its column in its direction.
+    // Empty for any other order, such as a column title clicked the other way: picking a choice
+    // then always sorts. Unsorted, the table lists the servers by last seen
     showSortChoice: function() {
         var select = this.nodes.connectionsSort,
-            state = this.connectionsTable.getActiveSortState(),
-            column = state ? state[0] : COLUMN_SEEN;
+            state = this.connectionsTable.getActiveSortState() || [ COLUMN_SEEN, false ];
 
         if (select)
-            select.value = SORT_CHOICES.some(function(c) { return c[0] === column; }) ? String(column) : '';
+            select.value = SORT_CHOICES.some(function(c) { return c[0] === state[0] && c[1] === !!state[1]; }) ? String(state[0]) : '';
     },
 
     // Fill of the sticky column titles: the first opaque background from a title cell up. Argon
