@@ -384,6 +384,8 @@ local function get_ui_dynamic_ips(with_counters)
 
     uci:load('geomate')
     local strict = uci:get('geomate', 'global', 'strict_mode') == '1'
+    -- Static mode has no _dynamic set
+    with_counters = with_counters and uci:get('geomate', 'global', 'operational_mode') ~= 'static'
     uci:foreach('geomate', 'geo_filter', function(s)
         local set_name = filter_set_name(s.name)
         if s.enabled ~= '1' or not set_name then

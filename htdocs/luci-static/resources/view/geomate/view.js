@@ -1593,13 +1593,18 @@ return view.extend({
                 #geomate-connections .tr:not(.placeholder) > .gm-col-city { display: none; }
                 /* Second line, small and dimmed. A long name ends in "…" instead of wrapping the
                    line: filter and country have a maximum width, the ISP fills the rest with at least
-                   10%. The three add up to 53%, so last seen and the traffic stay on the line */
+                   15%. The three add up to 70%, so last seen stays on the line */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-filter,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country,
                 #geomate-connections .tr:not(.placeholder) > .gm-col-isp { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: max(85%, 11px); opacity: 0.75; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 25%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 18%; }
-                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 10%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-filter { order: 5; flex: 0 1 auto; max-width: 30%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-country { order: 6; flex: 0 1 auto; max-width: 25%; }
+                #geomate-connections .tr:not(.placeholder) > .gm-col-isp { order: 7; flex: 1 1 0; min-width: 15%; }
+                /* A row with traffic makes room for it: filter and country get narrower, the ISP
+                   gets only what is left */
+                #geomate-connections .tr:has(.gm-traffic:not(.gm-traffic--none)) > .gm-col-filter { max-width: 25%; }
+                #geomate-connections .tr:has(.gm-traffic:not(.gm-traffic--none)) > .gm-col-country { max-width: 18%; }
+                #geomate-connections .tr:has(.gm-traffic:not(.gm-traffic--none)) > .gm-col-isp { min-width: 0; }
                 /* "Filter · Country · ISP" and "Last seen · Traffic": the dot starts the next cell,
                    so a cut name keeps it */
                 #geomate-connections .tr:not(.placeholder) > .gm-col-country::before,
@@ -1717,7 +1722,7 @@ return view.extend({
 
         // The search keeps its text over the polls; the select sorts like the column titles
         n.connectionsSearch = E('input', {
-            'type': 'search',
+            'type': 'text',
             'class': 'cbi-input-text gm-connections-search',
             'placeholder': _('Search'),
             'aria-label': _('Search'),
