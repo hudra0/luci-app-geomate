@@ -622,10 +622,14 @@ function recentKey(conn) {
     return conn.filter_name + '\0' + conn.dst;
 }
 
-// The recent list sessionStorage holds for this tab, as { key: { conn, lastSeen, restored } }.
-// Stored are only dst, filter_name, lastSeen and the geo text; an entry of another form is left
-// out, a broken value gives an empty list. Of two entries for one address the newer counts. A
-// restored entry has no verdict: the table shows it as unknown until a reply has the server again
+// The recent list sessionStorage holds for this tab, as { key: { conn, lastSeen, restored,
+// traffic } }. Stored are only dst, filter_name, lastSeen, the geo text and, from newer views
+// (saveRecent), the verdict (allowed, is_allowed_ip) and the packets and bytes in total. An entry
+// of another form is left out, a broken value gives an empty list, a broken verdict or count is
+// ignored. Of two entries for one address the newer counts. An entry without a verdict is
+// restored: the table shows it as unknown until a reply has the server again. Stored counters
+// show as a past row's total; they have no samples, so a reply with the server starts the rate
+// over (recordRecent: an entry read back has no run)
 function readRecent() {
     var list = null, recent = {}, byIp = {};
 
@@ -634,7 +638,7 @@ function readRecent() {
         return recent;
 
     list.forEach(function(item) {
-        var conn, old;
+        var conn, old, entry;
 
         if (!L.isObject(item) || typeof item.dst != 'string' || !validIPv4(item.dst) ||
             typeof item.filter_name != 'string' || !FILTER_NAME_RE.test(item.filter_name) ||
@@ -646,15 +650,23 @@ function readRecent() {
         if (old)
             delete recent[recentKey(old.conn)];
         conn = { dst: item.dst, filter_name: item.filter_name, geo: geoText(item.geo) };
-        recent[recentKey(conn)] = byIp[item.dst] = { conn: conn, lastSeen: item.lastSeen, restored: true };
+        entry = { conn: conn, lastSeen: item.lastSeen, restored: true };
+        if ((item.allowed === null || typeof item.allowed == 'boolean') && typeof item.is_allowed_ip == 'boolean') {
+            conn.allowed = item.allowed;
+            conn.is_allowed_ip = item.is_allowed_ip;
+            entry.restored = false;
+        }
+        if (isCount(item.packets) && isCount(item.bytes))
+            entry.traffic = { packets: item.packets, bytes: item.bytes, samples: [] };
+        recent[recentKey(conn)] = byIp[item.dst] = entry;
     });
     return recent;
 }
 
 // Status of a row the last reply no longer has (entry e of the recent list), or of a live row while
-// the list is old (e.live): the verdict of the last reply that had it, none when restored from
-// sessionStorage. An Allow or Remove since then wins: action (connectionAction) comes from the
-// configuration, and no reply brings the new verdict
+// the list is old (e.live): the verdict of the last reply that had it, also when read back from
+// sessionStorage; none for a restored entry (readRecent). An Allow or Remove since then wins:
+// action (connectionAction) comes from the configuration, and no reply brings the new verdict
 function pastStatus(e, action) {
     var whitelisted = !e.restored && !!e.conn.is_allowed_ip;
 
@@ -717,11 +729,12 @@ function trafficOf(prev, conn, now) {
     return { packets: conn.packets, bytes: conn.bytes, samples: samples };
 }
 
-// Packets per second of trafficOf() samples, null while they span less than RATE_MIN_SPAN
+// Packets per second of trafficOf() samples, null while they span less than RATE_MIN_SPAN or
+// there are none (counters read back from sessionStorage)
 function trafficRate(t) {
     var first = t.samples[0], last = t.samples[t.samples.length - 1];
 
-    return (last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
+    return (first && last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
 }
 
 // Packets in total for a Traffic cell: exact below 10000, then rounded ('108k packets', '1.2M
@@ -739,7 +752,7 @@ function packetsText(n) {
 
 // Traffic cell of a row (rec: its entry of the recent list): the packet rate of a live row, the
 // packets in total of a past row and of a live row before its rate is known, '–' without counters
-// (older backend, static mode, a row from before the page was loaded). The packets count those
+// (older backend, static mode, a row an older view stored without them). The packets count those
 // the devices of the filter sent to the server since its first packet after the last service
 // start or after an hour without one. data-value: the packets, for sorting. The tooltip adds the
 // bytes, the average packet size and how long this page has seen the server
@@ -2230,7 +2243,10 @@ return view.extend({
 
     // Keep the recent list in sessionStorage for this tab (readRecent): at most every
     // RECENT_SAVE_INTERVAL, and whenever the page is hidden or left (force). Only a convenience:
-    // a failed write changes nothing on the page
+    // a failed write changes nothing on the page. With the verdict of the last reply that had the
+    // server (allowed: true, false or null for untracked, as connectionStatus reads it; none for
+    // a restored entry or another value) and its packets and bytes in total, if known. Older
+    // views read only the first four fields
     saveRecent: function(force) {
         var now = Date.now(), recent = this.recent, text;
 
@@ -2238,8 +2254,18 @@ return view.extend({
             return;
         this.recentSavedAt = now;
         text = JSON.stringify(Object.keys(recent).map(function(key) {
-            var e = recent[key];
-            return { dst: e.conn.dst, filter_name: e.conn.filter_name, lastSeen: e.lastSeen, geo: geoText(e.conn.geo) };
+            var e = recent[key], c = e.conn,
+                item = { dst: c.dst, filter_name: c.filter_name, lastSeen: e.lastSeen, geo: geoText(c.geo) };
+
+            if (!e.restored && (c.allowed == null || typeof c.allowed == 'boolean')) {
+                item.allowed = (c.allowed == null) ? null : c.allowed;
+                item.is_allowed_ip = !!c.is_allowed_ip;
+            }
+            if (e.traffic) {
+                item.packets = e.traffic.packets;
+                item.bytes = e.traffic.bytes;
+            }
+            return item;
         }));
         if (text === this.recentSaved)
             return;
@@ -3334,9 +3360,9 @@ return view.extend({
     // recent list that it no longer has, newest first; with text in the search field only those
     // whose IP, filter, country, city or ISP contain it. Country, city and ISP come from
     // luci.geomate's geo lookup; older backends and cache entries have none of them, the cells
-    // then show '–'. A past row keeps the verdict of the last reply that had it (pastStatus);
-    // restored from sessionStorage it has none. The button of a row comes from the configuration
-    // (connectionAction). The table is rebuilt only when a row changed: ui.Table replaces every
+    // then show '–'. A past row keeps the verdict of the last reply that had it (pastStatus), also
+    // read back from sessionStorage; an entry an older view stored has none. The button of a row
+    // comes from the configuration (connectionAction). The table is rebuilt only when a row changed: ui.Table replaces every
     // row, and with it a button under the pointer. The Last seen and Traffic cells change in
     // place; sorted by traffic, the table is rebuilt when the order of the packets changes.
     // Until the first reply the table keeps saying it loads, or that the list is unavailable
