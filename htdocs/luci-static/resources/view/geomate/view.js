@@ -1812,10 +1812,9 @@ return view.extend({
         n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
         n.connectionsToggle = E('span', {}, [ _('Show') ]);
         // With flow offloading the firewall forwards an established connection past geomate's
-        // prerouting rules, which fill the live list and count the packets (updateStatus shows it)
-        n.offloading = E('p', { 'class': 'gm-connections-note', 'hidden': '' }, [
-            _('Flow offloading is enabled (Network > Firewall): servers show as live only at the start of a connection, and traffic counts only its first packets.')
-        ]);
+        // prerouting rules, which fill the live list and count the packets (updateStatus shows it
+        // and sets the text)
+        n.offloading = E('p', { 'class': 'gm-connections-note', 'hidden': '' });
 
         n.connections = E('details', {
             'class': 'cbi-section',
@@ -2003,9 +2002,15 @@ return view.extend({
             : _('Connections unavailable');
 
         // Flow offloading of the firewall (an older rpcd reports none: no note). A failed reply
-        // keeps the note as it was
-        if (st)
+        // keeps the note as it was. The traffic part only with the Traffic column (set_counters)
+        if (st) {
+            var offloadingText = this.withCounters
+                ? _('Flow offloading is on (Network > Firewall): servers show as live only at the start of a connection, and traffic counts only its first packets.')
+                : _('Flow offloading is on (Network > Firewall): servers show as live only at the start of a connection.');
+            if (n.offloading.textContent !== offloadingText)
+                n.offloading.textContent = offloadingText;
             n.offloading.hidden = st.flow_offloading !== true;
+        }
 
         // A failed reply tells nothing, and the service builds its table while it loads
         if (!polled || !st || !checks || loading)
