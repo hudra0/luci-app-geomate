@@ -377,9 +377,11 @@ end
 -- filter. strict_mode counts in monitor mode too: the table shows what the rules would do.
 -- Private and reserved addresses and the router's own addresses are left out.
 -- with_counters: also the 'nft list set' output of the _dynamic set of each filter that sees a
--- server, as { [section] = text }; nft lists it while the _allowed and _blocked sets are read
+-- server, as { [section] = text }. Read after the other sets, never through a pipe left open
+-- meanwhile: within uci:foreach the next popen read then came back empty, and an allowed
+-- server showed as blocked
 local function get_ui_dynamic_ips(with_counters)
-    local entries, by_ip, pipes, listings = {}, {}, {}, {}
+    local entries, by_ip, listings = {}, {}, {}
     local own = router_addresses()
 
     uci:load('geomate')
@@ -405,11 +407,11 @@ local function get_ui_dynamic_ips(with_counters)
             return
         end
 
-        if with_counters then
-            pipes[s['.name']] = io.popen("nft list set inet geomate '" .. set_name .. "_dynamic' 2>/dev/null")
-        end
         local allowed = read_set(set_name .. "_allowed")
         local blocked = read_set(set_name .. "_blocked")
+        if with_counters then
+            listings[s['.name']] = nft_list_set(set_name .. "_dynamic")
+        end
         for _, ip in ipairs(candidates) do
             local verdict = nil
             if set_has(allowed, ip) then
@@ -429,10 +431,6 @@ local function get_ui_dynamic_ips(with_counters)
         end
     end)
 
-    for sid, handle in pairs(pipes) do
-        listings[sid] = handle:read("*a") or ""
-        handle:close()
-    end
     return entries, listings
 end
 
