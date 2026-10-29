@@ -3362,10 +3362,11 @@ return view.extend({
     // luci.geomate's geo lookup; older backends and cache entries have none of them, the cells
     // then show '–'. A past row keeps the verdict of the last reply that had it (pastStatus), also
     // read back from sessionStorage; an entry an older view stored has none. The button of a row
-    // comes from the configuration (connectionAction). The table is rebuilt only when a row changed: ui.Table replaces every
-    // row, and with it a button under the pointer. The Last seen and Traffic cells change in
-    // place; sorted by traffic, the table is rebuilt when the order of the packets changes.
-    // Until the first reply the table keeps saying it loads, or that the list is unavailable
+    // comes from the configuration (connectionAction). The table is rebuilt only when a row
+    // changed: ui.Table replaces every row, and with it a button under the pointer. The Last seen
+    // and Traffic cells change in place; sorted by traffic, the table is rebuilt when the order of
+    // the packets changes. Until the first reply the table keeps saying it loads, or that the
+    // list is unavailable
     updateActiveConnectionsList: function() {
         var self = this, table = this.connectionsTable, recent = this.recent, now = Date.now();
         if (!table || !this.nodes.connectionsTitle || this.configLoads || this.connectionsAt == null) return;
