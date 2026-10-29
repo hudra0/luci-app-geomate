@@ -284,8 +284,9 @@ var SrcIpList = form.DynamicList.extend({
 });
 
 // The traffic a filter looks at, as the rule in the service is built from protocol, src_ip,
-// src_port and dest_port: 'UDP from 192.168.2.208 port 3074, 3075'. A missing protocol or
-// option adds no match, so 'Any traffic' is the filter without any
+// src_port and dest_port: 'UDP from 192.168.2.208 port 3074, 3075'. A missing option adds no
+// match, so 'Any traffic' is the filter without any. Ports without a protocol match TCP and
+// UDP: the service has no port match without a protocol and adds both
 function matchText(section_id) {
     var proto = String(uci.get('geomate', section_id, 'protocol') || '').trim().toUpperCase();
     var ips = matchItems(section_id, 'src_ip');
@@ -299,7 +300,7 @@ function matchText(section_id) {
     if (!from && !to)
         return proto ? _('%s traffic').format(proto) : _('Any traffic');
 
-    return [ proto || _('Any protocol'), from, to ].filter(Boolean).join(' ');
+    return [ proto || ((sport || dport) ? 'TCP/UDP' : _('Any protocol')), from, to ].filter(Boolean).join(' ');
 }
 
 // The session has uncommitted changes in this section, or in this option of it
