@@ -675,6 +675,65 @@ local function backend_capabilities()
     return caps
 end
 
+-- A version marker as the updater stamps it: 'dev', a release such as 1.2.0 or a commit hash
+local function valid_version(v)
+    return v == "dev" or v:match("^%d+%.%d+%.%d+$") ~= nil
+        or (#v >= 7 and #v <= 40 and v:match("^[0-9a-f]+$") ~= nil)
+end
+
+-- An update channel: release, snapshot, branch=<name> or commit=<hash>
+local function valid_channel(c)
+    return c == "release" or c == "snapshot" or c:match("^branch=[%w_.%-]+$") ~= nil
+        or c:match("^commit=[0-9a-f]+$") ~= nil
+end
+
+-- The first value of each marker line in a file: { key = value } for patterns { key = pattern }.
+-- Reading stops once every marker is found; the updater stamps them at the top of the file
+local function read_markers(path, patterns)
+    local found, missing = {}, 0
+    for _ in pairs(patterns) do missing = missing + 1 end
+    local f = io.open(path, "r")
+    if not f then
+        return found
+    end
+    for line in f:lines() do
+        for key, pattern in pairs(patterns) do
+            local value = found[key] == nil and line:match(pattern)
+            if value then
+                found[key] = value
+                missing = missing - 1
+            end
+        end
+        if missing == 0 then
+            break
+        end
+    end
+    f:close()
+    return found
+end
+
+-- Versions and update channels of the installed files, what check_version reports as 'Current
+-- version': VERSION and UPD_CHANNEL of the init script, UI_VERSION and UI_UPD_CHANNEL of view.js,
+-- as the updater stamps them. A missing file or line or an invalid value leaves its field out;
+-- nil when none is known
+local function installed_versions()
+    local backend = read_markers("/etc/init.d/geomate", {
+        version = '^%s*VERSION%s*=%s*"([^"]*)"',
+        channel = '^%s*UPD_CHANNEL%s*=%s*"([^"]*)"'
+    })
+    local frontend = read_markers("/www/luci-static/resources/view/geomate/view.js", {
+        version = "^%s*const%s+UI_VERSION%s*=%s*'([^']*)'",
+        channel = "^%s*const%s+UI_UPD_CHANNEL%s*=%s*'([^']*)'"
+    })
+    local installed = {
+        backend = backend.version and valid_version(backend.version) and backend.version or nil,
+        backend_channel = backend.channel and valid_channel(backend.channel) and backend.channel or nil,
+        frontend = frontend.version and valid_version(frontend.version) and frontend.version or nil,
+        frontend_channel = frontend.channel and valid_channel(frontend.channel) and frontend.channel or nil
+    }
+    return next(installed) and installed or nil
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -777,6 +836,9 @@ local function get_service_status()
     end
 
     status.capabilities = backend_capabilities()
+    -- The page checks for updates again when these change, and asks for a reload when its own
+    -- UI_VERSION differs from the installed one
+    status.installed = installed_versions()
 
     return status
 end

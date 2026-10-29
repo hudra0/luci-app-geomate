@@ -666,10 +666,16 @@ function showSeen(node, lastSeen, now) {
 }
 
 // check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
-// IP. The browser keeps the last result ({ stdout, stderr, code, at, ui }) and shows it again on page load
-// and in the hourly poll: a success for VERSION_INTERVAL, a failure for VERSION_RETRY seconds
+// IP. The browser keeps the last result ({ stdout, stderr, code, at, ui, installed }) and shows it
+// again on page load and in the hourly poll: a success for VERSION_INTERVAL, a failure for
+// VERSION_RETRY seconds, and only for the installed versions it was asked for (installedKey): an
+// update of either component makes it stale
 var VERSION_CACHE_KEY = 'geomate-version-check',
     VERSION_RETRY = 600;
+
+// Fields of status.installed (getStatus): the version markers of the installed files, which
+// check_version reports as 'Current version'
+var INSTALLED_FIELDS = [ 'backend', 'backend_channel', 'frontend', 'frontend_channel' ];
 
 // Symbols of the health check states in the status row
 var CHECK_ICONS = { ok: '✓', info: '○', warning: '⚠', error: '✗' };
@@ -732,13 +738,34 @@ function versionState(entry) {
     };
 }
 
-// The cached check_version result while it is fresh, else null. Only for this frontend version:
-// a frontend update changes it. A success expires a minute early, so the hourly poll asks again
-function cachedVersionCheck() {
+// A version marker as the updater stamps it: 'dev', a release such as 1.2.0 or a commit hash
+function validVersion(v) {
+    return typeof v == 'string' && (v === 'dev' || /^\d+\.\d+\.\d+$/.test(v) || /^[0-9a-f]{7,40}$/.test(v));
+}
+
+// The installed versions of a getStatus reply as one string, null when the reply has none (no
+// reply, or an rpcd backend without the field)
+function installedKey(st) {
+    var inst = st && st.installed,
+        values = !L.isObject(inst) ? [] : INSTALLED_FIELDS.map(function(k) {
+            return (typeof inst[k] == 'string') ? inst[k] : '';
+        });
+
+    return values.some(function(v) { return v !== ''; }) ? JSON.stringify(values) : null;
+}
+
+// The cached check_version result while it is fresh, else null. A success expires a minute early,
+// so the hourly poll asks again. With the installed versions known on both sides (installed: the
+// installedKey of the status) they decide, so after an update the entry is stale, and a page
+// reloaded after a frontend update uses the entry the old page stored for it. Else only the
+// frontend version of this page counts, as before
+function cachedVersionCheck(installed) {
     var entry = null, ttl;
 
     try { entry = JSON.parse(window.localStorage.getItem(VERSION_CACHE_KEY) || 'null'); } catch (e) {}
-    if (!entry || typeof entry.stdout != 'string' || typeof entry.at != 'number' || entry.ui !== UI_VERSION)
+    if (!entry || typeof entry.stdout != 'string' || typeof entry.at != 'number')
+        return null;
+    if ((installed != null && typeof entry.installed == 'string') ? entry.installed !== installed : entry.ui !== UI_VERSION)
         return null;
     ttl = (versionState(entry).state == 'failed') ? VERSION_RETRY : VERSION_INTERVAL - 60;
     return (Date.now() >= entry.at && Date.now() - entry.at < ttl * 1000) ? entry : null;
@@ -746,6 +773,20 @@ function cachedVersionCheck() {
 
 function storeVersionCheck(entry) {
     try { window.localStorage.setItem(VERSION_CACHE_KEY, JSON.stringify(entry)); } catch (e) {}
+}
+
+// Click handler of the reload link in the status row. LuCI loads a view by the URL below
+// (base_url, ?v=<LuCI version>) and allows the browser cache, and uhttpd sends no Cache-Control,
+// so a plain reload may run the old view.js again: fetch both views past the cache first
+function reloadViews(ev) {
+    var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
+
+    ev.preventDefault();
+    Promise.all([ 'view', 'geofilters' ].map(function(name) {
+        return window.fetch(L.env.base_url + '/view/geomate/' + name + '.js' + v, { cache: 'reload' }).catch(function() {});
+    })).then(function() {
+        window.location.reload();
+    });
 }
 
 return view.extend({
@@ -782,6 +823,7 @@ return view.extend({
     connectionsBusy: null,  // running getGeomateConnections request
     statusBusy: null,       // running status request
     versionBusy: null,      // running check_version request
+    versionInstalled: null, // installed versions (installedKey) for which a check was last started
     connectionsTable: null, // ui.Table of the active connections
     connectionsActions: false,  // the table has the Allow/Remove column (write access at render)
     connectionsKey: null,   // rows of the last table update, as JSON
@@ -995,6 +1037,10 @@ return view.extend({
         n.health = E('span', { 'id': 'health-check-status' });
         n.loading = E('span', { 'id': 'geomate-loading-indicator', 'class': 'gm-note' }, [ _('Loading GeoFilter data ...') ]);
         n.stale = E('span', { 'id': 'geomate-connections-stale', 'class': 'gm-note' });
+        n.reload = E('span', { 'id': 'geomate-reload-note', 'class': 'gm-note', 'hidden': '' }, [
+            _('The web interface was updated.'), ' ',
+            E('a', { 'href': '#', 'click': reloadViews }, [ _('Reload the page') ])
+        ]);
         n.version = E('span', { 'id': 'version-display', 'class': 'gm-muted gm-wide' });
         n.update = E('span', { 'id': 'version-update-status', 'class': 'gm-wide' });
 
@@ -1013,7 +1059,7 @@ return view.extend({
 
         n.statusRow = E('details', { 'id': 'geomate-status' }, [
             E('summary', { 'mousedown': noFocus }, [
-                n.state, n.mode, n.health, n.loading, n.stale,
+                n.state, n.mode, n.health, n.loading, n.stale, n.reload,
                 E('span', { 'class': 'gm-spacer' }),
                 n.version, n.update,
                 E('span', { 'class': 'gm-muted' }, [ _('Details'), ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
@@ -1717,16 +1763,32 @@ return view.extend({
         this.confirmed = confirmed;
     },
 
+    // The installed view.js (status.installed, from rpcd) is another version than this page: an
+    // update replaced it after the page was loaded, or the browser runs a cached copy. The
+    // unstamped 'dev' (a clone served by a dev proxy) is compared with nothing
+    pageOutdated: function() {
+        var inst = this.status && this.status.installed,
+            installed = L.isObject(inst) ? inst.frontend : null;
+
+        return validVersion(installed) && validVersion(UI_VERSION) && installed !== 'dev' &&
+            UI_VERSION !== 'dev' && installed !== UI_VERSION;
+    },
+
     // Show the versions and the update state of versionInfo; before the first result the
-    // frontend version of this file
+    // frontend version of this file. On an outdated page (pageOutdated) the reload note shows,
+    // and a frontend update is not offered: check_version compares the installed frontend
     showVersions: function() {
         var n = this.nodes,
             v = this.versionInfo || versionState({}),
+            outdated = this.pageOutdated(),
+            update = (outdated && v.update == 'both') ? 'backend' : (outdated && v.update == 'frontend') ? null : v.update,
             versions = [],
             summary = '', detail = '', primary = false;
 
         if (!n)
             return;
+
+        n.reload.hidden = !outdated;
 
         if (v.backend.current)
             versions.push(_('Backend %s').format(formatVersionDisplay(v.backend.current)));
@@ -1749,10 +1811,13 @@ return view.extend({
             detail = _('Could not run the update check: %s').format(v.error);
         }
         else if (v.state == 'update') {
-            summary = (v.update == 'both') ? _('Update available')
-                : (v.update == 'backend') ? _('Backend update available') : _('Frontend update available');
-            detail = (v.update == 'both') ? _('Backend and frontend updates available') : summary;
-            primary = true;
+            // Outdated page with only a frontend update: the reload note says it
+            if (update) {
+                summary = (update == 'both') ? _('Update available')
+                    : (update == 'backend') ? _('Backend update available') : _('Frontend update available');
+                detail = (update == 'both') ? _('Backend and frontend updates available') : summary;
+                primary = true;
+            }
         }
         else if (v.state == 'current') {
             summary = detail = _('Up to date');
@@ -1821,6 +1886,8 @@ return view.extend({
                 self.health = r[1];
                 self.statusLoaded = true;
                 self.updateStatus(true);
+                self.showVersions();
+                self.checkAfterUpdate();
             }).finally(function() {
                 self.statusBusy = null;
             });
@@ -3329,13 +3396,29 @@ return view.extend({
         });
     },
 
+    // After an update of either component the status reports other installed versions: ask for
+    // the versions again, once per change. A plain restart changes nothing here. A result cached
+    // for these versions (e.g. by another tab) is shown without a request (checkForUpdates), and
+    // any result stays while the status has no installed versions. A check that fails without a
+    // result is not repeated by the status poll, the hourly poll tries again. A busy check is no
+    // reason to wait: it ends here (checkForUpdates) and finds versions that changed meanwhile
+    checkAfterUpdate: function() {
+        var installed = installedKey(this.status);
+
+        if (installed == null || installed === this.versionInstalled || this.versionBusy)
+            return;
+        this.versionInstalled = installed;
+        this.checkForUpdates();
+    },
+
     /**
      * Check for updates, one call at a time. On page load and in the hourly poll a fresh cached
      * result (cachedVersionCheck) is shown instead of asking GitHub again.
      * @param {boolean} force - Ask GitHub now, whatever the cache holds ('Check again').
      */
     checkForUpdates: function(force) {
-        var self = this, cached = (force === true) ? null : cachedVersionCheck();
+        var self = this, installed = null,
+            cached = (force === true) ? null : cachedVersionCheck(installedKey(this.status));
 
         if (this.versionBusy || !this.nodes)
             return this.versionBusy || Promise.resolve();
@@ -3351,12 +3434,24 @@ return view.extend({
         this.versionBusy = new Promise(function(resolve) {
             window.setTimeout(resolve, 500);
         }).then(function() {
+            // A status request on its way tells which installed versions this check belongs to
+            return Promise.resolve(self.statusBusy).catch(function() {});
+        }).then(function() {
+            installed = installedKey(self.status);
+            self.versionInstalled = installed;
+            // With the installed versions known now, an entry stored for them may count after all
+            // (e.g. by the page before a reload)
+            var known = (force === true) ? null : cachedVersionCheck(installed);
+            if (known)
+                return known;
             // -i: past the backend's own 10-minute cache of the GitHub answer as well
-            return fs.exec('/etc/init.d/geomate', (force === true) ? [ 'check_version', '-i' ] : [ 'check_version' ]);
-        }).then(function(result) {
-            var entry = { stdout: result.stdout || '', stderr: result.stderr || '', code: result.code, at: Date.now(), ui: UI_VERSION };
+            return fs.exec('/etc/init.d/geomate', (force === true) ? [ 'check_version', '-i' ] : [ 'check_version' ]).then(function(result) {
+                var entry = { stdout: result.stdout || '', stderr: result.stderr || '', code: result.code, at: Date.now(), ui: UI_VERSION, installed: installed };
 
-            storeVersionCheck(entry);
+                storeVersionCheck(entry);
+                return entry;
+            });
+        }).then(function(entry) {
             self.versionInfo = versionState(entry);
         }).catch(function(error) {
             // No answer: a timeout means GitHub was slow, anything else that the command did
@@ -3368,6 +3463,7 @@ return view.extend({
         }).finally(function() {
             self.versionBusy = null;
             self.showVersions();
+            self.checkAfterUpdate();
         });
 
         this.showVersions();
