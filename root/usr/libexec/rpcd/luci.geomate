@@ -777,6 +777,20 @@ local function installed_versions()
     return next(installed) and installed or nil
 end
 
+-- Flow offloading of the firewall is on: 'flow_offloading' of the first 'defaults' section, the
+-- one fw4 reads, with fw4's true values. Hardware offloading needs it too. Offloaded packets skip
+-- the prerouting rules that fill _ui_dynamic and count in _dynamic, so a server shows as live
+-- only at the start of a connection. Read only; no firewall config counts as off
+local function flow_offloading()
+    local on = false
+    uci:foreach('firewall', 'defaults', function(s)
+        local v = s.flow_offloading
+        on = (v == '1' or v == 'on' or v == 'true' or v == 'yes')
+        return false
+    end)
+    return on
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -882,6 +896,8 @@ local function get_service_status()
     -- The page checks for updates again when these change, and asks for a reload when its own
     -- UI_VERSION differs from the installed one
     status.installed = installed_versions()
+    -- The page notes it at the connections table
+    status.flow_offloading = flow_offloading()
 
     return status
 end

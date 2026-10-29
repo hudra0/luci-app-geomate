@@ -1687,6 +1687,8 @@ return view.extend({
             /* Themes that uppercase headings leave the label as it is */
             #active-connections-container .gm-connections-toggle { flex: none; font-size: 13px; font-weight: normal; opacity: 0.7; white-space: nowrap; text-transform: none; letter-spacing: normal; }
             #active-connections-container .gm-connections-wrap { max-height: 400px; overflow: auto; margin-top: 8px; }
+            /* Note about flow offloading, small and dimmed like the second line of a card */
+            #active-connections-container .gm-connections-note { margin: 6px 3px 0; font-size: max(85%, 11px); opacity: 0.75; }
             /* Search field and, in the card layout, the "Sort by" select above the table. The bar
                is a container of the same name and width as the table's box (below), so the card
                query shows the select exactly when the table shows cards. Its items keep a margin
@@ -1809,6 +1811,10 @@ return view.extend({
         // updateActiveConnectionsList() sets the count in the title span
         n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
         n.connectionsToggle = E('span', {}, [ _('Show') ]);
+        // With flow offloading the firewall forwards an established connection past geomate's
+        // prerouting rules, which fill the live list and count the packets (updateStatus shows it
+        // and sets the text)
+        n.offloading = E('p', { 'class': 'gm-connections-note', 'hidden': '' });
 
         n.connections = E('details', {
             'class': 'cbi-section',
@@ -1822,6 +1828,7 @@ return view.extend({
                     E('span', { 'class': 'gm-connections-toggle' }, [ n.connectionsToggle, ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
                 ])
             ]),
+            n.offloading,
             E('div', { 'class': 'gm-connections-tools' }, [
                 n.connectionsSearch,
                 E('label', { 'class': 'gm-connections-sort' }, [ _('Sort by'), n.connectionsSort ])
@@ -1993,6 +2000,17 @@ return view.extend({
         n.stale.textContent = !stale ? '' : this.connectionsAt
             ? _('Connections not updated since %s').format(new Date(this.connectionsAt).toLocaleTimeString())
             : _('Connections unavailable');
+
+        // Flow offloading of the firewall (an older rpcd reports none: no note). A failed reply
+        // keeps the note as it was. The traffic part only with the Traffic column (set_counters)
+        if (st) {
+            var offloadingText = this.withCounters
+                ? _('Flow offloading is on (Network > Firewall): servers show as live only at the start of a connection, and traffic counts only its first packets.')
+                : _('Flow offloading is on (Network > Firewall): servers show as live only at the start of a connection.');
+            if (n.offloading.textContent !== offloadingText)
+                n.offloading.textContent = offloadingText;
+            n.offloading.hidden = st.flow_offloading !== true;
+        }
 
         // A failed reply tells nothing, and the service builds its table while it loads
         if (!polled || !st || !checks || loading)
