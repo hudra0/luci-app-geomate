@@ -40,6 +40,13 @@ var callUciChanges = rpc.declare({
 // Store geolocation status globally for access in render functions
 var geoStats = null;
 
+// Seconds between two status requests while a full geolocation runs
+var GEOLOCATION_POLL = 10;
+
+// The Geolocation Status widget (its node as rendered last and the function that builds its
+// content), the Manual Geolocation button as rendered last, and the next status request
+var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoTimer = null, geoChecking = false;
+
 // Source IP suggestions and host names (hostChoices), loaded with the page
 var hosts = { keys: [], labels: {}, names: {} };
 
@@ -121,6 +128,67 @@ function matchItems(section_id, option) {
 // counts as not supported
 function hasCapability(token) {
     return !!geoStats && Array.isArray(geoStats.capabilities) && geoStats.capabilities.indexOf(token) > -1;
+}
+
+// A full geolocation (manual or daily) is running. A missing field (older backend) is unknown
+// and counts as no run
+function geolocationRunning() {
+    return !!geoStats && geoStats.geolocation_running === true;
+}
+
+// The status line of a running full geolocation, null without one
+function runningLine() {
+    if (!geolocationRunning())
+        return null;
+
+    return E('div', { 'style': 'padding-top: 8px;' }, [ E('strong', {}, _('Geolocation:')), ' ',
+        (geoStats.geolocation_running_for != null)
+            ? _('Running for %s').format(formatTime(geoStats.geolocation_running_for))
+            : _('Running') ]);
+}
+
+// Puts geoStats into the status section and locks the Manual Geolocation button during a run
+function showGeolocationStatus() {
+    if (geoStatusNode && geoStatusContent)
+        dom.content(geoStatusNode, [ runningLine(), geoStatusContent() ]);
+    lockGeolocationButton();
+}
+
+function lockGeolocationButton() {
+    if (geoButton) {
+        geoButton.disabled = geolocationRunning();
+        if (geolocationRunning())
+            geoButton.setAttribute('title', _('Geolocation is already running.'));
+        else
+            geoButton.removeAttribute('title');
+    }
+}
+
+// During a run the page asks for the status every GEOLOCATION_POLL seconds, not while the tab
+// is hidden; a tab that becomes visible asks at once (see render). A failed request, as while
+// the service restarts at the end of a run, is tried again
+function watchGeolocation() {
+    window.clearTimeout(geoTimer);
+    geoTimer = geolocationRunning() ? window.setTimeout(checkGeolocation, GEOLOCATION_POLL * 1000) : null;
+}
+
+function checkGeolocation() {
+    geoTimer = null;
+    if (geoChecking || document.visibilityState == 'hidden')
+        return;
+
+    geoChecking = true;
+    callGetGeolocationStatus().then(function(stats) {
+        geoStats = stats;
+        showGeolocationStatus();
+        if (stats.geolocation_running === false)
+            ui.addNotification(null, E('p', {}, _('Geolocation finished.')), 'info');
+    }).catch(function(err) {
+        console.log('Failed to load geolocation status:', err);
+    }).finally(function() {
+        geoChecking = false;
+        watchGeolocation();
+    });
 }
 
 // Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
@@ -473,6 +541,21 @@ return view.extend({
             return E('div', { 'style': 'padding: 8px 0;' }, lines);
         };
 
+        // A running full geolocation goes on top; status requests during a run update the widget
+        geoStatusContent = o.renderWidget;
+        o.renderWidget = function() {
+            geoStatusNode = E('div', {}, [ runningLine(), geoStatusContent() ]);
+            return geoStatusNode;
+        };
+
+        // A tab that becomes visible again asks at once for the status of a running geolocation
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState == 'visible' && geolocationRunning()) {
+                window.clearTimeout(geoTimer);
+                checkGeolocation();
+            }
+        });
+
         // **Global Settings Section**
         // This section contains the main configuration options for the Geomate service
         s = m.section(form.TypedSection, 'global', _('Global Settings'));
@@ -506,6 +589,12 @@ return view.extend({
         o = s.option(form.Button, '_manual_geolocation', _('Manual Geolocation'));
         o.inputtitle = _('Run Manual Geolocation');
         o.inputstyle = 'action';
+        var renderButton = o.renderWidget;
+        o.renderWidget = function(/* section_id, option_index, cfgvalue */) {
+            geoButton = renderButton.apply(this, arguments);
+            lockGeolocationButton();
+            return geoButton;
+        };
         o.onclick = function(ev) {
             return ui.showModal(_('Manual Geolocation'), [
                 E('div', { 'class': 'alert-message warning' }, [
@@ -527,6 +616,29 @@ return view.extend({
                         'class': 'btn cbi-button-positive',
                         'click': function() {
                             ui.hideModal();
+
+                            // A newer backend starts the run in the background and refuses a
+                            // second one (exit 3); the status section shows the run until it ends
+                            if (hasCapability('geolocate_status'))
+                                return fs.exec('/etc/geolocate.sh', [ 'start' ]).then(function(res) {
+                                    if (res.code == 3) {
+                                        ui.addNotification(null, E('p', {}, _('Geolocation is already running.')), 'info');
+                                    }
+                                    else if (res.code != 0) {
+                                        throw new Error((res.stderr || res.stdout || '').trim() || _('Exit code %d').format(res.code));
+                                    }
+                                    else {
+                                        ui.addNotification(null, E('p', {}, _('Manual geolocation process started. This process runs in the background and may take several minutes to complete.')), 'info');
+                                    }
+                                    // Running until the first status request, which comes after
+                                    // the run has taken its lock
+                                    geoStats = Object.assign({}, geoStats, { geolocation_running: true, geolocation_running_for: null });
+                                    showGeolocationStatus();
+                                    watchGeolocation();
+                                }).catch(function(err) {
+                                    ui.addNotification(null, E('p', {}, _('Failed to start geolocation process: ') + errorText(err)), 'error');
+                                });
+
                             ui.addNotification(null, E('p', {}, _('Manual geolocation process started. This process runs in the background and may take several minutes to complete.')), 'info');
                             
                             return fs.exec_direct('/etc/geolocate.sh', [])
@@ -821,6 +933,9 @@ return view.extend({
         };
 
         return m.render().then(function(node) {
+            // A run that was going on when the page loaded (manual or daily)
+            watchGeolocation();
+
             // '#edit=<section>' (link of the map's region dialog) opens the dialog of that filter
             var edit = /^#edit=([^&]+)$/.exec(window.location.hash), sid = null;
 
