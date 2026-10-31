@@ -697,18 +697,20 @@ function readRecent() {
 // the list is old (e.live): the verdict of the last reply that had it, also when read back from
 // sessionStorage; none for a restored entry (readRecent). An Allow, Remove, Block or Unblock since
 // then wins: action (connectionAction) comes from the configuration, and no reply brings the new
-// verdict. The allowed IPs come first, as in the service
+// verdict. The allowed IPs come first, as in the service: an action of the blocked IPs means the
+// allowed IPs no longer cover the server
 function pastStatus(e, action) {
     var whitelisted = !e.restored && !!e.conn.is_allowed_ip,
         blacklisted = !e.restored && e.conn.is_blocked_ip === true && e.conn.allowed === false,
-        allowListed = [ 'remove', 'entry', 'range' ].indexOf(action) > -1;
+        allowListed = [ 'remove', 'entry', 'range' ].indexOf(action) > -1,
+        blockListed = [ 'unblock', 'blocked-entry', 'blocked-range', 'blocked-option' ].indexOf(action) > -1;
 
     if (action === 'remove' && !whitelisted)
         return [ 'whitelist', _('Whitelisted'), null ];
+    if (blockListed && !blacklisted)
+        return [ 'blacklist', _('Blacklisted'), blacklistedNote(e.conn.filter_name, null) ];
     if (action && !allowListed && whitelisted && sidByName(e.conn.filter_name))
         return [ 'unknown', _('Unknown'), _('Removed from the allowed IPs since last seen.') ];
-    if (action === 'unblock' && !blacklisted)
-        return [ 'blacklist', _('Blacklisted'), blacklistedNote(e.conn.filter_name, null) ];
     if (action === 'allow-block' && blacklisted && sidByName(e.conn.filter_name))
         return [ 'unknown', _('Unknown'), _('Removed from the blocked IPs since last seen.') ];
     if (e.restored)
@@ -2213,12 +2215,19 @@ return view.extend({
     },
 
     // One request at a time: a direct call while the poll's request runs shares it. Counters only
-    // once a status reply said the backend has them: the first request of the page goes without
+    // once a status reply said the backend has them: the first request of the page goes without.
+    // Its reply waits for the first status reply, which decides about Block (blocksIps): a table
+    // drawn before it would be drawn again at once
     pollConnections: function() {
         var self = this;
+        var afterStatus = function(list) {
+            var done = function() { return list; };
+
+            return (!self.statusLoaded && self.statusBusy) ? self.statusBusy.then(done, done) : list;
+        };
 
         if (!this.connectionsBusy)
-            this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(function(list) {
+            this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(afterStatus).then(function(list) {
                 var failed = self.connectionsFailed;
 
                 self.connectionsFailed = list ? 0 : failed + 1;

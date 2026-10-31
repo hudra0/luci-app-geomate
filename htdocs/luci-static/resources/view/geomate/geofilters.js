@@ -763,11 +763,12 @@ return view.extend({
         o.modalonly = true;
 
         // Blacklist for specific IP addresses, also inside the regions; the allowed IPs win. Only
-        // with a backend that reports blocked_ip: an older one ignores the list
+        // with a backend that reports blocked_ip: an older one ignores the list. No '!' entries:
+        // the backend skips them
         if (hasCapability('blocked_ip')) {
             o = s.option(form.DynamicList, 'blocked_ip', _('Blocked IPs'),
                 _('Blocked even inside a region. Allowed IPs take precedence.'));
-            o.datatype = 'list(neg(ip4addr))';
+            o.datatype = 'list(ip4addr)';
             o.placeholder = _('1.2.3.4 or 1.2.3.0/24');
             o.rmempty = true;
             o.modalonly = true;
