@@ -44,9 +44,10 @@ var geoStats = null;
 var GEOLOCATION_POLL = 10;
 
 // The Geolocation Status widget (its node as rendered last and the function that builds its
-// content), the Manual Geolocation button as rendered last and whether the form is read-only,
-// the next status request, and the replies in a row without the running field during a watch
-var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoReadonly = false;
+// content), the Manual Geolocation button as rendered last, the note next to it and whether the
+// form is read-only, the next status request, and the replies in a row without the running
+// field during a watch
+var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoButtonNote = null, geoReadonly = false;
 var geoTimer = null, geoChecking = false, geoUnknown = 0;
 
 // Source IP suggestions and host names (hostChoices), loaded with the page
@@ -138,15 +139,19 @@ function geolocationRunning() {
     return !!geoStats && geoStats.geolocation_running === true;
 }
 
+// How long the running full geolocation runs, for the status line and the button note
+function runningText() {
+    return (geoStats.geolocation_running_for != null)
+        ? _('Running for %s').format(formatTime(geoStats.geolocation_running_for))
+        : _('Running');
+}
+
 // The status line of a running full geolocation, null without one
 function runningLine() {
     if (!geolocationRunning())
         return null;
 
-    return E('div', { 'style': 'padding-top: 8px;' }, [ E('strong', {}, _('Geolocation:')), ' ',
-        (geoStats.geolocation_running_for != null)
-            ? _('Running for %s').format(formatTime(geoStats.geolocation_running_for))
-            : _('Running') ]);
+    return E('div', { 'style': 'padding-top: 8px;' }, [ E('strong', {}, _('Geolocation:')), ' ', runningText() ]);
 }
 
 // The status section's content: the running line (if any) on top of the regular status
@@ -161,7 +166,8 @@ function showGeolocationStatus() {
     lockGeolocationButton();
 }
 
-// A read-only session keeps its button disabled when no run is going
+// A read-only session keeps its button disabled when no run is going. During a run a note next
+// to the button says why it is disabled: a tooltip alone shows on hover only, not on a phone
 function lockGeolocationButton() {
     if (geoButton) {
         geoButton.disabled = geolocationRunning() || geoReadonly;
@@ -169,6 +175,10 @@ function lockGeolocationButton() {
             geoButton.setAttribute('title', _('Geolocation is already running.'));
         else
             geoButton.removeAttribute('title');
+    }
+    if (geoButtonNote) {
+        geoButtonNote.textContent = geolocationRunning() ? runningText() : '';
+        geoButtonNote.hidden = !geolocationRunning();
     }
 }
 
@@ -614,6 +624,9 @@ return view.extend({
             // LuCI returns a fragment with the button inside, not the button itself
             var node = renderButton.apply(this, arguments);
             geoButton = node.querySelector ? node.querySelector('button') : null;
+            geoButtonNote = E('span', { 'style': 'margin-left: 8px; opacity: 0.75;', 'hidden': '' });
+            if (geoButton)
+                node.appendChild(geoButtonNote);
             geoReadonly = !!((this.readonly != null) ? this.readonly : this.map.readonly);
             lockGeolocationButton();
             return node;
