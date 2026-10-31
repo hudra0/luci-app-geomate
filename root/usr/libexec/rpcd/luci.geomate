@@ -368,6 +368,44 @@ local function allowed_ip_list(s)
     return tokens
 end
 
+-- Blocked IPs of a filter section as the backend merges them (filter_set_entries): the entries
+-- of list blocked_ip, where a hand-written 'option blocked_ip' blocks nothing as with
+-- allowed_ip, and the older comma-separated option blocked_ips (read with config_get, so also
+-- a hand-written list), split at whitespace and commas
+local function blocked_ip_list(s)
+    local tokens = {}
+    local legacy = s.blocked_ips
+    for _, entries in ipairs({ type(s.blocked_ip) == "table" and s.blocked_ip or {},
+            type(legacy) == "table" and legacy or { legacy } }) do
+        for _, entry in ipairs(entries) do
+            for token in tostring(entry):gmatch("[^%s,]+") do
+                table.insert(tokens, token)
+            end
+        end
+    end
+    return tokens
+end
+
+-- Feature tokens of the installed backend: '/etc/geomate.sh capabilities' prints one line of
+-- space-separated tokens (fixed command, no input). An older geomate.sh prints its usage and
+-- exits 1; any line that is not lowercase tokens counts as no capabilities. Tokens are only
+-- added, never renamed. src_ip_multi: Source IP takes several entries and exceptions;
+-- blocked_ip: blocked IPs win over the regions
+local function backend_capabilities()
+    local caps = {}
+    local handle = io.popen("/etc/geomate.sh capabilities 2>/dev/null")
+    if handle then
+        local line = handle:read("*l")
+        handle:close()
+        if line and line:match("^[%l%d_ ]*$") then
+            for token in line:gmatch("[%l%d_]+") do
+                table.insert(caps, token)
+            end
+        end
+    end
+    return caps
+end
+
 -- Servers the enabled filters see right now (_ui_dynamic), one entry per IP:
 -- { ip, filter = <section>, allowed = true (in _allowed), false (in _blocked) or nil }.
 -- nil means untracked: not geolocated yet, or the filter has no circles. _allowed wins because
@@ -439,6 +477,10 @@ end
 -- filter's own allowed_ip, as an address or inside a prefix or range. The set has to agree:
 -- nft rejects the whole allowed_ip batch for one '!' entry, and a saved change counts only
 -- after the next service start.
+-- is_blocked_ip, only when true: the IP is in _blocked, not in _allowed, and in the filter's
+-- own blocked IPs (blocked_ip_list), and the backend reports blocked_ip. An older backend puts
+-- a blocked IP inside a region in _allowed and ignores list blocked_ip: none of its servers
+-- is blacklisted. The backend is asked only for a row that needs it.
 -- with_counters (the page asks for them when the backend reports set_counters): packets and
 -- bytes the kernel counted for the server in the filter's _dynamic set, since its first packet
 -- after the last service start or after an hour without one. Left out when the set has none,
@@ -455,10 +497,10 @@ local function get_all_connections(with_counters)
     end
     local changed = lookup_geo(wanted)
 
-    local connections, whitelists = {}, {}
+    local connections, whitelists, blocklists, blocks_ips = {}, {}, {}, nil
     for _, e in ipairs(entries) do
         local s = e.filter
-        local whitelisted = false
+        local whitelisted, blacklisted = false, false
         if e.allowed == true then
             local whitelist = whitelists[s['.name']]
             if not whitelist then
@@ -469,6 +511,21 @@ local function get_all_connections(with_counters)
                 whitelists[s['.name']] = whitelist
             end
             whitelisted = set_has(whitelist, e.ip)
+        elseif e.allowed == false then
+            local blocklist = blocklists[s['.name']]
+            if not blocklist then
+                blocklist = new_set()
+                for _, entry in ipairs(blocked_ip_list(s)) do
+                    add_element(blocklist, entry)
+                end
+                blocklists[s['.name']] = blocklist
+            end
+            if set_has(blocklist, e.ip) then
+                if blocks_ips == nil then
+                    blocks_ips = table_contains(backend_capabilities(), "blocked_ip")
+                end
+                blacklisted = blocks_ips
+            end
         end
 
         -- No position for an untracked server: older map.html versions draw a connection
@@ -480,7 +537,7 @@ local function get_all_connections(with_counters)
             packets, bytes = element_counter(listing, e.ip)
         end
 
-        table.insert(connections, {
+        local row = {
             src = "unknown",
             dst = e.ip,
             protocol = "unknown",
@@ -493,7 +550,13 @@ local function get_all_connections(with_counters)
             is_allowed_ip = whitelisted,
             packets = packets,
             bytes = bytes
-        })
+        }
+        -- Added afterwards: a row without it is the same table as before, so a reply without
+        -- blacklisted servers stays byte for byte the same
+        if blacklisted then
+            row.is_blocked_ip = true
+        end
+        table.insert(connections, row)
     end
 
     if changed then
@@ -697,25 +760,6 @@ function table_contains(tbl, element)
         end
     end
     return false
-end
-
--- Feature tokens of the installed backend: '/etc/geomate.sh capabilities' prints one line of
--- space-separated tokens (fixed command, no input). An older geomate.sh prints its usage and
--- exits 1; any line that is not lowercase tokens counts as no capabilities. Tokens are only
--- added, never renamed. src_ip_multi: Source IP takes several entries and exceptions
-local function backend_capabilities()
-    local caps = {}
-    local handle = io.popen("/etc/geomate.sh capabilities 2>/dev/null")
-    if handle then
-        local line = handle:read("*l")
-        handle:close()
-        if line and line:match("^[%l%d_ ]*$") then
-            for token in line:gmatch("[%l%d_]+") do
-                table.insert(caps, token)
-            end
-        end
-    end
-    return caps
 end
 
 -- A version marker as the updater stamps it: 'dev', a release such as 1.2.0 or a commit hash
