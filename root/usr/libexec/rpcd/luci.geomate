@@ -1043,7 +1043,8 @@ local function run_health_check()
 end
 
 -- A full geolocation run (manual or daily) holds this lock: its PID on line 1 and, if the
--- backend writes it, its start time (Unix time) on line 2. Older backends create it empty
+-- backend writes it, its start time (Unix time) on line 2. Read only with the backend token
+-- geolocate_status: older backends create it empty and delete it when the first run ends
 local GEOLOCATION_LOCK = "/tmp/geomate/geolocation.lock"
 
 -- Whether a full geolocation run is going on: true plus its start time while the PID of the
@@ -1185,8 +1186,14 @@ local methods = {
             -- The Geo Filters page offers several Source IP entries only with src_ip_multi
             data.capabilities = backend_capabilities()
             
-            -- A full geolocation run from the lock. No fields while unknown (older backend)
-            local running, started = geolocation_run()
+            -- A full geolocation run from the lock. No fields while unknown: a backend without
+            -- geolocate_status keeps no PID lock, so a missing lock tells nothing about a run
+            local running, started
+            for _, token in ipairs(data.capabilities) do
+                if token == "geolocate_status" then
+                    running, started = geolocation_run()
+                end
+            end
             if running ~= nil then
                 data.geolocation_running = running
                 if running and started then

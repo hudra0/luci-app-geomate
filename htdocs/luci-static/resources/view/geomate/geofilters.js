@@ -44,8 +44,10 @@ var geoStats = null;
 var GEOLOCATION_POLL = 10;
 
 // The Geolocation Status widget (its node as rendered last and the function that builds its
-// content), the Manual Geolocation button as rendered last, and the next status request
-var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoTimer = null, geoChecking = false;
+// content), the Manual Geolocation button as rendered last and whether the form is read-only,
+// the next status request, and the replies in a row without the running field during a watch
+var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoReadonly = false;
+var geoTimer = null, geoChecking = false, geoUnknown = 0;
 
 // Source IP suggestions and host names (hostChoices), loaded with the page
 var hosts = { keys: [], labels: {}, names: {} };
@@ -147,16 +149,22 @@ function runningLine() {
             : _('Running') ]);
 }
 
+// The status section's content: the running line (if any) on top of the regular status
+function geolocationStatusContent() {
+    return [ runningLine(), geoStatusContent() ].filter(Boolean);
+}
+
 // Puts geoStats into the status section and locks the Manual Geolocation button during a run
 function showGeolocationStatus() {
     if (geoStatusNode && geoStatusContent)
-        dom.content(geoStatusNode, [ runningLine(), geoStatusContent() ]);
+        dom.content(geoStatusNode, geolocationStatusContent());
     lockGeolocationButton();
 }
 
+// A read-only session keeps its button disabled when no run is going
 function lockGeolocationButton() {
     if (geoButton) {
-        geoButton.disabled = geolocationRunning();
+        geoButton.disabled = geolocationRunning() || geoReadonly;
         if (geolocationRunning())
             geoButton.setAttribute('title', _('Geolocation is already running.'));
         else
@@ -179,6 +187,18 @@ function checkGeolocation() {
 
     geoChecking = true;
     callGetGeolocationStatus().then(function(stats) {
+        stats = stats || {};
+
+        // A lock without its PID yet (the moment a run takes it) reads as unknown: during a
+        // watch on a backend with geolocate_status the run counts as going for a few replies
+        var caps = Array.isArray(stats.capabilities) ? stats.capabilities : [];
+        if (stats.geolocation_running == null && geolocationRunning()
+                && caps.indexOf('geolocate_status') > -1 && ++geoUnknown <= 3)
+            stats = Object.assign({}, stats, { geolocation_running: true,
+                geolocation_running_for: geoStats.geolocation_running_for });
+        else
+            geoUnknown = 0;
+
         geoStats = stats;
         showGeolocationStatus();
         if (stats.geolocation_running === false)
@@ -544,7 +564,7 @@ return view.extend({
         // A running full geolocation goes on top; status requests during a run update the widget
         geoStatusContent = o.renderWidget;
         o.renderWidget = function() {
-            geoStatusNode = E('div', {}, [ runningLine(), geoStatusContent() ]);
+            geoStatusNode = E('div', {}, geolocationStatusContent());
             return geoStatusNode;
         };
 
@@ -591,9 +611,12 @@ return view.extend({
         o.inputstyle = 'action';
         var renderButton = o.renderWidget;
         o.renderWidget = function(/* section_id, option_index, cfgvalue */) {
-            geoButton = renderButton.apply(this, arguments);
+            // LuCI returns a fragment with the button inside, not the button itself
+            var node = renderButton.apply(this, arguments);
+            geoButton = node.querySelector ? node.querySelector('button') : null;
+            geoReadonly = !!((this.readonly != null) ? this.readonly : this.map.readonly);
             lockGeolocationButton();
-            return geoButton;
+            return node;
         };
         o.onclick = function(ev) {
             return ui.showModal(_('Manual Geolocation'), [
