@@ -98,7 +98,7 @@
         .gm-popup-ip { font-weight: 700; font-variant-numeric: tabular-nums; }
         .gm-popup-status { margin: 2px 0 6px; font-weight: 600; }
         .gm-popup-status--allowed { color: var(--gm-success); }
-        .gm-popup-status--blocked { color: var(--gm-danger); }
+        .gm-popup-status--blocked, .gm-popup-status--blacklist { color: var(--gm-danger); }
         .gm-popup-status--ip { color: var(--gm-accent); }
         .gm-popup-fields { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; margin: 0; }
         .gm-popup-fields dt { color: var(--gm-muted); }
@@ -672,11 +672,13 @@
             className: 'custom-div-icon'
         });
 
-        // Marker icon and popup status per kind of connection (connectionKind)
+        // Marker icon and popup status per kind of connection (connectionKind). A blacklisted
+        // server has the blocked marker and counts as blocked in a cluster
         var CONNECTION_KINDS = {
             ip: { icon: allowedIPIcon, status: 'Whitelisted' },
             allowed: { icon: allowedConnectionIcon, status: 'Allowed' },
-            blocked: { icon: blockedDivIcon, status: 'Blocked' }
+            blocked: { icon: blockedDivIcon, status: 'Blocked' },
+            blacklist: { icon: blockedDivIcon, status: 'Blacklisted' }
         };
 
         // dst -> marker of a connection shown on the map; marker.gm = { kind, key }
@@ -773,9 +775,10 @@
             });
         }
 
-        // Whitelisted IPs (allowed_ip) arrive with is_allowed_ip
+        // Whitelisted IPs (allowed_ip) arrive with is_allowed_ip, blacklisted ones (blocked_ip)
+        // with is_blocked_ip
         function connectionKind(conn) {
-            return conn.is_allowed_ip ? 'ip' : conn.allowed ? 'allowed' : 'blocked';
+            return conn.is_allowed_ip ? 'ip' : conn.allowed ? 'allowed' : conn.is_blocked_ip === true ? 'blacklist' : 'blocked';
         }
 
         // A text field of the geo lookup, or '' when luci.geomate sent none (older backend or cache)

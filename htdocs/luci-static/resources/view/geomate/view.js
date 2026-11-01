@@ -265,14 +265,17 @@ function textOn(color) {
 
 // Status of a connection for the table: [ sort key, label, tooltip ]. luci.geomate takes
 // 'allowed' from the filter's nft sets: true in _allowed, false in _blocked, missing when the
-// server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs.
-// A row the map cannot show gets the tooltip of notOnMapNote, unless it is a past row (offMap): the
-// map never shows those. An untracked row has its own tooltip
+// server is in neither (untracked); is_allowed_ip: in _allowed and in the filter's own allowed IPs;
+// is_blocked_ip: in _blocked and in the filter's own blocked IPs, from a backend that reports
+// blocked_ip. A row the map cannot show gets the tooltip of notOnMapNote, unless it is a past row
+// (offMap): the map never shows those. Untracked and blacklisted rows have their own tooltip
 function connectionStatus(conn, offMap) {
     var note = (offMap || hasPosition(conn.geo)) ? null : notOnMapNote();
 
     if (conn.is_allowed_ip)
         return [ 'whitelist', _('Whitelisted'), note ];
+    if (conn.allowed === false && conn.is_blocked_ip === true)
+        return [ 'blacklist', _('Blacklisted'), blacklistedNote(conn.filter_name, note) ];
     if (conn.allowed === true)
         return [ 'allowed', _('Allowed'), note ];
     if (conn.allowed === false)
@@ -334,6 +337,18 @@ function untrackedNote(filterName) {
     return _('Not geolocated yet.') + ' ' + effect + ' ' + next;
 }
 
+// Tooltip of a blacklisted server: the list it is in and, in monitor mode, that nothing is
+// blocked, then the note of a server without a position (notOnMapNote), if any
+function blacklistedNote(filterName, note) {
+    var text = [ _('In the blocked IPs of %s.').format(filterName) ];
+
+    if ((uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor')
+        text.push(_('Monitor mode blocks nothing.'));
+    if (note)
+        text.push(note);
+    return text.join(' ');
+}
+
 // A table cell as an element: ui.Table puts a plain string in as HTML. Missing values show '–'
 function textCell(value, title) {
     var text = (typeof value == 'string' && value !== '') ? value : '–';
@@ -367,24 +382,36 @@ function sidByName(name) {
     return (found.length === 1) ? found[0]['.name'] : null;
 }
 
-// The allowed IPs of a filter as the service reads them: list entries only. A hand-written
-// 'option allowed_ip' (a string) allows nothing, like 'option allowed_region' (regionList)
-function allowedIpList(sid) {
-    var v = uci.get('geomate', sid, 'allowed_ip');
+// The allowed or blocked IPs of a filter (option 'allowed_ip' or 'blocked_ip') as the service
+// reads them: list entries only. A hand-written option (a string) allows or blocks nothing,
+// like 'option allowed_region' (regionList)
+function ipList(sid, option) {
+    var v = uci.get('geomate', sid, option);
     return Array.isArray(v) ? v : [];
 }
 
-// The filter's own allowed IPs list this exact address; a prefix or range around it does not count
-function filterAllowsIp(sid, ip) {
-    return allowedIpList(sid).indexOf(ip) > -1;
+// The filter's own list has this exact address as an entry; a prefix or range around it does
+// not count
+function filterListsIp(sid, option, ip) {
+    return ipList(sid, option).indexOf(ip) > -1;
 }
 
-// The allowed IPs of a filter split at whitespace and commas, as luci.geomate (allowed_ip_list)
-// and the backend read them: the entry '1.2.3.4 5.6.7.8' allows both addresses
-function allowedIpTokens(sid) {
-    return allowedIpList(sid).reduce(function(tokens, entry) {
+// Entries split at whitespace and commas, as luci.geomate (allowed_ip_list, blocked_ip_list) and
+// the backend read them: the entry '1.2.3.4 5.6.7.8' allows or blocks both addresses
+function entryTokens(entries) {
+    return entries.reduce(function(tokens, entry) {
         return tokens.concat(String(entry).split(/[\s,]+/).filter(function(t) { return t !== ''; }));
     }, []);
+}
+
+function ipTokens(sid, option) {
+    return entryTokens(ipList(sid, option));
+}
+
+// The older option blocked_ips of a filter, comma-separated, which the service adds to its list
+// blocked_ip; also a hand-written list
+function legacyBlockedTokens(sid) {
+    return entryTokens(L.toArray(uci.get('geomate', sid, 'blocked_ips')));
 }
 
 // An IPv4 address as a number, null for anything else
@@ -392,13 +419,13 @@ function ipNumber(ip) {
     return validIPv4(ip) ? ip.split('.').reduce(function(n, o) { return n * 256 + +o; }, 0) : null;
 }
 
-// A prefix (a.b.c.d/nn) or range (a.b.c.d-e.f.g.h) of the filter's allowed IPs covers the
+// A prefix (a.b.c.d/nn) or range (a.b.c.d-e.f.g.h) of these tokens (entryTokens) covers the
 // address. Read like add_element in luci.geomate; other entries count as nothing, also one with
 // a leading zero in an octet or the prefix length
-function rangeAllowsIp(sid, ip) {
+function rangeCoversIp(tokens, ip) {
     var n = ipNumber(ip);
 
-    return n != null && allowedIpTokens(sid).some(function(entry) {
+    return n != null && tokens.some(function(entry) {
         var m = /^([\d.]+)\/(0|[1-9]\d*)$/.exec(entry), lo, hi, size;
 
         if (m) {
@@ -624,10 +651,11 @@ function recentKey(conn) {
 
 // The recent list sessionStorage holds for this tab, as { key: { conn, lastSeen, restored,
 // traffic } }. Stored are only dst, filter_name, lastSeen, the geo text and, from newer views
-// (saveRecent), the verdict (allowed, is_allowed_ip) and the packets and bytes in total. An entry
-// of another form is left out, a broken value gives an empty list, a broken verdict or count is
-// ignored. Of two entries for one address the newer counts. An entry without a verdict is
-// restored: the table shows it as unknown until a reply has the server again. Stored counters
+// (saveRecent), the verdict (allowed, is_allowed_ip, is_blocked_ip only when true) and the
+// packets and bytes in total. An entry of another form is left out, a broken value gives an
+// empty list, a broken verdict or count is ignored. Of two entries for one address the newer
+// counts. An entry without a verdict is restored: the table shows it as unknown until a reply
+// has the server again. Stored counters
 // show as a past row's total; they have no samples, so a reply with the server starts the rate
 // over (recordRecent: an entry read back has no run)
 function readRecent() {
@@ -654,6 +682,8 @@ function readRecent() {
         if ((item.allowed === null || typeof item.allowed == 'boolean') && typeof item.is_allowed_ip == 'boolean') {
             conn.allowed = item.allowed;
             conn.is_allowed_ip = item.is_allowed_ip;
+            if (item.is_blocked_ip === true)
+                conn.is_blocked_ip = true;
             entry.restored = false;
         }
         if (isCount(item.packets) && isCount(item.bytes))
@@ -665,15 +695,24 @@ function readRecent() {
 
 // Status of a row the last reply no longer has (entry e of the recent list), or of a live row while
 // the list is old (e.live): the verdict of the last reply that had it, also when read back from
-// sessionStorage; none for a restored entry (readRecent). An Allow or Remove since then wins:
-// action (connectionAction) comes from the configuration, and no reply brings the new verdict
+// sessionStorage; none for a restored entry (readRecent). An Allow, Remove, Block or Unblock since
+// then wins: action (connectionAction) comes from the configuration, and no reply brings the new
+// verdict. The allowed IPs come first, as in the service: an action of the blocked IPs means the
+// allowed IPs no longer cover the server
 function pastStatus(e, action) {
-    var whitelisted = !e.restored && !!e.conn.is_allowed_ip;
+    var whitelisted = !e.restored && !!e.conn.is_allowed_ip,
+        blacklisted = !e.restored && e.conn.is_blocked_ip === true && e.conn.allowed === false,
+        allowListed = [ 'remove', 'entry', 'range' ].indexOf(action) > -1,
+        blockListed = [ 'unblock', 'blocked-entry', 'blocked-range', 'blocked-option' ].indexOf(action) > -1;
 
     if (action === 'remove' && !whitelisted)
         return [ 'whitelist', _('Whitelisted'), null ];
-    if (action === 'allow' && whitelisted && sidByName(e.conn.filter_name))
+    if (blockListed && !blacklisted)
+        return [ 'blacklist', _('Blacklisted'), blacklistedNote(e.conn.filter_name, null) ];
+    if (action && !allowListed && whitelisted && sidByName(e.conn.filter_name))
         return [ 'unknown', _('Unknown'), _('Removed from the allowed IPs since last seen.') ];
+    if (action === 'allow-block' && blacklisted && sidByName(e.conn.filter_name))
+        return [ 'unknown', _('Unknown'), _('Removed from the blocked IPs since last seen.') ];
     if (e.restored)
         return [ 'unknown', _('Unknown'), _('Seen before the page was loaded.') ];
     return connectionStatus(e.conn, !e.live);
@@ -962,7 +1001,8 @@ return view.extend({
     versionBusy: null,      // running check_version request
     versionInstalled: null, // installed versions (installedKey) for which a check was last started
     connectionsTable: null, // ui.Table of the active connections
-    connectionsActions: false,  // the table has the Allow/Remove column (write access at render)
+    connectionsActions: false,  // the table has the Allow/Block column (write access at render)
+    blocksIps: false,       // the backend applies blocked IPs (blocked_ip), as the last status reply said
     connectionsKey: null,   // rows of the last table update, as JSON
     recent: null,           // servers of recent replies: { 'filter\0ip': { conn, lastSeen, restored, firstSeen, traffic, run } }
     recentSaved: null,      // recent list as last written to sessionStorage, as JSON
@@ -1709,7 +1749,7 @@ return view.extend({
             #active-connections-container .gm-sticky-fill thead th { background-color: var(--gm-sticky-bg); }
             /* Pills and theme colors: renderStatus */
             .gm-status--allowed { --gm-status-color: var(--gm-success); }
-            .gm-status--blocked { --gm-status-color: var(--gm-danger); }
+            .gm-status--blocked, .gm-status--blacklist { --gm-status-color: var(--gm-danger); }
             .gm-status--whitelist { --gm-status-color: var(--gm-primary); }
             .gm-status--untracked, .gm-status--unknown { --gm-status-color: #8c959f; }
             #active-connections-container .gm-seen, #active-connections-container .gm-traffic { white-space: nowrap; }
@@ -1719,6 +1759,10 @@ return view.extend({
                Text never below 11px: Material's tables are 11.2px below 1367 px */
             #geomate-connections .td, #geomate-connections .th { padding: 5px 10px; vertical-align: middle; }
             #geomate-connections .td .cbi-button { padding: 1px 10px; line-height: 1.5; height: auto; min-height: 0; font-size: max(90%, 11px); }
+            /* Allow and Block side by side, spaced the same in every theme: the themes give the
+               buttons in a box of an action cell their own margins and widths */
+            #geomate-connections .gm-actions { display: inline-flex; gap: 4px; margin: 0; white-space: nowrap; }
+            #geomate-connections .gm-actions > .cbi-button { flex: none; margin: 0; }
             #geomate-connections .gm-status { line-height: 1.4; }
             /* OpenWrt2020 fades a stacked cell at 40% of its width (up to 800 px), where its own
                padding started the text; with the compact padding the fade would cover the text */
@@ -1763,10 +1807,10 @@ return view.extend({
         `);
 
         // Sortable columns; the theme styles the table like every LuCI table. With write access a
-        // last column without a title holds Allow/Remove, like the action column of LuCI tables.
-        // Last seen and Traffic come after the earlier columns: LuCI stores the sorted column by its
-        // index (COLUMN_*). A class per column for the card layout and the table's wrapping; LuCI
-        // also gives the first one to the placeholder
+        // last column without a title holds Allow and Block, Remove or Unblock, like the action
+        // column of LuCI tables. Last seen and Traffic come after the earlier columns: LuCI stores
+        // the sorted column by its index (COLUMN_*). A class per column for the card layout and the
+        // table's wrapping; LuCI also gives the first one to the placeholder
         var captions = [ _('IP'), _('Filter'), _('Status'), _('Country'), _('City'), _('ISP'), _('Last seen'), _('Traffic') ],
             columns = [ 'ip', 'filter', 'status', 'country', 'city', 'isp', 'seen', 'traffic' ],
             options = {
@@ -2147,9 +2191,14 @@ return view.extend({
                 // A failed request keeps the last answer, so the counters do not start over. Another
                 // PID: Geomate was restarted and built its sets again, every count starts from 0
                 if (r[0]) {
-                    var pid = r[0].pid || null;
+                    var pid = r[0].pid || null, blocks = hasCapability(r[0], 'blocked_ip');
 
                     self.withCounters = hasCapability(r[0], 'set_counters');
+                    // The table offers Block and Unblock from now on, or no longer
+                    if (blocks !== self.blocksIps) {
+                        self.blocksIps = blocks;
+                        self.updateActiveConnectionsList();
+                    }
                     if (self.backendPid !== undefined && pid !== self.backendPid)
                         self.backendRuns++;
                     self.backendPid = pid;
@@ -2166,12 +2215,19 @@ return view.extend({
     },
 
     // One request at a time: a direct call while the poll's request runs shares it. Counters only
-    // once a status reply said the backend has them: the first request of the page goes without
+    // once a status reply said the backend has them: the first request of the page goes without.
+    // Its reply waits for the first status reply, which decides about Block (blocksIps): a table
+    // drawn before it would be drawn again at once
     pollConnections: function() {
         var self = this;
+        var afterStatus = function(list) {
+            var done = function() { return list; };
+
+            return (!self.statusLoaded && self.statusBusy) ? self.statusBusy.then(done, done) : list;
+        };
 
         if (!this.connectionsBusy)
-            this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(function(list) {
+            this.connectionsBusy = L.resolveDefault(callGeomateConnections(this.withCounters), null).then(afterStatus).then(function(list) {
                 var failed = self.connectionsFailed;
 
                 self.connectionsFailed = list ? 0 : failed + 1;
@@ -2262,9 +2318,9 @@ return view.extend({
     // Keep the recent list in sessionStorage for this tab (readRecent): at most every
     // RECENT_SAVE_INTERVAL, and whenever the page is hidden or left (force). Only a convenience:
     // a failed write changes nothing on the page. With the verdict of the last reply that had the
-    // server (allowed: true, false or null for untracked, as connectionStatus reads it; none for
-    // a restored entry or another value) and its packets and bytes in total, if known. Older
-    // views read only the first four fields
+    // server (allowed: true, false or null for untracked, as connectionStatus reads it, and
+    // is_blocked_ip only when true; none for a restored entry or another value) and its packets
+    // and bytes in total, if known. Older views read only the fields they know
     saveRecent: function(force) {
         var now = Date.now(), recent = this.recent, text;
 
@@ -2278,6 +2334,8 @@ return view.extend({
             if (!e.restored && (c.allowed == null || typeof c.allowed == 'boolean')) {
                 item.allowed = (c.allowed == null) ? null : c.allowed;
                 item.is_allowed_ip = !!c.is_allowed_ip;
+                if (c.is_blocked_ip === true)
+                    item.is_blocked_ip = true;
             }
             if (e.traffic) {
                 item.packets = e.traffic.packets;
@@ -2705,7 +2763,7 @@ return view.extend({
                 // The map's filters have not changed with the mode
                 if (!mode)
                     self.pushFilters();
-                // Undo of Allow or Remove: the table shows the other button again
+                // Undo of a table action: the table shows the buttons from before again
                 self.updateActiveConnectionsList();
                 self.refreshConnections();
                 if (mode)
@@ -3418,8 +3476,8 @@ return view.extend({
         }).map(function(key) { return recent[key]; }).sort(function(a, b) { return b.lastSeen - a.lastSeen; });
 
         // While the status row says the list is old, its rows show the age of the last reply and,
-        // like past rows, an Allow or Remove since then (pastStatus). rec: the entry of the recent
-        // list, with the counters
+        // like past rows, an Allow, Remove, Block or Unblock since then (pastStatus). rec: the entry
+        // of the recent list, with the counters
         var liveSeen = (this.connectionsFailed >= CONNECTIONS_STALE_AFTER) ? this.connectionsAt : null;
         var all = list.map(function(conn) {
             return { conn: conn, lastSeen: liveSeen, live: true, rec: recent[recentKey(conn)] };
@@ -3498,52 +3556,93 @@ return view.extend({
         this.showSortChoice();
     },
 
-    // Button of a table row, from the configuration as loaded: 'remove' when the filter's own
-    // allowed IPs list the address as an entry of its own, 'entry' (no button) when a longer
-    // entry such as '1.2.3.4 5.6.7.8' lists it, 'range' (no button) when only a prefix or range
-    // of them covers it, else 'allow'. null without write access. Not from the poll's
-    // is_allowed_ip: right after an action that is still the old verdict. A filter name that is
-    // not unique gets 'allow', and the click says why nothing happens (setIpAllowed)
+    // Buttons of a table row, from the configuration as loaded. The allowed IPs come first, as in
+    // the service: 'remove' when the filter's own allowed IPs list the address as an entry of its
+    // own, 'entry' (no button) when a longer entry such as '1.2.3.4 5.6.7.8' lists it, 'range' (no
+    // button) when only a prefix or range of them covers it. Without a backend that applies
+    // blocked IPs (blocksIps) then 'allow'. With one: 'blocked-option' (no button) when the older
+    // option blocked_ips covers it, which the table never writes; 'unblock', 'blocked-entry' and
+    // 'blocked-range' as for the allowed IPs, else 'allow-block' (Allow and Block). null without
+    // write access. Not from the poll's is_allowed_ip or is_blocked_ip: right after an action that
+    // is still the old verdict. A filter name that is not unique gets 'allow' or 'allow-block', and
+    // the click says why nothing happens (setIpListed)
     connectionAction: function(conn) {
-        var sid;
+        var sid, ip = conn.dst, tokens;
 
-        if (!this.connectionsActions || this.readonly || !validIPv4(conn.dst))
+        if (!this.connectionsActions || this.readonly || !validIPv4(ip))
             return null;
         sid = sidByName(conn.filter_name);
-        if (sid && filterAllowsIp(sid, conn.dst))
+        if (sid && filterListsIp(sid, 'allowed_ip', ip))
             return 'remove';
-        if (sid && allowedIpTokens(sid).indexOf(conn.dst) > -1)
+        tokens = sid ? ipTokens(sid, 'allowed_ip') : [];
+        if (tokens.indexOf(ip) > -1)
             return 'entry';
-        return (sid && rangeAllowsIp(sid, conn.dst)) ? 'range' : 'allow';
+        if (rangeCoversIp(tokens, ip))
+            return 'range';
+        if (!this.blocksIps)
+            return 'allow';
+        tokens = sid ? legacyBlockedTokens(sid) : [];
+        if (tokens.indexOf(ip) > -1 || rangeCoversIp(tokens, ip))
+            return 'blocked-option';
+        if (sid && filterListsIp(sid, 'blocked_ip', ip))
+            return 'unblock';
+        tokens = sid ? ipTokens(sid, 'blocked_ip') : [];
+        if (tokens.indexOf(ip) > -1)
+            return 'blocked-entry';
+        return rangeCoversIp(tokens, ip) ? 'blocked-range' : 'allow-block';
     },
 
+    // The cell of connectionAction: one or two buttons, or '–' with a tooltip. Two buttons sit in
+    // a box of their own, so a theme's rules for the buttons of an action cell do not space them
     renderConnectionAction: function(r) {
-        if (r.action === 'entry')
+        var self = this;
+        var button = function(option, add) {
+            var allowed = option === 'allowed_ip';
+
+            return E('button', {
+                'class': 'btn cbi-button ' + ((allowed === add) ? 'cbi-button-positive' : 'cbi-button-negative'),
+                'title': (allowed
+                    ? (add ? _('Add %s to the allowed IPs of %s') : _('Remove %s from the allowed IPs of %s'))
+                    : (add ? _('Add %s to the blocked IPs of %s') : _('Remove %s from the blocked IPs of %s'))).format(r.ip, r.filter),
+                'click': ui.createHandlerFn(self, 'setIpListed', option, r.filter, r.ip, add)
+            }, [ allowed ? (add ? _('Allow') : _('Remove')) : (add ? _('Block') : _('Unblock')) ]);
+        };
+
+        switch (r.action) {
+        case 'entry':
             return textCell('', _('Part of a longer allowed IP entry. Edit it on the Geo Filters page.'));
-        if (r.action === 'range')
+        case 'range':
             return textCell('', _('In an allowed IP range. Edit it on the Geo Filters page.'));
-        if (r.action !== 'allow' && r.action !== 'remove')
-            return '';
-
-        var allow = r.action === 'allow';
-
-        return E('button', {
-            'class': 'btn cbi-button ' + (allow ? 'cbi-button-positive' : 'cbi-button-negative'),
-            'title': (allow ? _('Add %s to the allowed IPs of %s') : _('Remove %s from the allowed IPs of %s')).format(r.ip, r.filter),
-            'click': ui.createHandlerFn(this, 'setIpAllowed', r.filter, r.ip, allow)
-        }, [ allow ? _('Allow') : _('Remove') ]);
+        case 'blocked-entry':
+            return textCell('', _('Part of a longer blocked IP entry. Edit it on the Geo Filters page.'));
+        case 'blocked-range':
+            return textCell('', _('In a blocked IP range. Edit it on the Geo Filters page.'));
+        case 'blocked-option':
+            return textCell('', _('Blocked by "option blocked_ips" of the filter. Edit it in /etc/config/geomate.'));
+        case 'allow':
+            return button('allowed_ip', true);
+        case 'remove':
+            return button('allowed_ip', false);
+        case 'unblock':
+            return button('blocked_ip', false);
+        case 'allow-block':
+            return E('div', { 'class': 'gm-actions' }, [ button('allowed_ip', true), button('blocked_ip', true) ]);
+        }
+        return '';
     },
 
     /**
-     * Add a server IP to the allowed IPs of a filter or remove it (table button), and apply that
-     * like a map change: 'Applied.' with Undo in the map toast. Refusals show as notifications.
-     * Without B1 (backend) the commit restarts geomate instead of reloading the filter's sets.
+     * Add a server IP to the allowed or blocked IPs of a filter or remove it (table buttons), and
+     * apply that like a map change: 'Applied.' with Undo in the map toast. Refusals show as
+     * notifications. A backend without the live reload of the list (B1 for allowed IPs,
+     * blocked_ip for blocked IPs) restarts geomate instead of reloading the filter's sets.
+     * @param {string} option - 'allowed_ip' or 'blocked_ip'.
      * @param {string} name - The filter name of the row.
      * @param {string} ip - The server address of the row.
-     * @param {boolean} allow - true: add the address, false: remove it.
+     * @param {boolean} add - true: add the address, false: remove it.
      */
-    setIpAllowed: function(name, ip, allow) {
-        var self = this;
+    setIpListed: function(option, name, ip, add) {
+        var self = this, allowed = option === 'allowed_ip';
 
         if (!validIPv4(ip)) {
             notify(_('Invalid IP address %s.').format(ip));
@@ -3552,7 +3651,7 @@ return view.extend({
 
         return this.enqueue(null, null, function() {
             // The configuration was loaded again: look the filter up once more
-            var sid = sidByName(name), before, list;
+            var sid = sidByName(name), before, list, allowTokens;
 
             if (!sid)
                 return notify(uci.sections('geomate', 'geo_filter').some(function(s) { return s.name === name; })
@@ -3560,27 +3659,40 @@ return view.extend({
                     : _('Filter %s not found.').format(name));
 
             // The service ignores a hand-written option; never turn it into a list here
-            if (typeof uci.get('geomate', sid, 'allowed_ip') == 'string')
-                return notify(_('Filter %s has "option allowed_ip". Edit it on the Geo Filters page.').format(name));
+            if (typeof uci.get('geomate', sid, option) == 'string')
+                return notify((allowed ? _('Filter %s has "option allowed_ip". Edit it on the Geo Filters page.')
+                    : _('Filter %s has "option blocked_ip". Edit it on the Geo Filters page.')).format(name));
 
             // Changed in another tab since the table showed the button
-            if (filterAllowsIp(sid, ip) === allow) {
-                notify((allow ? _('%s is already in the allowed IPs of %s.') : _('%s is not in the allowed IPs of %s.')).format(ip, name), 'info');
+            if (filterListsIp(sid, option, ip) === add) {
+                notify((allowed
+                    ? (add ? _('%s is already in the allowed IPs of %s.') : _('%s is not in the allowed IPs of %s.'))
+                    : (add ? _('%s is already in the blocked IPs of %s.') : _('%s is not in the blocked IPs of %s.'))).format(ip, name), 'info');
+                return self.updateActiveConnectionsList();
+            }
+
+            // The allowed IPs win over the blocked ones: a block would change nothing
+            allowTokens = ipTokens(sid, 'allowed_ip');
+            if (!allowed && add && (allowTokens.indexOf(ip) > -1 || rangeCoversIp(allowTokens, ip))) {
+                notify(_('%s is in the allowed IPs of %s.').format(ip, name), 'info');
                 return self.updateActiveConnectionsList();
             }
 
             before = filterOptions(sid);
-            list = allowedIpList(sid).filter(function(entry) { return entry !== ip; });
-            if (allow)
+            list = ipList(sid, option).filter(function(entry) { return entry !== ip; });
+            if (add)
                 list.push(ip);
-            uci.set('geomate', sid, 'allowed_ip', list.length ? list : null);
+            uci.set('geomate', sid, option, list.length ? list : null);
 
             // As in checkRegion: commit only when the reloaded configuration holds the change
             return self.applyChange(function() {
-                if (uci.get('geomate', sid, 'name') !== name || filterAllowsIp(sid, ip) !== allow)
-                    throw failure(_('Could not save the allowed IPs of filter %s.').format(name));
+                if (uci.get('geomate', sid, 'name') !== name || filterListsIp(sid, option, ip) !== add)
+                    throw failure((allowed ? _('Could not save the allowed IPs of filter %s.')
+                        : _('Could not save the blocked IPs of filter %s.')).format(name));
             }).then(function() {
-                var text = (allow ? _('Added %s to the allowed IPs of %s.') : _('Removed %s from the allowed IPs of %s.')).format(ip, name);
+                var text = (allowed
+                    ? (add ? _('Added %s to the allowed IPs of %s.') : _('Removed %s from the allowed IPs of %s.'))
+                    : (add ? _('Blocked %s in %s.') : _('Unblocked %s in %s.'))).format(ip, name);
 
                 self.updateActiveConnectionsList();
                 self.refreshConnections();
