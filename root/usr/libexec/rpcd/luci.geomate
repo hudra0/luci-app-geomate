@@ -835,6 +835,19 @@ local function flow_offloading()
     return on
 end
 
+-- 'nft -t list table inet geomate': the table without set elements, about 1.5 KB where the full
+-- listing runs to hundreds of KB with large IP lists. '' without the table, nil if nft could not
+-- be started. Enough to tell whether the table exists and to count its sets
+local function nft_table_terse()
+    local handle = io.popen("nft -t list table inet geomate 2>/dev/null")
+    if not handle then
+        return nil
+    end
+    local result = handle:read("*a") or ""
+    handle:close()
+    return result
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -886,20 +899,16 @@ local function get_service_status()
     status.operational_mode = uci:get('geomate', 'global', 'operational_mode') or 'dynamic'
     status.debug_level = tonumber(uci:get('geomate', 'global', 'debug_level')) or 0
 
-    -- Check nftables status
-    local nft_check = io.popen("nft list table inet geomate 2>/dev/null")
-    if nft_check then
-        local result = nft_check:read("*a")
-        nft_check:close()
-        status.nft_active = (result ~= nil and result ~= "")
-    end
-
-    -- Count nft sets
-    local nft_sets = io.popen("nft list sets inet geomate 2>/dev/null | grep -c 'set geomate_'")
-    if nft_sets then
-        local count = nft_sets:read("*l")
-        nft_sets:close()
-        status.nft_sets_count = tonumber(count) or 0
+    -- Check nftables status and count the sets, as 'grep -c' counted the lines of the full
+    -- listing: one terse listing instead of two full ones
+    local nft_table = nft_table_terse()
+    if nft_table then
+        status.nft_active = (nft_table ~= "")
+        for line in nft_table:gmatch("[^\n]+") do
+            if line:find("set geomate_", 1, true) then
+                status.nft_sets_count = status.nft_sets_count + 1
+            end
+        end
     end
 
     -- Get filter information
@@ -1029,11 +1038,9 @@ local function run_health_check()
 
     -- Check 5: nftables table (only if service is enabled)
     if config_enabled then
-        local nft_check = io.popen("nft list table inet geomate 2>/dev/null")
-        if nft_check then
-            local result = nft_check:read("*a")
-            nft_check:close()
-            if result and result ~= "" then
+        local result = nft_table_terse()
+        if result then
+            if result ~= "" then
                 health.checks.nft = { status = "ok", message = "nftables table active" }
             else
                 health.checks.nft = { status = "error", message = "nftables table not active" }
