@@ -1086,6 +1086,41 @@ local function run_health_check()
     return health
 end
 
+-- A full geolocation run (manual or daily) holds this lock: its PID on line 1 and, if the
+-- backend writes it, its start time (Unix time) on line 2. Read only with the backend token
+-- geolocate_status: older backends create it empty and delete it when the first run ends
+local GEOLOCATION_LOCK = "/tmp/geomate/geolocation.lock"
+
+-- Whether a full geolocation run is going on: true plus its start time while the PID of the
+-- lock is alive and a geolocate.sh; false without a lock or with a stale one; nil (unknown)
+-- for a lock without PID, as older backends write it
+local function geolocation_run()
+    local f = io.open(GEOLOCATION_LOCK, "r")
+    if not f then
+        return false
+    end
+    local pid, started = f:read("*l"), f:read("*l")
+    f:close()
+    pid = pid and pid:match("^%s*(%d+)%s*$")
+    if not pid then
+        return nil
+    end
+    local proc = io.open("/proc/" .. pid .. "/cmdline", "r")
+    local cmdline = proc and proc:read("*a") or ""
+    if proc then
+        proc:close()
+    end
+    if not cmdline:find("geolocate.sh", 1, true) then
+        return false
+    end
+    started = tonumber(started and started:match("^%s*(%d+)%s*$"))
+    if not started then
+        local st = nixio.fs.stat(GEOLOCATION_LOCK)
+        started = st and st.mtime
+    end
+    return true, started
+end
+
 -- Main function of the RPC script
 local methods = {
     getGeomateConnections = {
@@ -1194,6 +1229,22 @@ local methods = {
             
             -- The Geo Filters page offers several Source IP entries only with src_ip_multi
             data.capabilities = backend_capabilities()
+            
+            -- A full geolocation run from the lock. No fields while unknown: a backend without
+            -- geolocate_status keeps no PID lock, so a missing lock tells nothing about a run
+            local running, started
+            for _, token in ipairs(data.capabilities) do
+                if token == "geolocate_status" then
+                    running, started = geolocation_run()
+                end
+            end
+            if running ~= nil then
+                data.geolocation_running = running
+                if running and started then
+                    data.geolocation_started = started
+                    data.geolocation_running_for = math.max(0, os.time() - started)
+                end
+            end
             
             return { status = data }
         end

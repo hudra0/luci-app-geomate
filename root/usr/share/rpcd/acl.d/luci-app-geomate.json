@@ -30,6 +30,7 @@
             "file": {
                 "/etc/init.d/geomate": [ "exec" ],
                 "/etc/geolocate.sh": [ "exec" ],
+                "/etc/geolocate.sh start": [ "exec" ],
                 "/etc/geomate.d/*": [ "write" ]
             }
         }
