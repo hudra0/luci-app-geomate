@@ -38,6 +38,13 @@ function validRegion(region) {
 // Filter names the backend supports in nft set and file names (filter_set_name in luci.geomate)
 var FILTER_NAME_RE = /^[\w .-]+$/;
 
+// Two filter names clash when their keys match: a space and '_' give the same nft set name, so
+// 'A B' and 'A_B' would share their sets, and names match without regard to case (same rule as
+// checkFilterName in geofilters.js)
+function filterKey(name) {
+    return String(name == null ? '' : name).toLowerCase().replace(/ /g, '_');
+}
+
 // Filter colors by section order, readable on the OSM tiles
 var PALETTE = ['#0072B2', '#E69F00', '#CC79A7', '#009E73', '#D55E00', '#56B4E9', '#7F4FBF', '#8C6D31'];
 
@@ -3065,10 +3072,11 @@ return view.extend({
         if (!validRegion(region))
             return Promise.reject(new Error(_('Invalid circle %s').format(region)));
 
-        // Existing filter names match without regard to case
+        // The existing filter whose name clashes with this one (filterKey): the region goes to it,
+        // so that no 'A_B' appears next to 'A B'
         var findFilter = function(name) {
-            name = name.toLowerCase();
-            return sections.find(function(s) { return s.name.toLowerCase() === name; }) || null;
+            name = filterKey(name);
+            return sections.find(function(s) { return filterKey(s.name) === name; }) || null;
         };
 
         // Every filter in config order, then 'New filter…'; without filters the name field shows at once
@@ -3380,14 +3388,14 @@ return view.extend({
     // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox.
     // The caller has loaded the configuration again after the dialog, sec is the dialog's copy:
     // its id may name another filter or none now (movedFilter), or a filter of the new name may
-    // exist (names match without regard to case, as in the dialog)
+    // exist (names match by filterKey, as in the dialog)
     saveRegion: function(token, region, name, sec, values, initial) {
         var self = this, sid, before = null;
 
         if (sec && uci.get('geomate', sec['.name'], 'name') !== sec.name)
             throw filtersChanged();
         if (!sec && uci.sections('geomate', 'geo_filter').some(function(s) {
-            return String(s.name || '').toLowerCase() === name.toLowerCase();
+            return s.name && filterKey(s.name) === filterKey(name);
         }))
             throw failure(_('Not applied: filter %s was created in the meantime.').format(name));
 

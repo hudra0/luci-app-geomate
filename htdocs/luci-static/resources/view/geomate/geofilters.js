@@ -53,6 +53,9 @@ var geoTimer = null, geoChecking = false, geoUnknown = 0;
 // Source IP suggestions and host names (hostChoices), loaded with the page
 var hosts = { keys: [], labels: {}, names: {} };
 
+// The router's own addresses (ownAddresses), loaded with the page; none without the permission
+var routerAddrs = {};
+
 // Staged changes of this LuCI session (uci changes): loaded with the page and again after every
 // save of the form. The backend sees only what Save & Apply has committed
 var pending = {};
@@ -77,8 +80,8 @@ var FILTER_NAME_RE = /^[\w .-]+$/;
 // name fails too. A name other than the saved one must not start or end with a space (the map
 // dialog and Create Empty List trim names, so they could not reach that filter) and must not
 // clash with the name of another filter (others): a space and '_' give the same nft set name,
-// so 'A B' and 'A_B' would share their sets, and the map's region dialog finds a filter by its
-// name without regard to case. Returns true or the error text
+// so 'A B' and 'A_B' would share their sets, and names match without regard to case (the map's
+// region dialog uses the same rule, filterKey in view.js). Returns true or the error text
 function checkFilterName(name, saved, others) {
     var key = function(n) { return String(n).toLowerCase().replace(/ /g, '_'); };
     var clash;
@@ -259,25 +262,32 @@ function checkGeolocation() {
     });
 }
 
-// Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
-// 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
-// 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
-// once. Returns { keys: the addresses in numeric order, labels: { address: node }, names:
-// { address: host name } }; a label is a node, because LuCI puts a string label in as HTML
-// (same function in view.js)
-function hostChoices(hints, devices) {
-    var own = {}, text = {}, names = {}, labels = {}, keys;
+// The router's own IPv4 addresses on every interface, WAN included, from luci-rpc
+// getNetworkDevices, which lists each address as { address, netmask, ... }. Returns
+// { address: true }, empty for a reply that is no object (a session without the permission)
+function ownAddresses(devices) {
+    var own = {};
 
-    hints = L.isObject(hints) ? hints : {};
     devices = L.isObject(devices) ? devices : {};
-
-    // getNetworkDevices lists each address as { address, netmask, ... }
     Object.keys(devices).forEach(function(dev) {
         L.toArray(L.isObject(devices[dev]) ? devices[dev].ipaddrs : null).forEach(function(a) {
             if (L.isObject(a) && typeof a.address == 'string')
                 own[a.address] = true;
         });
     });
+    return own;
+}
+
+// Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
+// 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (ownAddresses) and
+// 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
+// once. Returns { keys: the addresses in numeric order, labels: { address: node }, names:
+// { address: host name } }; a label is a node, because LuCI puts a string label in as HTML
+// (same function in view.js, which reads the router's addresses inline)
+function hostChoices(hints, devices) {
+    var own = ownAddresses(devices), text = {}, names = {}, labels = {}, keys;
+
+    hints = L.isObject(hints) ? hints : {};
 
     Object.keys(hints).forEach(function(mac) {
         var h = L.isObject(hints[mac]) ? hints[mac] : {};
@@ -493,6 +503,11 @@ function listPath(opt, sid) {
     return error ? null : path;
 }
 
+// The message for an IP list path that names a directory, such as /etc/geomate.d/runtime
+function directoryError(path) {
+    return _('%s is a directory, not an IP list file.').format(path);
+}
+
 // Write the chosen file as the IP list. A new file is written at once; an existing list is
 // replaced only after the user confirmed
 function uploadList(opt, sid, path, file) {
@@ -510,7 +525,9 @@ function uploadList(opt, sid, path, file) {
         });
     };
 
-    return fs.stat(path).then(function() {
+    return fs.stat(path).then(function(st) {
+        if (st && st.type == 'directory')
+            return dom.content(status, [ directoryError(path) ]);
         dom.content(status, [
             _('%s already exists. Replace it with %s?').format(path, file.name), ' ',
             E('button', { 'class': 'btn cbi-button-negative', 'click': write }, [ _('Replace') ]), ' ',
@@ -526,26 +543,30 @@ function uploadList(opt, sid, path, file) {
 }
 
 // A public IPv4 address: none of the ranges the harvest skips (is_valid_public_ip in
-// geomate.sh): 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16 and 224/3
+// geomate.sh): 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16 and 224/3, and not in the
+// carrier-grade NAT range 100.64/10, which the harvest keeps (a WAN behind CGNAT has one)
 function publicIPv4(ip) {
     var o = validation.parseIPv4(ip);
 
     return !(o[0] == 0 || o[0] == 10 || o[0] == 127 || o[0] >= 224 || (o[0] == 169 && o[1] == 254) ||
-        (o[0] == 172 && o[1] >= 16 && o[1] <= 31) || (o[0] == 192 && o[1] == 168));
+        (o[0] == 172 && o[1] >= 16 && o[1] <= 31) || (o[0] == 192 && o[1] == 168) ||
+        (o[0] == 100 && o[1] >= 64 && o[1] <= 127));
 }
 
 // An IP list cleaned for sharing: the address of each line without its time stamp (which shows
-// when someone played), only public IPv4 addresses, each once, in numeric order. Returns
-// { ips: the addresses, skipped: the lines left out, not counting empty ones }
-function cleanList(text) {
+// when someone played), only public IPv4 addresses that are none of the router's own (own:
+// { address: true }), each once, in numeric order. Returns { ips: the addresses, skipped: the
+// lines left out, not counting empty ones }
+function cleanList(text, own) {
     var seen = {}, ips = [], skipped = 0;  // seen: address -> number
 
+    own = own || {};
     String(text).split('\n').forEach(function(line) {
         var ip = line.split(',')[0].trim();
 
         if (!line.trim())
             return;
-        if (!plainIPv4(ip) || !publicIPv4(ip) || seen[ip] != null) {
+        if (!plainIPv4(ip) || !publicIPv4(ip) || own[ip] || seen[ip] != null) {
             skipped++;
             return;
         }
@@ -570,7 +591,7 @@ function downloadList(opt, path) {
         if (!String(text).trim())
             return dom.content(status, [ _('%s is empty.').format(path) ]);
 
-        list = cleanList(text);
+        list = cleanList(text, routerAddrs);
         if (!list.ips.length)
             return dom.content(status, [ _('%s has no public IPv4 addresses.').format(path) ]);
 
@@ -586,14 +607,24 @@ function downloadList(opt, path) {
         window.setTimeout(function() { URL.revokeObjectURL(link.href); }, 60000);
 
         dom.content(status, [ list.skipped
-            ? _('Downloaded %d addresses, left out %d private, duplicate or invalid lines.').format(list.ips.length, list.skipped)
+            ? _('Downloaded %d addresses, left out %d lines: private or router addresses, duplicates and invalid entries.').format(list.ips.length, list.skipped)
             : _('Downloaded %d addresses.').format(list.ips.length) ]);
     }).catch(function(err) {
         var name = err ? err.name : null;
 
-        dom.content(status, [ (name == 'NotFoundError') ? _('%s does not exist.').format(path)
-            : (name == 'PermissionError') ? _('No permission to read %s.').format(path)
-            : _('Failed to read %s: %s').format(path, errorText(err)) ]);
+        if (name == 'NotFoundError')
+            return dom.content(status, [ _('%s does not exist.').format(path) ]);
+        if (name != 'PermissionError')
+            return dom.content(status, [ _('Failed to read %s: %s').format(path, errorText(err)) ]);
+
+        // cgi-download refuses a directory with the same status as a path the ACL denies
+        return fs.stat(path).then(function(st) {
+            return st && st.type == 'directory';
+        }, function() {
+            return false;
+        }).then(function(dir) {
+            dom.content(status, [ dir ? directoryError(path) : _('No permission to read %s.').format(path) ]);
+        });
     });
 }
 
@@ -611,6 +642,7 @@ return view.extend({
             geoStats = data[0] || null;
             pending = data[1] || {};
             hosts = hostChoices(data[2], data[3]);
+            routerAddrs = ownAddresses(data[3]);
             return data;
         });
     },
@@ -869,7 +901,8 @@ return view.extend({
                 if (note) notes.push(note);
             };
 
-            if (!filterName) return '–';
+            // An enabled filter without a name goes on to "Invalid name": the service skips it
+            if (!filterName && !enabled) return '–';
             if (!enabled && !staged) return _('Disabled');
 
             if (staged) words.push(_('Unsaved'));
@@ -877,8 +910,8 @@ return view.extend({
                 // The service does not start while Geomate is disabled globally
                 if (uci.get('geomate', 'global', 'enabled') !== '1') problem(_('Service off'), _('Geomate is disabled in the global settings.'));
                 // The service skips a filter with such a name
-                if (!FILTER_NAME_RE.test(filterName)) problem(_('Invalid name'), _('The service skips this filter. Use only letters, digits, spaces, "_", "." and "-".'));
-                if (hasNftError(filterName)) problem(_('nftables error'), _('See /tmp/geomate_nft_errors.log on the router.'));
+                if (!FILTER_NAME_RE.test(filterName || '')) problem(_('Invalid name'), _('The service skips this filter. Use only letters, digits, spaces, "_", "." and "-".'));
+                if (filterName && hasNftError(filterName)) problem(_('nftables error'), _('See /tmp/geomate_nft_errors.log on the router.'));
                 if (regionIsOption(section_id)) problem(_('Region not a list'), optionNote);
                 else if (!regionList(section_id).some(function(r) { return parseRegion(r) !== null; })) problem(_('No regions'));
                 if (!ipList) problem(_('No IP list'));
@@ -1109,9 +1142,9 @@ return view.extend({
             this.fileInput.click();
         };
 
-        // Download List button: saves the IP list without time stamps and private addresses,
-        // for sharing or as a backup. Reading the list needs no write access, so a read-only
-        // session can use it too
+        // Download List button: saves the IP list without time stamps, private addresses and
+        // the router's own, for sharing or as a backup. Reading the list needs no write access,
+        // so a read-only session can use it too
         o = s.option(form.Button, '_download', _('Download IP List'));
         o.inputtitle = _('Download List');
         o.inputstyle = 'apply';
