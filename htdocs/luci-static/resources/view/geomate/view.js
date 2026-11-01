@@ -1688,6 +1688,7 @@ return view.extend({
             /* No side margin: the map and the sections around it share the edges of the page content */
             #geomate-overview { container: gm-overview / inline-size; margin-top: 12px; }
             .gm-overview-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: 12px; align-items: stretch; }
+            .gm-overview--single .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
             #geomate-map-container { margin: 0; min-width: 0; }
             .gm-map-frame { display: block; width: 100%; height: clamp(400px, 54vh, 490px); border: 0; }
             @container gm-overview (max-width: 900px) {
@@ -3856,13 +3857,18 @@ return view.extend({
         var n = this.nodes;
 
         n.serverTitle = E('h3', { 'class': 'gm-server-title' }, [ _('Server') ]);
+        n.serverToggle = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'aria-controls': 'gm-server-body', 'aria-expanded': 'true', 'hidden': '', 'click': L.bind(this.toggleServerPanel, this) }, [ _('Hide') ]);
+        n.serverClose = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'hidden': '', 'click': L.bind(this.closeServerPanel, this) }, [ _('Close') ]);
         n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a connection') ]);
-        n.serverBody = E('div', { 'class': 'gm-server-body' });
+        n.serverBody = E('div', { 'id': 'gm-server-body', 'class': 'gm-server-body' });
         n.serverPanel = E('section', { 'id': 'gm-server-panel', 'class': 'cbi-section gm-details', 'tabindex': '-1', 'aria-labelledby': 'gm-server-title' }, [
             E('style', {}, `
                 #gm-server-panel { margin: 0; padding: 12px 16px; min-width: 0; box-sizing: border-box; }
-                .gm-details [hidden] { display: none !important; }
-                .gm-details .gm-server-title { margin: 0 0 8px; overflow-wrap: anywhere; }
+                #gm-server-panel[hidden], .gm-details [hidden] { display: none !important; }
+                .gm-server-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+                .gm-server-collapsed .gm-server-heading { margin-bottom: 0; }
+                .gm-details .gm-server-title { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
+                .gm-server-heading .cbi-button { flex: none; margin: 0; }
                 .gm-server-empty { margin: 28px 0; opacity: 0.65; }
                 .gm-server-head { display: flex; align-items: flex-start; gap: 8px; }
                 .gm-server-meta { flex: 1; min-width: 0; }
@@ -3903,10 +3909,57 @@ return view.extend({
                     .gm-details .gm-chart { height: 110px; }
                     .gm-packets .gm-chart { height: 65px; }
                 }
-            `), n.serverTitle, n.serverEmpty, n.serverBody
+            `), E('div', { 'class': 'gm-server-heading' }, [ n.serverTitle, n.serverToggle, n.serverClose ]), n.serverEmpty, n.serverBody
         ]);
         n.serverTitle.id = 'gm-server-title';
         return n.serverPanel;
+    },
+
+    // A collapsed panel keeps its selection below the full-width map; a closed panel is absent.
+    updateServerPanelLayout: function() {
+        var n = this.nodes, d = this.details, collapsed = !!d && d.collapsed,
+            overview = n.serverPanel.closest('#geomate-overview');
+
+        n.serverBody.hidden = collapsed;
+        n.serverToggle.hidden = n.serverClose.hidden = !d;
+        n.serverToggle.textContent = collapsed ? _('Show') : _('Hide');
+        n.serverToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        n.serverPanel.classList.toggle('gm-server-collapsed', collapsed);
+        if (overview)
+            overview.classList.toggle('gm-overview--single', n.serverPanel.hidden || collapsed);
+    },
+
+    toggleServerPanel: function() {
+        var d = this.details;
+
+        if (!d)
+            return;
+        d.collapsed = !d.collapsed;
+        if (d.collapsed) {
+            d.sampleEpoch++;
+            window.clearTimeout(d.timer);
+            d.timer = null;
+            d.currentRtt = null;
+            d.pingTimeout = false;
+            d.last = null;
+        }
+        else if (d.state !== 'paused' && !d.stopped)
+            d.state = 'pending';
+        this.updateServerPanelLayout();
+        this.showDetails();
+        if (!d.collapsed) {
+            this.focusServerPanel();
+            this.sampleDetails();
+        }
+    },
+
+    closeServerPanel: function() {
+        var n = this.nodes, target = n.connectionsWrap && n.connectionsWrap.querySelector('.gm-server-link[aria-current="true"]');
+
+        this.closeDetails();
+        target = target || n.frame;
+        if (target)
+            target.focus({ preventScroll: true });
     },
 
     updateSelectedConnection: function() {
@@ -3937,8 +3990,11 @@ return view.extend({
             return;
         if (this.fullscreen)
             this.setFullscreen(false);
-        if (this.details && this.details.filter === filter && this.details.ip === ip)
+        if (this.details && this.details.filter === filter && this.details.ip === ip) {
+            if (this.details.collapsed)
+                return this.toggleServerPanel();
             return this.focusServerPanel();
+        }
         this.closeDetails();
 
         d = this.details = {
@@ -3948,7 +4004,7 @@ return view.extend({
             ping: true, pingFails: 0, pingReplied: false, currentRtt: null, pingTimeout: false,
             last: null, points: [], state: '', manualPause: false,
             started: performance.now(), wait: DETAILS_INTERVAL, failures: 0,
-            busy: false, stopped: false, timer: null, nodes: {}
+            busy: false, stopped: false, collapsed: false, sampleEpoch: 0, timer: null, nodes: {}
         };
         n = d.nodes;
         n.status = E('span');
@@ -4005,8 +4061,10 @@ return view.extend({
         n.ratesBox.hidden = !(d.rx || d.tx);
         n.countsHint.hidden = !n.countsHint.textContent;
         this.nodes.serverTitle.textContent = ip;
+        this.nodes.serverPanel.hidden = false;
         this.nodes.serverEmpty.hidden = true;
         this.nodes.serverBody.appendChild(d.root);
+        this.updateServerPanelLayout();
         this.showDetailsHead();
         this.showDetails();
         this.updateSelectedConnection();
@@ -4042,6 +4100,8 @@ return view.extend({
         if (this.nodes && this.nodes.serverEmpty) {
             this.nodes.serverEmpty.hidden = false;
             this.nodes.serverTitle.textContent = _('Server');
+            this.nodes.serverPanel.hidden = true;
+            this.updateServerPanelLayout();
         }
         this.updateSelectedConnection();
     },
@@ -4103,11 +4163,11 @@ return view.extend({
 
     // One sample of the selected server, then the next DETAILS_INTERVAL ms after this one was sent
     // (d.wait), never two at a time. Nothing while the tab is hidden (handleVisibilityChange starts
-    // again) or LuCI's auto refresh is paused; samples stop when the panel is removed
+    // again) or LuCI's auto refresh is paused; samples stop when the panel is collapsed or removed
     sampleDetails: function() {
-        var self = this, d = this.details, sent;
+        var self = this, d = this.details, sent, epoch;
 
-        if (!d || d.busy || d.stopped)
+        if (!d || d.busy || d.stopped || d.collapsed)
             return;
         window.clearTimeout(d.timer);
         d.timer = null;
@@ -4130,19 +4190,20 @@ return view.extend({
         }
 
         d.busy = true;
+        epoch = d.sampleEpoch;
         sent = performance.now();
         callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
-            if (self.details === d && !d.stopped && d.state !== 'paused' && self.detailsShown(d))
+            if (self.details === d && epoch === d.sampleEpoch && !d.stopped && !d.collapsed && d.state !== 'paused' && self.detailsShown(d))
                 self.detailsReply(d, L.isObject(reply) ? reply : {});
         }, function(err) {
-            if (self.details === d && !d.stopped && d.state !== 'paused' && self.detailsShown(d))
+            if (self.details === d && epoch === d.sampleEpoch && !d.stopped && !d.collapsed && d.state !== 'paused' && self.detailsShown(d))
                 self.detailsFailed(d, err);
         }).finally(function() {
             d.busy = false;
             if (self.details !== d)
                 return;
             self.showDetails();
-            if (!d.stopped && d.state !== 'paused' && !document.hidden)
+            if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden)
                 d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (performance.now() - sent)));
         });
     },
@@ -4274,7 +4335,8 @@ return view.extend({
         n.rates.top.textContent = rateText(top);
         n.rates.half.textContent = rateText(top / 2);
         Object.keys(n.cells).forEach(function(key) {
-            var s = (!d.state || d.state === 'paused' || d.state === 'refresh') ? rateStats(points, key) : null,
+            var latest = points[points.length - 1],
+                s = latest && latest[key] && (!d.state || d.state === 'paused' || d.state === 'refresh') ? rateStats(points, key) : null,
                 cell = n.cells[key];
             cell.rate.textContent = s ? rateText(s.rate) : '–';
             cell.rate.title = s && s.size != null ? _('Average packet size: %d bytes').format(Math.round(s.size)) : '';
