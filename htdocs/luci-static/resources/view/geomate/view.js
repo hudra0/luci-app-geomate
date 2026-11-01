@@ -174,7 +174,7 @@ var callKnownServers = rpc.declare({
     reject: true
 });
 
-// Counters and ping of one server for the details window (getServerSample), polled once per
+// Counters and ping of the selected server (getServerSample), polled once per
 // second while it is open. nobatch: a status batch (several hundred ms) never delays a sample. An
 // older rpcd ACL or luci.geomate rejects it
 var callServerSample = rpc.declare({
@@ -863,7 +863,7 @@ function searchText(conn) {
     }).join('\n').toLowerCase();
 }
 
-// Server details window (openServerDetails): one getServerSample request per DETAILS_INTERVAL
+// Selected server (openServerDetails): one getServerSample request per DETAILS_INTERVAL
 // ms while it is open and the tab is visible, the next only after the reply. The graphs show the
 // last DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
 // give no rate, and the lines break there. The figures take the last DETAILS_STATS rates. After
@@ -1003,7 +1003,7 @@ function svgNode(tag, attrs) {
     return el;
 }
 
-// A graph of the details window: an SVG of 1000 x 100 units stretched to its box (the lines keep
+// A graph of the selected server: an SVG of 1000 x 100 units stretched to its box (the lines keep
 // their width: non-scaling-stroke), a path per class in lines, a grid line at the top and at half
 // height with their values as text at the left edge. Built once; showDetails() sets the paths and
 // the values. Returns { box, paths: { class: path }, top, half }
@@ -1204,7 +1204,7 @@ return view.extend({
     serversLoads: {},       // running getKnownServers request per filter section
     restartPid: null,       // PID of the service when a mode change was applied, until it restarted
     restartAt: 0,           // time of that change
-    details: null,          // the open server details window (openServerDetails), null when closed
+    details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
@@ -1238,7 +1238,10 @@ return view.extend({
         if (!this.readonly && this.knownChanges !== '[]')
             this.showNotice();
 
-        var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
+        var nodes = E([], [ this.renderStatus(),
+            E('div', { 'id': 'geomate-overview' }, [
+                E('div', { 'class': 'gm-overview-grid' }, [ this.renderMap(), this.renderServerPanel() ])
+            ]), this.renderConnections() ]);
 
         window.addEventListener('message', L.bind(this.handleMessage, this), false);
         // Escape outside the map also ends drawing, then fullscreen; the map handles it when it
@@ -1683,11 +1686,19 @@ return view.extend({
 
         var style = E('style', {}, `
             /* No side margin: the map and the sections around it share the edges of the page content */
-            #geomate-map-container { margin: 12px 0 0; }
-            .gm-map-frame { display: block; width: 100%; height: 80vh; border: 0; }
-            .gm-map-frame.gm-map-frame--short { height: 600px; height: min(600px, 80vh); }
-            @media (max-width: 767px) {
-                .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+            #geomate-overview { container: gm-overview / inline-size; margin-top: 12px; }
+            .gm-overview-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: 12px; align-items: stretch; }
+            #geomate-map-container { margin: 0; min-width: 0; }
+            .gm-map-frame { display: block; width: 100%; height: clamp(400px, 54vh, 490px); border: 0; }
+            @container gm-overview (max-width: 900px) {
+                .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
+                .gm-map-frame { height: clamp(260px, 42vh, 360px); }
+            }
+            @supports not (container-type: inline-size) {
+                @media (max-width: 1100px) {
+                    .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
+                    .gm-map-frame { height: 360px; }
+                }
             }
             /* Fullscreen: the map covers the window. An ancestor with its own z-index (Argon's
                #maincontent) is lifted with it; a LuCI dialog stays above both */
@@ -1840,7 +1851,7 @@ return view.extend({
     },
 
     // Section below the map: a <details> whose summary is the "Active connections (n)" heading
-    // with a Show/Hide label, and the table, collapsed until shown
+    // with a Show/Hide label, and the table, open initially
     renderConnections: function() {
         var n = this.nodes;
 
@@ -2041,7 +2052,7 @@ return view.extend({
 
         // updateActiveConnectionsList() sets the count in the title span
         n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
-        n.connectionsToggle = E('span', {}, [ _('Show') ]);
+        n.connectionsToggle = E('span', {}, [ _('Hide') ]);
         // With flow offloading the firewall forwards an established connection past geomate's
         // prerouting rules, which fill the live list and count the packets (updateStatus shows it
         // and sets the text)
@@ -2050,6 +2061,7 @@ return view.extend({
         n.connections = E('details', {
             'class': 'cbi-section',
             'id': 'active-connections-container',
+            'open': '',
             'toggle': L.bind(this.toggleConnections, this)
         }, [
             style,
@@ -2125,17 +2137,14 @@ return view.extend({
         wrap.classList.add('gm-sticky-fill');
     },
 
-    // After the connections section opened or closed: the map gets smaller while the table is shown
+    // After the connections section opened or closed: update its label and sticky header
     toggleConnections: function() {
         var n = this.nodes,
             show = n.connections.open;
 
         n.connectionsToggle.textContent = show ? _('Hide') : _('Show');
-        n.frame.classList.toggle('gm-map-frame--short', show);
-        if (show) {
+        if (show)
             this.updateStickyHeader();
-            n.connections.scrollIntoView({ behavior: 'smooth' });
-        }
     },
 
     // Show the last status and health check in the status row; polled: with a new status reply,
@@ -3784,6 +3793,7 @@ return view.extend({
             return cells;
         }), placeholder);
         this.showSortChoice();
+        this.updateSelectedConnection();
     },
 
     // Buttons of a table row, from the configuration as loaded. The allowed IPs come first, as in
@@ -3822,14 +3832,18 @@ return view.extend({
         return rangeCoversIp(tokens, ip) ? 'blocked-range' : 'allow-block';
     },
 
-    // IP cell of a row: a link that opens the server details window, plain text once the details
+    // IP cell of a row: a link that selects the server, plain text once the details
     // turned out not to be available (detailsOff)
     ipCell: function(r) {
         if (this.detailsOff || !validIPv4(r.ip) || !FILTER_NAME_RE.test(r.filter || ''))
             return textCell(r.ip);
         return E('a', {
             'href': '#',
-            'title': _('Show details'),
+            'title': _('Show server'),
+            'class': 'gm-server-link',
+            'data-filter': r.filter,
+            'data-ip': r.ip,
+            'aria-controls': 'gm-server-panel',
             'click': L.bind(function(ev) {
                 ev.preventDefault();
                 this.openServerDetails(r.filter, r.ip);
@@ -3837,102 +3851,36 @@ return view.extend({
         }, [ r.ip ]);
     },
 
-    /**
-     * Server details window of a server of a filter (IP link of the table, Details link of a map
-     * popup): head with status, filter and geo text, a graph of the packets per second from and
-     * to the server, a ping graph once the server answers, and their figures. The packets come
-     * from the filter's nft sets, not from conntrack, whose counters nlbwmon resets every 30 s:
-     * 'From server' only with the backend token rx_counters, 'To server' with set_counters, none
-     * in static mode. Samples run while the window is open (sampleDetails).
-     * @param {string} filter - The filter name of the row.
-     * @param {string} ip - The server address.
-     */
-    openServerDetails: function(filter, ip) {
-        var mode = this.statusMode() || uci.get('geomate', 'global', 'operational_mode') || 'dynamic',
-            counts = mode !== 'static',
-            tickNote = _('Most games send one packet per server tick, so this is close to the server\'s tick rate. Voice chat and large updates split over several packets can raise it.'),
-            d, n, column;
+    // Persistent server panel beside the map; its host stays in place across selections.
+    renderServerPanel: function() {
+        var n = this.nodes;
 
-        if (this.detailsOff)
-            return notify(_('Server details are not available. Reload the page or log in again.'));
-        if (!validIPv4(ip) || !FILTER_NAME_RE.test(filter))
-            return;
-        this.closeDetails();
-
-        d = this.details = {
-            ip: ip,
-            filter: filter,
-            rx: counts && hasCapability(this.status, 'rx_counters'),
-            tx: counts && hasCapability(this.status, 'set_counters'),
-            ping: true,         // ask for a ping with the next sample
-            pingFails: 0,       // pings without reply in a row
-            pingReplied: false, // the server has answered a ping since the last start
-            last: null,         // { t, rx, tx } of the last reading
-            points: [],         // samplePoint() results of the last DETAILS_SPAN ms
-            state: '',          // note of the window: '', 'refresh', 'paused', 'unknown', 'limit', 'offline', 'invalid', 'unavailable'
-            started: performance.now(),
-            wait: DETAILS_INTERVAL,
-            failures: 0,        // failed requests in a row
-            busy: false,
-            stopped: false,
-            timer: null,
-            nodes: {}
-        };
-        n = d.nodes;
-
-        n.status = E('span');
-        n.geo = E('span', { 'class': 'gm-details-geo' });
-        n.noteText = E('span');
-        n.continue = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.continueDetails, this, d) }, [ _('Continue') ]);
-        n.retryPing = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.retryPing, this, d) }, [ _('Try again') ]);
-        n.note = E('p', { 'class': 'gm-details-note', 'hidden': '' }, [ n.noteText, ' ', n.continue, n.retryPing ]);
-
-        n.rates = detailsChart([ 'gm-line--tx', 'gm-line--rx' ]);
-        n.ping = detailsChart([ 'gm-line--rtt', 'gm-line--lost' ]);
-        n.pingBox = E('div', { 'hidden': '' }, [
-            E('div', { 'class': 'gm-legend' }, [ legendKey('gm-key--rtt', _('Ping')), legendKey('gm-key--lost', _('No reply')) ]),
-            n.ping.box
-        ]);
-
-        // Figures: a column per direction the backend counts
-        n.cells = {};
-        column = function(key, label, title) {
-            n.cells[key] = { rate: E('span', {}, [ '–' ]), size: E('span', {}, [ '–' ]) };
-            return E('span', { 'class': 'gm-details-col', 'title': title || '' }, [ label ]);
-        };
-        var columns = [].concat(d.rx ? [ column('rx', _('From server'), tickNote) ] : [],
-            d.tx ? [ column('tx', _('To server')) ] : []);
-        var keys = Object.keys(n.cells);
-
-        n.stats = E('div', { 'class': 'gm-details-stats', 'style': 'grid-template-columns: max-content repeat(%d, max-content)'.format(keys.length) }, [].concat(
-            [ E('span') ], columns,
-            [ E('span', { 'class': 'gm-muted' }, [ _('Rate') ]) ], keys.map(function(k) { return n.cells[k].rate; }),
-            [ E('span', { 'class': 'gm-muted' }, [ _('Packet size') ]) ], keys.map(function(k) { return n.cells[k].size; })
-        ));
-        n.tick = E('p', { 'class': 'gm-details-hint', 'hidden': '', 'title': tickNote });
-
-        n.pingValue = E('span', {}, [ '–' ]);
-        n.jitter = E('span', {}, [ '–' ]);
-        n.loss = E('span', {}, [ '–' ]);
-        n.pingStats = E('div', { 'class': 'gm-details-ping' }, [
-            E('span', { 'class': 'gm-muted', 'title': _('Ping from the router to the server. Game traffic can see another delay.') }, [ _('Ping') ]), n.pingValue,
-            E('span', { 'class': 'gm-muted' }, [ _('Jitter') ]), n.jitter,
-            E('span', { 'class': 'gm-muted' }, [ _('Loss') ]), n.loss
-        ]);
-
-        d.root = E('div', { 'class': 'gm-details' }, [
+        n.serverTitle = E('h3', { 'class': 'gm-server-title' }, [ _('Server') ]);
+        n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a connection') ]);
+        n.serverBody = E('div', { 'class': 'gm-server-body' });
+        n.serverPanel = E('section', { 'id': 'gm-server-panel', 'class': 'cbi-section gm-details', 'tabindex': '-1', 'aria-labelledby': 'gm-server-title' }, [
             E('style', {}, `
-                .gm-details [hidden] { display: none; }
-                .gm-details-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0 0 8px; }
-                .gm-details-geo { min-width: 0; overflow-wrap: anywhere; opacity: 0.75; }
-                .gm-details-note { margin: 8px 0; }
-                .gm-details-note .cbi-button { margin: 0 0 0 4px; }
+                #gm-server-panel { margin: 0; padding: 12px 16px; min-width: 0; box-sizing: border-box; }
+                .gm-details [hidden] { display: none !important; }
+                .gm-details .gm-server-title { margin: 0 0 8px; overflow-wrap: anywhere; }
+                .gm-server-empty { margin: 28px 0; opacity: 0.65; }
+                .gm-server-head { display: flex; align-items: flex-start; gap: 8px; }
+                .gm-server-meta { flex: 1; min-width: 0; }
+                .gm-server-meta .gm-status { margin-bottom: 4px; }
+                .gm-details-geo { display: block; overflow-wrap: anywhere; opacity: 0.75; font-size: 90%; }
+                .gm-server-head .cbi-button { flex: none; margin: 0; }
+                .gm-details-note { margin: 8px 0; font-size: 90%; }
                 .gm-details .gm-muted { opacity: 0.65; }
-                .gm-details .gm-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 12px 0 4px; font-size: 90%; }
-                .gm-details .gm-key { display: inline-block; width: 18px; margin: 0 6px 0 0; vertical-align: middle; border-top: 2px solid var(--gm-primary); }
-                .gm-details .gm-key--tx { border-top: 2px dashed currentColor; opacity: 0.7; }
-                .gm-details .gm-key--lost { width: 0; height: 10px; border-top: 0; border-left: 2px solid var(--gm-danger); }
-                .gm-details .gm-chart { position: relative; height: 110px; }
+                .gm-ping-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 14px 0 10px; }
+                .gm-ping-stat { min-width: 0; }
+                .gm-ping-label { display: block; font-size: 90%; opacity: 0.7; margin-bottom: 4px; }
+                .gm-ping-value { display: block; font-size: 1.45em; line-height: 1.2; white-space: nowrap; }
+                .gm-ping-tools { display: flex; align-items: center; justify-content: space-between; min-height: 25px; gap: 8px; font-size: 85%; }
+                .gm-ping-tools .cbi-button { margin: 0; }
+                .gm-ping-method { opacity: 0.65; }
+                .gm-ping-plot { position: relative; }
+                .gm-ping-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; opacity: 0.65; font-size: 90%; pointer-events: none; }
+                .gm-details .gm-chart { position: relative; height: 125px; }
                 .gm-details .gm-chart svg { display: block; width: 100%; height: 100%; overflow: visible; }
                 .gm-details .gm-chart path { fill: none; vector-effect: non-scaling-stroke; }
                 .gm-details .gm-chart-grid { stroke: currentColor; stroke-opacity: 0.15; stroke-width: 1; }
@@ -3941,54 +3889,146 @@ return view.extend({
                 .gm-details .gm-line--lost { stroke: var(--gm-danger); stroke-linecap: butt; }
                 .gm-details .gm-chart-label { position: absolute; top: 4px; left: 2px; font-size: 11px; line-height: 1; opacity: 0.7; pointer-events: none; }
                 .gm-details .gm-chart-label--half { top: 50%; }
-                .gm-details-caption { margin: 2px 0 0; font-size: 11px; opacity: 0.7; text-align: right; }
-                .gm-details-stats, .gm-details-ping { display: grid; gap: 2px 16px; margin: 12px 0 0; }
-                .gm-details-ping { grid-template-columns: repeat(3, max-content minmax(0, max-content)); gap: 2px 8px; }
-                .gm-details-col[title]:not([title=""]) { text-decoration: underline dotted; cursor: help; }
-                .gm-details-hint { margin: 6px 0 0; font-size: 90%; opacity: 0.75; }
-                @media (max-width: 480px) {
-                    .gm-details-ping { grid-template-columns: max-content minmax(0, 1fr); }
+                .gm-details-caption { margin: 2px 0 0; font-size: 11px; opacity: 0.65; text-align: right; }
+                .gm-packet-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-top: 14px; font-size: 90%; }
+                .gm-packet-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+                .gm-packet-stat { white-space: nowrap; }
+                .gm-packet-stat .gm-key { display: inline-block; width: 14px; margin-right: 5px; vertical-align: middle; border-top: 2px solid var(--gm-primary); }
+                .gm-packet-stat .gm-key--tx { border-top: 2px dashed currentColor; opacity: 0.65; }
+                .gm-packets .gm-chart { height: 70px; margin-top: 6px; }
+                .gm-details-hint { margin: 6px 0 0; font-size: 85%; opacity: 0.65; }
+                #active-connections-container .gm-server-link[aria-current="true"] { font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+                #active-connections-container .gm-server-selected { box-shadow: inset 3px 0 var(--gm-primary); }
+                @container gm-overview (max-width: 900px) {
+                    .gm-details .gm-chart { height: 110px; }
+                    .gm-packets .gm-chart { height: 65px; }
                 }
-            `),
-            E('div', { 'class': 'gm-details-head' }, [ n.status, n.geo ]),
-            n.note,
-            n.ratesBox = E('div', {}, [
-                E('div', { 'class': 'gm-legend' }, [].concat(
-                    d.rx ? [ legendKey('gm-key--rx', _('From server')) ] : [],
-                    d.tx ? [ legendKey('gm-key--tx', _('To server')) ] : [])),
-                n.rates.box
-            ]),
-            n.pingBox,
-            n.caption = E('p', { 'class': 'gm-details-caption' }, [ _('Last 3 minutes') ]),
-            n.statsBox = E('div', {}, [ n.stats, n.tick ]),
-            n.pingStats,
-            n.countsHint = E('p', { 'class': 'gm-details-hint' }, [
-                !counts ? _('Static mode counts no packets.')
-                    : (!d.rx && !d.tx) ? _('Update geomate to see the packet rates.')
-                    : !d.rx ? _('Update geomate to see the packets from the server.') : ''
-            ]),
-            // LuCI's dialog clicks the first button of '.right' on Escape
-            E('div', { 'class': 'right' }, [
-                E('button', { 'class': 'btn cbi-button', 'click': L.bind(this.closeDetails, this) }, [ _('Close') ])
-            ])
+            `), n.serverTitle, n.serverEmpty, n.serverBody
+        ]);
+        n.serverTitle.id = 'gm-server-title';
+        return n.serverPanel;
+    },
+
+    updateSelectedConnection: function() {
+        var wrap = this.nodes && this.nodes.connectionsWrap, d = this.details;
+
+        if (!wrap)
+            return;
+        wrap.querySelectorAll('.gm-server-link').forEach(function(link) {
+            var selected = !!d && link.getAttribute('data-ip') === d.ip && link.getAttribute('data-filter') === d.filter,
+                row = link.closest('.tr, tr');
+            if (selected)
+                link.setAttribute('aria-current', 'true');
+            else
+                link.removeAttribute('aria-current');
+            if (row)
+                row.classList.toggle('gm-server-selected', selected);
+        });
+    },
+
+    // Select one server for the persistent panel. Repeated selection keeps its history.
+    openServerDetails: function(filter, ip) {
+        var mode = this.statusMode() || uci.get('geomate', 'global', 'operational_mode') || 'dynamic',
+            counts = mode !== 'static', d, n;
+
+        if (this.detailsOff)
+            return notify(_('Server measurements unavailable. Reload the page.'));
+        if (!validIPv4(ip) || !FILTER_NAME_RE.test(filter))
+            return;
+        if (this.fullscreen)
+            this.setFullscreen(false);
+        if (this.details && this.details.filter === filter && this.details.ip === ip)
+            return this.focusServerPanel();
+        this.closeDetails();
+
+        d = this.details = {
+            ip: ip, filter: filter,
+            rx: counts && hasCapability(this.status, 'rx_counters'),
+            tx: counts && hasCapability(this.status, 'set_counters'),
+            ping: true, pingFails: 0, pingReplied: false, currentRtt: null, pingTimeout: false,
+            last: null, points: [], state: '', manualPause: false,
+            started: performance.now(), wait: DETAILS_INTERVAL, failures: 0,
+            busy: false, stopped: false, timer: null, nodes: {}
+        };
+        n = d.nodes;
+        n.status = E('span');
+        n.geo = E('span', { 'class': 'gm-details-geo' });
+        n.noteText = E('span');
+        n.note = E('p', { 'class': 'gm-details-note', 'hidden': '' }, [ n.noteText ]);
+        n.pause = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.toggleDetails, this, d) }, [ _('Pause') ]);
+        n.retryPing = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.retryPing, this, d), 'hidden': '' }, [ _('Retry') ]);
+        n.pingValue = E('strong', { 'class': 'gm-ping-value' }, [ '–' ]);
+        n.jitter = E('strong', { 'class': 'gm-ping-value' }, [ '–' ]);
+        n.loss = E('strong', { 'class': 'gm-ping-value' }, [ '–' ]);
+        var stat = function(label, value, title) {
+            return E('div', { 'class': 'gm-ping-stat', 'title': title }, [ E('span', { 'class': 'gm-ping-label' }, [ label ]), value ]);
+        };
+        n.pingStats = E('div', { 'class': 'gm-ping-stats' }, [
+            stat(_('Ping'), n.pingValue, _('Round-trip time from router to server')),
+            stat(_('Jitter'), n.jitter, _('Variation between successful ping replies')),
+            stat(_('Ping loss'), n.loss, _('ICMP probes without a reply'))
+        ]);
+        n.ping = detailsChart([ 'gm-line--rtt', 'gm-line--lost' ]);
+        n.pingEmpty = E('span', { 'class': 'gm-ping-empty' }, [ _('Waiting for reply') ]);
+        n.pingState = E('span', { 'class': 'gm-ping-method' }, [ _('ICMP') ]);
+        n.pingBox = E('div', {}, [
+            E('div', { 'class': 'gm-ping-tools' }, [ n.pingState, n.retryPing ]),
+            E('div', { 'class': 'gm-ping-plot' }, [ n.ping.box, n.pingEmpty ]),
+            E('p', { 'class': 'gm-details-caption' }, [ _('Last 3 minutes') ])
+        ]);
+
+        n.rates = detailsChart([ 'gm-line--tx', 'gm-line--rx' ]);
+        n.cells = {};
+        var packet = function(key, label) {
+            var cell = n.cells[key] = { rate: E('span', {}, [ '–' ]) };
+            return E('span', { 'class': 'gm-packet-stat' }, [
+                E('span', { 'class': 'gm-key gm-key--' + key }), label, ' ', cell.rate
+            ]);
+        };
+        n.ratesBox = E('div', { 'class': 'gm-packets' }, [
+            E('div', { 'class': 'gm-packet-head' }, [
+                E('span', { 'class': 'gm-muted' }, [ _('Packets') ]),
+                E('span', { 'class': 'gm-packet-stats' }, [].concat(
+                    d.rx ? [ packet('rx', _('Received')) ] : [], d.tx ? [ packet('tx', _('Sent')) ] : []))
+            ]), n.rates.box
+        ]);
+        n.countsHint = E('p', { 'class': 'gm-details-hint' }, [
+            !counts ? _('Packet counters unavailable in static mode')
+                : (!d.rx && !d.tx) ? _('Update Geomate to show packet counters')
+                : !d.rx ? _('Update Geomate to show receive counters') : ''
+        ]);
+        d.root = E('div', { 'class': 'gm-server-content' }, [
+            E('div', { 'class': 'gm-server-head' }, [
+                E('div', { 'class': 'gm-server-meta' }, [ n.status, n.geo ]), n.pause
+            ]), n.note, n.pingStats, n.pingBox, n.ratesBox, n.countsHint
         ]);
         n.ratesBox.hidden = !(d.rx || d.tx);
-        n.statsBox.hidden = !keys.length;
         n.countsHint.hidden = !n.countsHint.textContent;
-
-        d.dialog = ui.showModal(_('Server %s').format(ip), [ d.root ]);
+        this.nodes.serverTitle.textContent = ip;
+        this.nodes.serverEmpty.hidden = true;
+        this.nodes.serverBody.appendChild(d.root);
         this.showDetailsHead();
         this.showDetails();
+        this.updateSelectedConnection();
+        this.focusServerPanel();
         this.sampleDetails();
     },
 
-    // The details window is still shown: LuCI's dialog is open and holds it. Another dialog
-    // replaces its content; ui.hideModal() leaves the content in place
-    detailsShown: function(d) {
-        return document.body.classList.contains('modal-overlay-active') && !!d.dialog && d.dialog.contains(d.root);
+    // Selection from a long table or fullscreen map reveals the panel without an overlay.
+    focusServerPanel: function() {
+        var panel = this.nodes.serverPanel, bounds = panel.getBoundingClientRect();
+
+        if (bounds.top < 0 || bounds.bottom > window.innerHeight)
+            panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        panel.focus({ preventScroll: true });
     },
 
-    // Close the details window and stop its samples; a reply still on its way is dropped
+    detailsShown: function(d) {
+        return !!(this.nodes && this.nodes.serverBody && this.nodes.serverBody.isConnected &&
+            this.nodes.serverBody.contains(d.root));
+    },
+
+    // Stop this selection; late responses cannot change the replacement panel.
     closeDetails: function() {
         var d = this.details;
 
@@ -3997,8 +4037,25 @@ return view.extend({
         this.details = null;
         d.stopped = true;
         window.clearTimeout(d.timer);
-        if (this.detailsShown(d))
-            ui.hideModal();
+        if (d.root && d.root.parentNode)
+            d.root.parentNode.removeChild(d.root);
+        if (this.nodes && this.nodes.serverEmpty) {
+            this.nodes.serverEmpty.hidden = false;
+            this.nodes.serverTitle.textContent = _('Server');
+        }
+        this.updateSelectedConnection();
+    },
+
+    toggleDetails: function(d) {
+        if (this.details !== d || d.stopped)
+            return;
+        if (d.state === 'paused')
+            return this.continueDetails(d);
+        d.state = 'paused';
+        d.manualPause = true;
+        window.clearTimeout(d.timer);
+        d.timer = null;
+        this.showDetails();
     },
 
     // Continue after the pause of DETAILS_SESSION
@@ -4006,6 +4063,7 @@ return view.extend({
         if (this.details !== d || d.stopped)
             return;
         d.state = '';
+        d.manualPause = false;
         d.started = performance.now();
         this.showDetails();
         this.sampleDetails();
@@ -4018,10 +4076,12 @@ return view.extend({
         d.ping = true;
         d.pingFails = 0;
         d.pingReplied = false;
+        d.currentRtt = null;
+        d.pingTimeout = false;
         this.showDetails();
     },
 
-    // Status, filter and geo text of the details window, as the table shows the server now: its
+    // Status, filter and geo text of the selected server, as the table shows the server now: its
     // row in the last reply, else its entry of the recent list
     showDetailsHead: function() {
         var d = this.details, n = d && d.nodes, conn, e, status, geo;
@@ -4041,9 +4101,9 @@ return view.extend({
         n.geo.textContent = [ d.filter, geo.country, geo.city, geo.isp ].filter(function(s) { return s; }).join(' · ');
     },
 
-    // One sample of the details window, then the next DETAILS_INTERVAL ms after this one was sent
+    // One sample of the selected server, then the next DETAILS_INTERVAL ms after this one was sent
     // (d.wait), never two at a time. Nothing while the tab is hidden (handleVisibilityChange starts
-    // again) or LuCI's auto refresh is paused; the window stops when its dialog is gone
+    // again) or LuCI's auto refresh is paused; samples stop when the panel is removed
     sampleDetails: function() {
         var self = this, d = this.details, sent;
 
@@ -4064,6 +4124,7 @@ return view.extend({
             return;
         }
         if (performance.now() - d.started >= DETAILS_SESSION) {
+            d.manualPause = false;
             d.state = 'paused';
             return this.showDetails();
         }
@@ -4071,32 +4132,32 @@ return view.extend({
         d.busy = true;
         sent = performance.now();
         callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
-            if (self.details === d && !d.stopped && self.detailsShown(d))
+            if (self.details === d && !d.stopped && d.state !== 'paused' && self.detailsShown(d))
                 self.detailsReply(d, L.isObject(reply) ? reply : {});
         }, function(err) {
-            if (self.details === d && !d.stopped && self.detailsShown(d))
+            if (self.details === d && !d.stopped && d.state !== 'paused' && self.detailsShown(d))
                 self.detailsFailed(d, err);
         }).finally(function() {
             d.busy = false;
             if (self.details !== d)
                 return;
             self.showDetails();
-            if (!d.stopped)
+            if (!d.stopped && d.state !== 'paused' && !document.hidden)
                 d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (performance.now() - sent)));
         });
     },
 
-    // A getServerSample reply: a new point, or the note of an error. 'busy': another page sampled
-    // the server just now, the next sample comes as usual
+    // A getServerSample reply: a new point, or a measurement gap. 'busy': another page sampled
+    // the server just now, the next sample comes as usual.
     detailsReply: function(d, reply) {
         var p, last;
 
         d.failures = 0;
         d.wait = (reply.error === 'limit') ? DETAILS_LIMIT_RETRY : DETAILS_INTERVAL;
-        if (reply.error === 'busy')
-            return;
-        if (reply.error === 'limit' || reply.error === 'unknown') {
+        if (reply.error === 'busy' || reply.error === 'limit' || reply.error === 'unknown') {
             d.state = reply.error;
+            d.currentRtt = null;
+            d.pingTimeout = false;
             // No rate across the time without readings
             d.last = null;
             return;
@@ -4104,6 +4165,8 @@ return view.extend({
         p = (reply.error == null) ? samplePoint(d.last, reply) : null;
         if (!p) {
             d.state = 'invalid';
+            d.currentRtt = null;
+            d.pingTimeout = false;
             d.stopped = true;
             return;
         }
@@ -4118,6 +4181,8 @@ return view.extend({
         while (p.t - d.points[0].t > DETAILS_SPAN)
             d.points.shift();
 
+        d.currentRtt = p.rtt != null ? p.rtt : null;
+        d.pingTimeout = p.rtt === null || (p.rtt === undefined && !d.ping && d.pingFails > 0);
         if (p.rtt != null) {
             d.pingReplied = true;
             d.pingFails = 0;
@@ -4128,11 +4193,14 @@ return view.extend({
     },
 
     // A failed getServerSample request. A missing method or ACL entry (older luci.geomate or an
-    // rpcd that was not restarted) stops the window, and the IPs are no links from now on. Other
-    // errors (timeout, no connection) keep sampling, and the window says so from the third in a
+    // rpcd that was not restarted) stops sampling, and the IPs are no links from now on. Other
+    // errors (timeout, no connection) keep sampling, and the panel says so from the third in a
     // row
     detailsFailed: function(d, err) {
         d.wait = DETAILS_INTERVAL;
+        d.currentRtt = null;
+        d.pingTimeout = false;
+        d.last = null;
         // LuCI translates ubus status text; the numeric method/resource/permission codes stay
         // stable. JSON-RPC reports a missing method or denied session with its own error codes
         if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
@@ -4143,44 +4211,60 @@ return view.extend({
             this.updateActiveConnectionsList();
             this.sendMessageToMap('serverDetails', { on: false });
         }
-        else if (++d.failures >= 3) {
-            d.state = 'offline';
-        }
+        else
+            d.state = ++d.failures >= 3 ? 'offline' : 'pending';
     },
 
-    // Graphs, figures and note of the details window from its points. Only attributes and texts
+    // Graphs, figures and note of the selected server from its points. Only attributes and texts
     // change: the nodes are built once (openServerDetails)
     showDetails: function() {
         var d = this.details, n = d && d.nodes;
 
         if (!d)
             return;
-
         var points = d.points,
             end = points.length ? points[points.length - 1].t : 0,
             from = end - DETAILS_SPAN,
             notes = {
-                refresh: _('Auto refresh is paused.'),
-                paused: _('Paused after 10 minutes.'),
-                unknown: _('No traffic with this server right now.'),
-                limit: _('Paused: details of other servers are open.'),
-                offline: _('No answer from the router.'),
-                invalid: _('This server cannot be checked.'),
-                unavailable: _('Server details are not available. Reload the page or log in again.')
+                refresh: _('Auto refresh paused'),
+                paused: d.manualPause ? _('Paused') : _('Paused after 10 minutes'),
+                unknown: _('No recent traffic'),
+                busy: _('Waiting for measurement'),
+                pending: _('Waiting for measurement'),
+                limit: _('Waiting for another measurement'),
+                offline: _('Router unavailable'),
+                invalid: _('Measurement unavailable'),
+                unavailable: _('Server measurements unavailable. Reload the page.')
             },
-            pingText = d.ping ? '' : d.pingReplied ? _('The server no longer answers ping.')
-                : _('No reply to ping. Many game servers do not answer ping; the packet rates still work.'),
-            text = notes[d.state] || pingText;
+            text = notes[d.state] || '';
 
-        if (n.noteText.textContent !== text)
-            n.noteText.textContent = text;
+        n.noteText.textContent = text;
         n.note.hidden = !text;
-        n.continue.hidden = d.state !== 'paused';
-        n.retryPing.hidden = !pingText || !!notes[d.state];
+        n.pause.textContent = d.state === 'paused' ? _('Resume') : _('Pause');
+        n.pause.disabled = d.stopped;
+        n.retryPing.hidden = d.ping || d.stopped;
+        n.retryPing.disabled = d.state === 'paused' || d.state === 'refresh';
 
-        // Packets per second, the same scale for both directions
-        var rate = function(key) { return function(p) { return p[key] ? p[key].pps : null; }; },
-            top = 0;
+        var ping = pingStats(points), rtts = points.filter(function(p) { return p.rtt != null; }),
+            pingTop = niceMax(Math.max.apply(null, [ 0 ].concat(rtts.map(function(p) { return p.rtt; }))), 50);
+
+        n.ping.paths['gm-line--rtt'].setAttribute('d', chartPath(points, function(p) { return p.rtt; }, from, DETAILS_SPAN, pingTop));
+        n.ping.paths['gm-line--lost'].setAttribute('d', rtts.length ? points.filter(function(p) { return p.rtt === null && p.t >= from; }).map(function(p) {
+            return 'M' + ((p.t - from) * 1000 / DETAILS_SPAN).toFixed(1) + ' 100V88';
+        }).join('') : '');
+        n.ping.top.textContent = msText(pingTop);
+        n.ping.half.textContent = msText(pingTop / 2);
+        n.pingEmpty.hidden = !!rtts.length;
+        n.pingEmpty.textContent = d.pingTimeout ? _('No ping reply')
+            : (d.state && d.state !== 'refresh' && d.state !== 'paused') ? _('No measurements') : _('Waiting for reply');
+        n.pingState.textContent = d.pingTimeout && rtts.length ? _('ICMP · No reply') : _('ICMP');
+        n.pingValue.textContent = d.currentRtt != null ? msText(d.currentRtt) : '–';
+        n.pingValue.title = ping && ping.avg != null ? _('Average %s').format(msText(ping.avg)) : '';
+        n.jitter.textContent = ping && ping.jitter != null ? msText(ping.jitter) : '–';
+        // Without a successful probe there is no measured RTT; loss describes ICMP probes only.
+        n.loss.textContent = ping && rtts.length ? _('%d%%').format(Math.round(ping.loss)) : '–';
+
+        var rate = function(key) { return function(p) { return p[key] ? p[key].pps : null; }; }, top = 0;
         points.forEach(function(p) {
             top = Math.max(top, (d.rx && p.rx) ? p.rx.pps : 0, (d.tx && p.tx) ? p.tx.pps : 0);
         });
@@ -4189,39 +4273,12 @@ return view.extend({
         n.rates.paths['gm-line--tx'].setAttribute('d', d.tx ? chartPath(points, rate('tx'), from, DETAILS_SPAN, top) : '');
         n.rates.top.textContent = rateText(top);
         n.rates.half.textContent = rateText(top / 2);
-
         Object.keys(n.cells).forEach(function(key) {
-            var s = rateStats(points, key), c = n.cells[key],
-                rateValue = s ? rateText(s.rate) : '–',
-                sizeValue = (s && s.size != null) ? _('%d bytes').format(Math.round(s.size)) : '–';
-
-            if (c.rate.textContent !== rateValue)
-                c.rate.textContent = rateValue;
-            if (c.size.textContent !== sizeValue)
-                c.size.textContent = sizeValue;
-            if (key === 'rx') {
-                n.tick.hidden = !(s && s.steady);
-                if (s && s.steady)
-                    n.tick.textContent = _('The server sends about %d updates per second.').format(Math.round(s.rate));
-            }
+            var s = (!d.state || d.state === 'paused' || d.state === 'refresh') ? rateStats(points, key) : null,
+                cell = n.cells[key];
+            cell.rate.textContent = s ? rateText(s.rate) : '–';
+            cell.rate.title = s && s.size != null ? _('Average packet size: %d bytes').format(Math.round(s.size)) : '';
         });
-
-        // Ping: a graph once the server has answered, with a mark per ping without reply
-        var ping = pingStats(points), rtts = points.filter(function(p) { return p.rtt != null; }),
-            pingTop = niceMax(Math.max.apply(null, [ 0 ].concat(rtts.map(function(p) { return p.rtt; }))), 50);
-
-        n.pingBox.hidden = !rtts.length;
-        n.caption.hidden = n.pingBox.hidden && !(d.rx || d.tx);
-        n.ping.paths['gm-line--rtt'].setAttribute('d', chartPath(points, function(p) { return p.rtt; }, from, DETAILS_SPAN, pingTop));
-        n.ping.paths['gm-line--lost'].setAttribute('d', points.filter(function(p) { return p.rtt === null && p.t >= from; }).map(function(p) {
-            return 'M' + ((p.t - from) * 1000 / DETAILS_SPAN).toFixed(1) + ' 100V88';
-        }).join(''));
-        n.ping.top.textContent = msText(pingTop);
-        n.ping.half.textContent = msText(pingTop / 2);
-        n.pingValue.textContent = (ping && ping.last != null) ? msText(ping.last) : '–';
-        n.pingValue.title = (ping && ping.avg != null) ? _('Average %s').format(msText(ping.avg)) : '';
-        n.jitter.textContent = (ping && ping.jitter != null) ? msText(ping.jitter) : '–';
-        n.loss.textContent = ping ? _('%d%%').format(Math.round(ping.loss)) : '–';
     },
 
     // The cell of connectionAction: one or two buttons, or '–' with a tooltip. Two buttons sit in
