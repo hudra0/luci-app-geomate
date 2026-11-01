@@ -742,6 +742,147 @@ local function get_known_servers(sid)
     return result
 end
 
+-- Server details window (getServerSample): one stamp file per server address with the time of
+-- its last sample in ms, in RAM. A sample of a server comes at most every SAMPLE_MIN_GAP ms, and
+-- at most SAMPLE_MAX_SERVERS servers get one within SAMPLE_WINDOW ms, across all pages and tabs
+local SAMPLE_DIR = "/tmp/geomate/samples"
+local SAMPLE_MIN_GAP = 800
+local SAMPLE_WINDOW = 3000
+local SAMPLE_MAX_SERVERS = 4
+-- Stamps of other servers older than this are deleted
+local SAMPLE_STALE = 60000
+
+local function now_ms()
+    local sec, usec = nixio.gettimeofday()
+    return sec * 1000 + math.floor(usec / 1000)
+end
+
+-- Whether a server may get a sample now: false plus 'busy' within SAMPLE_MIN_GAP of its last
+-- one, false plus 'limit' while SAMPLE_MAX_SERVERS other servers had one within SAMPLE_WINDOW.
+-- Read only, apart from deleting stale stamps. A stamp from the future (the clock was set back)
+-- counts as stale
+local function sample_allowed(ip, now)
+    local others = 0
+    for name in nixio.fs.dir(SAMPLE_DIR) or function() end do
+        local path = SAMPLE_DIR .. "/" .. name
+        local f = ip_number(name) and io.open(path, "r")
+        local last = f and tonumber(f:read("*l") or "")
+        if f then
+            f:close()
+        end
+        local age = last and now - last
+        if name == ip then
+            if age and age >= 0 and age < SAMPLE_MIN_GAP then
+                return false, "busy"
+            end
+        elseif age and age >= 0 and age < SAMPLE_WINDOW then
+            others = others + 1
+        elseif f and (not age or age < 0 or age > SAMPLE_STALE) then
+            os.remove(path)
+        end
+    end
+    if others >= SAMPLE_MAX_SERVERS then
+        return false, "limit"
+    end
+    return true
+end
+
+-- Notes the sample time of a server, through a temp file and a rename. mkdirr comes with the Lua
+-- part of nixio.fs, which require "nixio" does not load
+local function stamp_sample(ip, now)
+    require("nixio.fs").mkdirr(SAMPLE_DIR)
+    local tmp = SAMPLE_DIR .. "/." .. ip .. "." .. nixio.getpid()
+    local f = io.open(tmp, "w")
+    if not f then
+        return
+    end
+    local ok = f:write(tostring(now), "\n")
+    f:close()
+    if not (ok and os.rename(tmp, SAMPLE_DIR .. "/" .. ip)) then
+        os.remove(tmp)
+    end
+end
+
+-- Whether the 'nft list set' output of a set lists the address as an element of its own, with
+-- or without a counter; element_counter() finds only elements with one
+local function set_lists(listing, ip)
+    local from = listing:find("elements = {", 1, true)
+    while from do
+        local p = listing:find(ip, from, true)
+        if not p then
+            return false
+        end
+        if listing:find("^[%s{]", p - 1) and listing:find("^[%s,}]", p + #ip) then
+            return true
+        end
+        from = p + 1
+    end
+    return false
+end
+
+-- One ICMP echo, as LuCI's Diagnostics page sends it: the round trip in ms, nil without a reply
+-- within 1 s. The address is a checked dotted quad
+local function ping_rtt(ip)
+    local handle = io.popen("ping -c1 -W1 -q '" .. ip .. "' 2>/dev/null")
+    if not handle then
+        return nil
+    end
+    local out = handle:read("*a") or ""
+    handle:close()
+    return tonumber(out:match("min/avg/max = [%d%.]+/([%d%.]+)/"))
+end
+
+-- getServerSample: the counters of one server of a filter for the details window, polled once
+-- per second while it is open. { t, tx = { packets, bytes }, rx = { packets, bytes }, ping, rtt }:
+-- t is the router's time of the counter read in ms, so the delay of the request does not change
+-- the rates. tx: what the filter's _dynamic set counted for the server (packets to it, backend
+-- token set_counters); rx: what its _rx set counted (packets from it, token rx_counters). Each
+-- only when the set has a counter for the server. ping: 'ok' with rtt in ms, 'timeout', or 'off'
+-- when not asked for. Errors: { error = 'invalid' } for an address that is no public IPv4
+-- address or a filter name the backend does not support, 'unknown' when no live or counter set
+-- of the filter has the server, 'busy' or 'limit' (sample_allowed).
+-- The server must be one of the filter's, so the page pings no other host. LuCI's Diagnostics
+-- page already pings any host, so this keeps the window to its purpose; it is no security
+-- boundary. 'nft list set' reads one set (1-2 ms each); 'nft get element' would load the whole
+-- ruleset, about 80 ms per call
+local function get_server_sample(args)
+    args = type(args) == "table" and args or {}
+    local ip, prefix = args.ip, filter_set_name(args.filter)
+    if type(ip) ~= "string" or not ip_number(ip) or not prefix or not is_public_ip(ip, router_addresses()) then
+        return { error = "invalid" }
+    end
+
+    local ok, reason = sample_allowed(ip, now_ms())
+    if not ok then
+        return { error = reason }
+    end
+
+    -- Read one after the other, each to its end (see get_ui_dynamic_ips)
+    local dynamic = nft_list_set(prefix .. "_dynamic")
+    local rx_listing = nft_list_set(prefix .. "_rx")
+    local t = now_ms()
+    local tx_packets, tx_bytes = element_counter(dynamic, ip)
+    local rx_packets, rx_bytes = element_counter(rx_listing, ip)
+    if not (tx_packets or rx_packets or set_lists(dynamic, ip)
+            or set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)) then
+        return { error = "unknown" }
+    end
+    stamp_sample(ip, t)
+
+    local reply = { t = t, ping = "off" }
+    if tx_packets and tx_bytes then
+        reply.tx = { packets = tx_packets, bytes = tx_bytes }
+    end
+    if rx_packets and rx_bytes then
+        reply.rx = { packets = rx_packets, bytes = rx_bytes }
+    end
+    if args.ping == true then
+        reply.rtt = ping_rtt(ip)
+        reply.ping = reply.rtt and "ok" or "timeout"
+    end
+    return reply
+end
+
 -- Function to check if an element is in a table
 function table_contains(tbl, element)
     for _, value in ipairs(tbl) do
@@ -1133,6 +1274,12 @@ local methods = {
         args = { sid = 'string' },
         call = function(args)
             return get_known_servers(type(args) == "table" and args.sid or nil)
+        end
+    },
+    getServerSample = {
+        args = { filter = 'string', ip = 'string', ping = true },
+        call = function(args)
+            return get_server_sample(args)
         end
     },
     getStatus = {
