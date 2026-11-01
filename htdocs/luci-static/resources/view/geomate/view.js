@@ -770,7 +770,7 @@ function showSeen(node, lastSeen, now) {
 var COLUMN_IP = 0, COLUMN_COUNTRY = 3, COLUMN_SEEN = 6, COLUMN_TRAFFIC = 7;
 
 // Choices of the "Sort by" select of the card layout: [ column, descending ]. Last seen from the
-// newest, traffic from the most packets
+// newest, traffic from the current rate, then the packet total
 var SORT_CHOICES = [ [ COLUMN_SEEN, false ], [ COLUMN_TRAFFIC, true ], [ COLUMN_IP, false ], [ COLUMN_COUNTRY, false ] ];
 
 // The packet rate of a server is taken over the replies of the last RATE_WINDOW ms, once they
@@ -807,6 +807,18 @@ function trafficRate(t) {
     return (first && last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
 }
 
+// Traffic column sort key, fixed width so a string compare matches the numeric order. Current
+// packets per second (hundredths) come first, the packet total breaks ties. A past row and a live
+// row that has no rate yet sort as 0 pkt/s, so a quiet history stays below anything still sending
+function trafficSortValue(rec, live) {
+    var t = rec && rec.traffic,
+        rate = (t && live) ? trafficRate(t) : null,
+        pps = (rate == null || rate < 0) ? 0 : Math.min(rate, 99999999.99),
+        packets = t ? Math.min(t.packets, 999999999999) : 0;
+
+    return ('0000000000' + Math.round(pps * 100)).slice(-10) + '-' + ('000000000000' + packets).slice(-12);
+}
+
 // Packets in total for a Traffic cell: exact below 10000, then rounded ('108k packets', '1.2M
 // packets'). The table never wraps the Traffic column, so a long session's total would widen
 // it; this way the text stays at most 12 characters. The tooltip keeps the exact count
@@ -833,8 +845,8 @@ function rateText(rate) {
 // packets in total of a past row and of a live row before its rate is known, '–' without counters
 // (older backend, static mode, a row an older view stored without them). The packets count those
 // the devices of the filter sent to the server since its first packet after the last service
-// start or after an hour without one. data-value: the packets, for sorting. The tooltip adds the
-// bytes, the average packet size and how long this page has seen the server
+// start or after an hour without one. data-value is trafficSortValue(), what the column sorts by.
+// The tooltip adds the bytes, the average packet size and how long this page has seen the server
 function showTraffic(node, rec, live) {
     var t = rec && rec.traffic,
         rate = (t && live) ? trafficRate(t) : null,
@@ -856,7 +868,7 @@ function showTraffic(node, rec, live) {
         node.textContent = text;
     node.classList.toggle('gm-traffic--none', !t);
     node.classList.toggle('gm-traffic--past', !live);
-    node.setAttribute('data-value', t ? t.packets : 0);
+    node.setAttribute('data-value', trafficSortValue(rec, live));
     if (title.length)
         node.setAttribute('title', title.join('\n'));
     else
@@ -890,7 +902,8 @@ var DETAILS_INTERVAL = 1000,
     PING_GIVE_UP = 3,
     PING_GIVE_UP_LATER = 10,
     ROUTE_INTERVAL = 2000,
-    ROUTE_STALE = 10000;
+    ROUTE_STALE = 10000,
+    ROUTE_GRAPH_GAP = 20000;
 
 // Packets per second between two counter readings of getServerSample ({ packets, bytes }) dt ms
 // apart: { pps, packets, bytes } with the counts in between. null when one is missing or a count
@@ -985,9 +998,11 @@ function niceMax(v, floor) {
 // 'from' on over span ms, scaled to max. The line breaks at a point without value and between
 // points more than DETAILS_MAX_GAP apart; each piece starts with a dot ('h0', round line caps),
 // so a single point shows
-function chartPath(points, value, from, span, max) {
+function chartPath(points, value, from, span, max, maxGap) {
     var d = [], prev = null;
 
+    if (maxGap == null)
+        maxGap = DETAILS_MAX_GAP;
     points.forEach(function(p) {
         var v = value(p);
 
@@ -996,7 +1011,7 @@ function chartPath(points, value, from, span, max) {
             return;
         }
         var x = ((p.t - from) * 1000 / span).toFixed(1), y = (100 - Math.min(v, max) * 98 / max).toFixed(1);
-        d.push((prev == null || p.t - prev > DETAILS_MAX_GAP) ? 'M' + x + ' ' + y + 'h0' : 'L' + x + ' ' + y);
+        d.push((prev == null || p.t - prev > maxGap) ? 'M' + x + ' ' + y + 'h0' : 'L' + x + ' ' + y);
         prev = p.t;
     });
     return d.join('');
@@ -1253,7 +1268,7 @@ return view.extend({
             this.showNotice();
 
         var nodes = E([], [ this.renderStatus(),
-            E('div', { 'id': 'geomate-overview' }, [
+            E('div', { 'id': 'geomate-overview', 'class': 'gm-overview--single' }, [
                 E('div', { 'class': 'gm-overview-grid' }, [ this.renderMap(), this.renderServerPanel() ])
             ]), this.renderConnections() ]);
 
@@ -2043,6 +2058,10 @@ return view.extend({
             options.captionClasses.push([ 'cbi-section-actions', 'gm-col-action' ]);
         }
         this.connectionsTable = new ui.Table(captions, options, E('em', {}, [ _('Loading connections…') ]));
+        // First visit sorts by the current rate. A sort the user already picked stays in LuCI's
+        // table-sort storage and is left as it is
+        if (!this.connectionsTable.getActiveSortState())
+            this.connectionsTable.setActiveSortState(COLUMN_TRAFFIC, true);
         // A click on a column title sorts in ui.Table's handler on the title row, before this one
         this.connectionsTable.render().addEventListener('click', L.bind(function(ev) {
             if (ev.target.matches('th[data-sortable-row]'))
@@ -3765,12 +3784,13 @@ return view.extend({
         var sorting = table.getActiveSortState();
         var key = JSON.stringify([ rows, placeholder ]);
 
-        // The order ui.Table gives the rows: descending negates the comparison, equal packets
-        // keep the order of the rows (stable sort)
+        // The order ui.Table gives the rows: descending negates the comparison, equal keys
+        // keep the order of the rows (stable sort). Live means a fresh reply, as showTraffic
         if (sorting && sorting[0] === COLUMN_TRAFFIC)
             key += JSON.stringify(entries.map(function(e, i) { return i; }).sort(function(a, b) {
-                var ta = entries[a].rec && entries[a].rec.traffic, tb = entries[b].rec && entries[b].rec.traffic;
-                return (sorting[1] ? -1 : 1) * ((ta ? ta.packets : 0) - (tb ? tb.packets : 0)) || (a - b);
+                var ka = trafficSortValue(entries[a].rec, entries[a].lastSeen == null),
+                    kb = trafficSortValue(entries[b].rec, entries[b].lastSeen == null);
+                return (sorting[1] ? -1 : 1) * (ka < kb ? -1 : ka > kb ? 1 : 0) || (a - b);
             }));
 
         if (key === this.connectionsKey) {
@@ -3942,6 +3962,7 @@ return view.extend({
             `), E('div', { 'class': 'gm-server-heading' }, [ n.serverTitle, n.serverToggle, n.serverClose ]), n.serverEmpty, n.serverBody
         ]);
         n.serverTitle.id = 'gm-server-title';
+        n.serverPanel.hidden = true;
         return n.serverPanel;
     },
 
@@ -4284,9 +4305,9 @@ return view.extend({
         this.addRoutePoint(d, reply);
     },
 
-    // History of the route graph, on the router's clock like the samples: a point per measurement,
-    // a gap for one without reply and before a changed answering router or TTL. A cached reply
-    // repeats the last measurement and adds nothing
+    // History of the route graph, on the router's clock like the samples: a point per successful
+    // measurement, a gap only before a changed answering router or TTL. A missed hop reply is
+    // common and keeps the line. A cached reply repeats the last measurement and adds nothing
     addRoutePoint: function(d, reply) {
         var points = d.routePoints, last = points[points.length - 1], t = reply.measured_at;
 
@@ -4296,13 +4317,12 @@ return view.extend({
         if (last && t < last.t)
             points.length = 0;
         last = points[points.length - 1];
+        // A missed hop reply is common; keep the line and only break on a hop change
         if (reply.status !== 'ok')
+            return;
+        if (last && last.rtt != null && (last.responder !== reply.responder || last.ttl !== reply.ttl))
             points.push({ t: t, rtt: null });
-        else {
-            if (last && last.rtt != null && (last.responder !== reply.responder || last.ttl !== reply.ttl))
-                points.push({ t: t, rtt: null });
-            points.push({ t: t, rtt: reply.rtt, responder: reply.responder, ttl: reply.ttl });
-        }
+        points.push({ t: t, rtt: reply.rtt, responder: reply.responder, ttl: reply.ttl });
         while (t - points[0].t > DETAILS_SPAN)
             points.shift();
     },
@@ -4510,7 +4530,7 @@ return view.extend({
             rtt = function(p) { return p.rtt; };
 
         n.ping.paths['gm-line--rtt'].setAttribute('d', routed.length ? '' : chartPath(points, rtt, from, DETAILS_SPAN, pingTop));
-        n.ping.paths['gm-line--route'].setAttribute('d', routed.length ? chartPath(route, rtt, from, DETAILS_SPAN, pingTop) : '');
+        n.ping.paths['gm-line--route'].setAttribute('d', routed.length ? chartPath(route, rtt, from, DETAILS_SPAN, pingTop, ROUTE_GRAPH_GAP) : '');
         n.ping.paths['gm-line--lost'].setAttribute('d', rtts.length ? points.filter(function(p) { return p.rtt === null && p.t >= from; }).map(function(p) {
             return 'M' + ((p.t - from) * 1000 / DETAILS_SPAN).toFixed(1) + ' 100V88';
         }).join('') : '');
