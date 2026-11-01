@@ -908,6 +908,286 @@ local function get_server_sample(args)
     return reply
 end
 
+-- Route RTT is independent of server ping. One globally locked job sends at most 26
+-- small ICMP probes, to the selected server only. TTL hints avoid repeated full traces.
+local ROUTE_DIR = "/tmp/geomate/route"
+local ROUTE_GAP = 5
+local ROUTE_REDISCOVER = 60
+local ROUTE_HINT_AGE = 180
+
+local function route_uptime()
+    local f = io.open("/proc/uptime", "r")
+    if not f then return nil end
+    local value = tonumber((f:read(64) or ""):match("^(%d+%.?%d*)"))
+    f:close()
+    return value
+end
+
+local function route_word(n)
+    return string.char(math.floor(n / 256) % 256, n % 256)
+end
+
+local function route_address(ip)
+    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    return string.char(tonumber(a), tonumber(b), tonumber(c), tonumber(d))
+end
+
+local function route_checksum(data)
+    local total = 0
+    for i = 1, #data, 2 do
+        total = total + data:byte(i) * 256 + (data:byte(i + 1) or 0)
+    end
+    while total > 65535 do total = total % 65536 + math.floor(total / 65536) end
+    return 65535 - total
+end
+
+-- Nixio exposes IP_HDRINCL, but not IP_TTL. Linux fills the IPv4 length, checksum,
+-- zero source address and zero packet ID; the ICMP checksum remains ours.
+local function route_packet(ip, id, seq, ttl)
+    local echo = string.char(8, 0, 0, 0) .. route_word(id) .. route_word(seq) .. "geomate-route"
+    echo = echo:sub(1, 2) .. route_word(route_checksum(echo)) .. echo:sub(5)
+    return string.char(69, 0, 0, 0, 0, 0, 0, 0, ttl, 1, 0, 0, 0, 0, 0, 0)
+        .. route_address(ip) .. echo
+end
+
+-- Only an exact endpoint echo or a correlated TTL-expired message can supply RTT.
+-- ICMP unreachable and other control messages are not alternate latency sources.
+local function route_reply(data, host, ip, id, seq)
+    if type(host) ~= "string" or not ip_number(host) or type(data) ~= "string"
+            or #data < 28 or math.floor(data:byte(1) / 16) ~= 4
+            or data:byte(10) ~= 1 then return nil end
+    local h = data:byte(1) % 16 * 4
+    if h < 20 or #data < h + 8 then return nil end
+    local length = data:byte(3) * 256 + data:byte(4)
+    if length < h + 8 or #data < length or data:sub(13, 16) ~= route_address(host)
+            or data:byte(7) % 64 ~= 0 or data:byte(8) ~= 0
+            or route_checksum(data:sub(h + 1, length)) ~= 0 then return nil end
+    local kind, code = data:byte(h + 1, h + 2)
+    local tag = route_word(id) .. route_word(seq)
+    if kind == 0 and code == 0 and host == ip and data:sub(h + 5, h + 8) == tag
+            and data:sub(h + 9, length) == "geomate-route" then
+        return true
+    end
+    if kind ~= 11 or code ~= 0 then return nil end
+    local inner = h + 8
+    if #data < inner + 20 or math.floor(data:byte(inner + 1) / 16) ~= 4 then return nil end
+    local ih = data:byte(inner + 1) % 16 * 4
+    local echo = inner + ih
+    if ih < 20 or length < echo + 8 or data:byte(inner + 10) ~= 1
+            or data:byte(inner + 3) * 256 + data:byte(inner + 4) < ih + 8
+            or data:byte(inner + 7) % 64 ~= 0 or data:byte(inner + 8) ~= 0
+            or data:sub(inner + 17, inner + 20) ~= route_address(ip)
+            or data:byte(echo + 1) ~= 8 or data:byte(echo + 2) ~= 0
+            or data:sub(echo + 5, echo + 8) ~= tag then return nil end
+    return false
+end
+
+local function measure_route(ip, hint)
+    local sock
+    local ok, result, next_hint, observed = pcall(function()
+        sock = nixio.socket("inet", "raw", "icmp")
+        if not sock or not sock:setsockopt("ip", "hdrincl", 1) or not sock:setblocking(false) then
+            return { error = "unsupported" }
+        end
+        local started = route_uptime()
+        if not started then return { error = "clock" } end
+        local previous, deadline, sequence, received = started, started + 7, 0, 0
+        local fault
+        local id = nixio.getpid() % 65536
+        local pollset = {{ fd = sock, events = nixio.poll_flags("in") }}
+        local function clock()
+            local now = route_uptime()
+            if not now or now < previous then fault = "clock"; return deadline end
+            previous = now
+            return now
+        end
+        local function wall()
+            local sec, usec = nixio.gettimeofday()
+            return sec * 1000 + usec / 1000
+        end
+        local function probe(ttl, timeout)
+            local sent = clock()
+            if fault or sent >= deadline or sequence >= 28 or received >= 512 then return nil end
+            sequence = sequence + 1
+            local packet = route_packet(ip, id, sequence, ttl)
+            local sent_wall = wall()
+            if sock:sendto(packet, ip, 0) ~= #packet then fault = "internal"; return nil end
+            local limit = math.min(sent + timeout, deadline)
+            while not fault do
+                local now = clock()
+                if now >= limit or received >= 512 then break end
+                local ready = nixio.poll(pollset, math.max(1, math.ceil((limit - now) * 1000)))
+                if ready == nil then fault = "internal"; break end
+                if not ready or ready <= 0 then break end
+                local data, host = sock:recvfrom(2048)
+                received = received + 1
+                local at, at_wall = clock(), wall()
+                local endpoint = route_reply(data, host, ip, id, sequence)
+                if endpoint ~= nil and at <= limit then
+                    local rtt = at_wall - sent_wall
+                    -- /proc/uptime has 10 ms resolution. Reject wall-clock steps rather
+                    -- than displaying negative or implausible RTT after time correction.
+                    if rtt < 0 or rtt > timeout * 1000 + 20
+                            or math.abs(rtt - (at - sent) * 1000) > 25 then
+                        fault = "clock"; break
+                    end
+                    return { rtt = rtt, responder = host, ttl = ttl, endpoint = endpoint,
+                        measured_at = math.floor(at_wall), observed = at }
+                end
+            end
+        end
+        local last, samples = nil, {}
+        if not hint then
+            for ttl = 1, 24 do
+                local value = probe(ttl, 0.2)
+                if value then last = value end
+                if fault or clock() >= deadline or (value and value.endpoint) then break end
+            end
+            hint = last and last.ttl
+            if last then samples[1] = last end
+        end
+        if hint then
+            for _ = #samples + 1, 3 do
+                local value = probe(hint, 0.4)
+                if value then samples[#samples + 1] = value; last = value end
+                if fault or clock() >= deadline then break end
+            end
+        end
+        if fault then return { error = fault } end
+        if not last then return { status = "no_reply", measured_at = now_ms() } end
+        -- A changed responder is a different measurement, even at the same TTL.
+        local values = {}
+        for _, value in ipairs(samples) do
+            if value.responder == last.responder and value.endpoint == last.endpoint then
+                values[#values + 1] = value.rtt
+            end
+        end
+        table.sort(values)
+        local middle = math.floor(#values / 2) + 1
+        local median = #values % 2 == 1 and values[middle] or (values[middle - 1] + values[middle]) / 2
+        return { status = "ok", rtt = math.floor(median * 1000 + 0.5) / 1000,
+            responder = last.responder, ttl = last.ttl, endpoint = last.endpoint,
+            measured_at = last.measured_at }, last.ttl, last.observed
+    end)
+    if sock then sock:close() end
+    if not ok then return { error = "internal" } end
+    return result, next_hint, observed
+end
+
+local function load_route_state(now)
+    local f = io.open(ROUTE_DIR .. "/state.json", "r")
+    local content = f and f:read(16385)
+    if f then f:close() end
+    local state = content and #content <= 16384 and jsonc.parse(content) or {}
+    if type(state) ~= "table" then state = {} end
+    if type(state.entries) ~= "table" then state.entries = {} end
+    if type(state.last_attempt) ~= "number" or state.last_attempt > now then state.last_attempt = nil end
+    local entries = {}
+    for ip, entry in pairs(state.entries) do
+        if type(ip) == "string" and ip_number(ip) and type(entry) == "table"
+                and type(entry.at) == "number" and entry.at <= now and now - entry.at <= 300
+                and type(entry.discovered) == "number" and entry.discovered <= now then
+            entries[#entries + 1] = { ip = ip, entry = entry }
+        end
+    end
+    table.sort(entries, function(a, b) return a.entry.at > b.entry.at end)
+    state.entries = {}
+    for i = 1, math.min(#entries, 20) do state.entries[entries[i].ip] = entries[i].entry end
+    return state
+end
+
+local function save_route_state(state)
+    local path = ROUTE_DIR .. "/state.json"
+    local tmp = path .. "." .. nixio.getpid()
+    local f = io.open(tmp, "w")
+    if not f then return false end
+    local written = f:write(jsonc.stringify(state))
+    local closed = f:close()
+    if written and closed and os.rename(tmp, path) then return true end
+    os.remove(tmp)
+    return false
+end
+
+local function route_response(ip, entry, now, cached)
+    local reply = {}
+    for key, value in pairs(entry.result) do reply[key] = value end
+    reply.ip, reply.method, reply.cached = ip, "route", cached
+    reply.age_ms = math.floor(math.max(0, now - (entry.observed or entry.at)) * 1000)
+    reply.refresh_after_ms = math.ceil(math.max(0, ROUTE_GAP - (now - entry.at)) * 1000)
+    return reply
+end
+
+local function get_server_route(args)
+    args = type(args) == "table" and args or {}
+    local ip, prefix = args.ip, filter_set_name(args.filter)
+    if not prefix then return { error = "invalid_filter" } end
+    if type(ip) ~= "string" or not ip_number(ip) or not is_public_ip(ip, router_addresses()) then
+        return { error = "invalid_target" }
+    end
+    local first, second = ip:match("^(%d+)%.(%d+)%.")
+    if tonumber(first) == 100 and tonumber(second) >= 64 and tonumber(second) <= 127 then
+        return { error = "invalid_target" }
+    end
+    if not (set_lists(nft_list_set(prefix .. "_dynamic"), ip)
+            or set_lists(nft_list_set(prefix .. "_rx"), ip)
+            or set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)) then
+        return { error = "unknown_target" }
+    end
+    require("nixio.fs").mkdirr(ROUTE_DIR)
+    local lock = nixio.open(ROUTE_DIR .. "/.lock", "w", "600")
+    if not lock then return { error = "busy" } end
+    if not lock:lock("tlock") then lock:close(); return { error = "busy" } end
+    -- The descriptor stays locked through measurement and cache publication. Never unlink it.
+    local ok, reply = pcall(function()
+        local now = route_uptime()
+        if not now then return { error = "clock" } end
+        local state = load_route_state(now)
+        local entry = state.entries[ip]
+        if entry and type(entry.result) == "table" and now - entry.at < ROUTE_GAP then
+            return route_response(ip, entry, now, true)
+        end
+        if state.last_attempt and now - state.last_attempt < ROUTE_GAP then
+            return { error = "rate_limited", retry_after_ms = math.ceil((ROUTE_GAP - (now - state.last_attempt)) * 1000) }
+        end
+        local hint = entry and entry.hint
+        if type(hint) ~= "number" or hint < 1 or hint > 24 or hint % 1 ~= 0
+                or now - entry.discovered >= ROUTE_HINT_AGE then hint = nil end
+        if entry and not hint and now - entry.discovered < ROUTE_REDISCOVER then
+            return { error = "rate_limited", retry_after_ms = math.ceil((ROUTE_REDISCOVER - (now - entry.discovered)) * 1000) }
+        end
+        if not entry then
+            local count, oldest, oldest_time = 0, nil, now
+            for other, value in pairs(state.entries) do
+                count = count + 1
+                if value.at <= oldest_time then oldest, oldest_time = other, value.at end
+            end
+            if count >= 20 then state.entries[oldest] = nil end
+            entry = { at = now, discovered = now }
+            state.entries[ip] = entry
+        end
+        if not hint then entry.discovered = now end
+        state.last_attempt = now
+        if not save_route_state(state) then return { error = "internal" } end
+        local result, next_hint, observed = measure_route(ip, hint)
+        local finished = route_uptime()
+        if not finished or finished < now then return { error = "clock" } end
+        state.last_attempt, entry.at = finished, finished
+        if not result.error then
+            entry.result, entry.observed = result, observed or finished
+            -- On a failed hint, retry it until rediscovery is allowed; the next request
+            -- can then discover again without adding a second trace to this job.
+            entry.hint = next_hint or (hint and finished - entry.discovered < ROUTE_REDISCOVER and hint or nil)
+        else
+            entry.result, entry.observed = nil, nil
+        end
+        if not save_route_state(state) then return { error = "internal" } end
+        if result.error then return result end
+        return route_response(ip, entry, finished, false)
+    end)
+    lock:close()
+    return ok and reply or { error = "internal" }
+end
+
 -- Function to check if an element is in a table
 function table_contains(tbl, element)
     for _, value in ipairs(tbl) do
@@ -1306,6 +1586,10 @@ local methods = {
         call = function(args)
             return get_server_sample(args)
         end
+    },
+    getServerRoute = {
+        args = { filter = 'string', ip = 'string' },
+        call = get_server_route
     },
     getStatus = {
         call = function()

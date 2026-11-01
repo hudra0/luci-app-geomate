@@ -186,6 +186,16 @@ var callServerSample = rpc.declare({
     nobatch: true
 });
 
+// A bounded route measurement, separate from direct ICMP samples and their statistics.
+var callServerRoute = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getServerRoute',
+    params: [ 'filter', 'ip' ],
+    expect: { '': {} },
+    reject: true,
+    nobatch: true
+});
+
 // A getKnownServers answer as the map takes it: { total, approx, decimals, missing, points:
 // [[lat, lon, n]] }, or null for an error or an answer of another form, which the map then shows
 // as unknown. decimals (how far merged positions were rounded) only when it is 0, 1 or 2: an older
@@ -878,7 +888,9 @@ var DETAILS_INTERVAL = 1000,
     DETAILS_SESSION = 10 * 60 * 1000,
     DETAILS_LIMIT_RETRY = 3000,
     PING_GIVE_UP = 3,
-    PING_GIVE_UP_LATER = 10;
+    PING_GIVE_UP_LATER = 10,
+    ROUTE_INTERVAL = 5000,
+    ROUTE_STALE = 15000;
 
 // Packets per second between two counter readings of getServerSample ({ packets, bytes }) dt ms
 // apart: { pps, packets, bytes } with the counts in between. null when one is missing or a count
@@ -1206,6 +1218,8 @@ return view.extend({
     restartAt: 0,           // time of that change
     details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
+    routeOff: false,        // missing route method/permission; direct samples remain available
+    routeRequest: null,     // one route call across selections, including late replies
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so the status calls would delay the map. startPolls() fetches the
@@ -2381,8 +2395,10 @@ return view.extend({
             this.pollHidden(true);
             this.saveRecent(true);
             // A sample on its way finishes, the next one waits for the tab (sampleDetails)
-            if (this.details)
+            if (this.details) {
                 window.clearTimeout(this.details.timer);
+                this.invalidateServerRoute(this.details);
+            }
         } else {
             this.pollHidden(false);
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
@@ -3896,6 +3912,13 @@ return view.extend({
                 .gm-details .gm-chart-label { position: absolute; top: 4px; left: 2px; font-size: 11px; line-height: 1; opacity: 0.7; pointer-events: none; }
                 .gm-details .gm-chart-label--half { top: 50%; }
                 .gm-details-caption { margin: 2px 0 0; font-size: 11px; opacity: 0.65; text-align: right; }
+                .gm-route { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(128, 128, 128, 0.3); }
+                .gm-route-head { display: flex; align-items: center; gap: 8px; }
+                .gm-route-head .cbi-button { margin: 0 0 0 auto; flex: none; }
+                .gm-route-value { font-size: 1.15em; white-space: nowrap; }
+                .gm-route-label { font-size: 90%; opacity: 0.7; }
+                .gm-route-meta, .gm-route-hint, .gm-route-note { display: block; margin-top: 4px; font-size: 85%; overflow-wrap: anywhere; }
+                .gm-route-meta, .gm-route-hint { opacity: 0.65; }
                 .gm-packet-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-top: 14px; font-size: 90%; }
                 .gm-packet-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; }
                 .gm-packet-stat { white-space: nowrap; }
@@ -3937,6 +3960,7 @@ return view.extend({
         d.collapsed = !d.collapsed;
         if (d.collapsed) {
             d.sampleEpoch++;
+            this.invalidateServerRoute(d);
             window.clearTimeout(d.timer);
             d.timer = null;
             d.currentRtt = null;
@@ -4009,7 +4033,9 @@ return view.extend({
             ping: true, pingFails: 0, pingReplied: false, currentRtt: null, pingTimeout: false,
             last: null, points: [], state: '', manualPause: false,
             started: performance.now(), wait: DETAILS_INTERVAL, failures: 0,
-            busy: false, stopped: false, collapsed: false, sampleEpoch: 0, timer: null, nodes: {}
+            busy: false, stopped: false, collapsed: false, sampleEpoch: 0, timer: null, nodes: {},
+            routeEnabled: false, routeEpoch: 0, routeNextAt: 0, routeResult: null,
+            routeReceivedAt: 0, routeState: '', routeAttempted: false
         };
         n = d.nodes;
         n.status = E('span');
@@ -4038,6 +4064,16 @@ return view.extend({
             E('p', { 'class': 'gm-details-caption' }, [ _('Last 3 minutes') ])
         ]);
 
+        n.routeValue = E('strong', { 'class': 'gm-route-value' }, [ '–' ]);
+        n.routeMeta = E('span', { 'class': 'gm-route-meta', 'hidden': '' });
+        n.routeHint = E('span', { 'class': 'gm-route-hint' });
+        n.routeNote = E('span', { 'class': 'gm-route-note', 'hidden': '' });
+        n.routeButton = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.sampleServerRoute, this, d, true) }, [ _('Measure') ]);
+        n.routeBox = E('div', { 'class': 'gm-route' }, [
+            E('div', { 'class': 'gm-route-head' }, [ E('span', { 'class': 'gm-route-label' }, [ _('Route RTT') ]), n.routeValue, n.routeButton ]),
+            n.routeMeta, n.routeNote, n.routeHint
+        ]);
+
         n.rates = detailsChart([ 'gm-line--tx', 'gm-line--rx' ]);
         n.cells = {};
         var packet = function(key, label) {
@@ -4061,7 +4097,7 @@ return view.extend({
         d.root = E('div', { 'class': 'gm-server-content' }, [
             E('div', { 'class': 'gm-server-head' }, [
                 E('div', { 'class': 'gm-server-meta' }, [ n.status, n.geo ]), n.pause
-            ]), n.note, n.pingStats, n.pingBox, n.ratesBox, n.countsHint
+            ]), n.note, n.pingStats, n.pingBox, n.routeBox, n.ratesBox, n.countsHint
         ]);
         n.ratesBox.hidden = !(d.rx || d.tx);
         n.countsHint.hidden = !n.countsHint.textContent;
@@ -4118,6 +4154,7 @@ return view.extend({
             return this.continueDetails(d);
         d.state = 'paused';
         d.manualPause = true;
+        this.invalidateServerRoute(d);
         window.clearTimeout(d.timer);
         d.timer = null;
         this.showDetails();
@@ -4143,7 +4180,126 @@ return view.extend({
         d.pingReplied = false;
         d.currentRtt = null;
         d.pingTimeout = false;
+        d.routeEnabled = false;
+        this.invalidateServerRoute(d);
         this.showDetails();
+    },
+
+    // A discarded route result must not become current again after Hide/Show or Pause/Resume.
+    invalidateServerRoute: function(d) {
+        d.routeEpoch++;
+        d.routeResult = null;
+        if (d.routeState === 'measuring' || d.routeState === 'ok')
+            d.routeState = '';
+    },
+
+    routePanelActive: function(d) {
+        return this.details === d && !d.stopped && !d.collapsed && !document.hidden &&
+            poll.active() && d.state !== 'paused' && d.state !== 'refresh' &&
+            performance.now() - d.started < DETAILS_SESSION && this.detailsShown(d);
+    },
+
+    // The existing sample tick checks the next due time; there are no additional per-IP timers.
+    sampleServerRoute: function(d, manual) {
+        var self = this, now = performance.now(), job;
+
+        if (!d || this.routeOff || !this.routePanelActive(d))
+            return;
+        if (manual)
+            d.routeEnabled = true;
+        if (!d.routeEnabled) {
+            if (d.ping || !d.pingFails)
+                return;
+            d.routeEnabled = true;
+        }
+        if (this.routeRequest || now < d.routeNextAt)
+            return;
+
+        job = this.routeRequest = { details: d, epoch: d.routeEpoch };
+        d.routeAttempted = true;
+        d.routeState = 'measuring';
+        this.showServerRoute(d);
+        return callServerRoute(d.filter, d.ip).then(function(reply) {
+            if (self.routePanelActive(d) && job.epoch === d.routeEpoch)
+                self.serverRouteReply(d, L.isObject(reply) ? reply : {});
+        }, function(err) {
+            if (!self.routePanelActive(d) || job.epoch !== d.routeEpoch)
+                return;
+            d.routeResult = null;
+            d.routeState = 'unavailable';
+            d.routeNextAt = performance.now() + ROUTE_INTERVAL;
+            if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
+                self.routeOff = true;
+                d.routeState = 'unsupported';
+            }
+        }).finally(function() {
+            if (self.routeRequest === job)
+                self.routeRequest = null;
+            if (self.details)
+                self.showServerRoute(self.details);
+        });
+    },
+
+    serverRouteReply: function(d, reply) {
+        var now = performance.now(), delay = ROUTE_INTERVAL;
+
+        d.routeResult = null;
+        if (reply.error) {
+            d.routeState = reply.error === 'unsupported' ? 'unsupported'
+                : reply.error === 'busy' || reply.error === 'rate_limited' ? 'waiting'
+                : reply.error === 'unknown_target' ? 'unknown' : 'unavailable';
+            if (d.routeState === 'unsupported')
+                this.routeOff = true;
+            if (Number.isFinite(reply.retry_after_ms) && reply.retry_after_ms > 0)
+                delay = Math.max(ROUTE_INTERVAL, Math.min(60000, reply.retry_after_ms));
+            d.routeNextAt = now + delay;
+            return;
+        }
+        if (reply.ip !== d.ip || reply.method !== 'route' ||
+            (reply.status !== 'ok' && reply.status !== 'no_reply') ||
+            !Number.isFinite(reply.measured_at) || reply.measured_at <= 0 ||
+            !Number.isFinite(reply.age_ms) || reply.age_ms < 0 || typeof reply.cached !== 'boolean' ||
+            (reply.status === 'ok' && (!Number.isFinite(reply.rtt) || reply.rtt < 0 ||
+                typeof reply.responder !== 'string' || !validIPv4(reply.responder) ||
+                !Number.isInteger(reply.ttl) || reply.ttl < 1 || reply.ttl > 24 ||
+                typeof reply.endpoint !== 'boolean' || (reply.endpoint && reply.responder !== d.ip)))) {
+            d.routeState = 'unavailable';
+            d.routeNextAt = now + ROUTE_INTERVAL;
+            return;
+        }
+        if (Number.isFinite(reply.refresh_after_ms) && reply.refresh_after_ms >= 0)
+            delay = Math.max(1000, Math.min(ROUTE_INTERVAL, reply.refresh_after_ms));
+        else
+            delay = Math.max(1000, ROUTE_INTERVAL - reply.age_ms);
+        d.routeNextAt = now + delay;
+        d.routeReceivedAt = now;
+        d.routeState = reply.status;
+        d.routeResult = reply.status === 'ok' ? reply : null;
+    },
+
+    showServerRoute: function(d) {
+        var n = d && d.nodes, now = performance.now(), result = d && d.routeResult,
+            age = result ? result.age_ms + Math.max(0, now - d.routeReceivedAt) : 0,
+            stale = !!result && age >= ROUTE_STALE,
+            measuring = this.routeRequest && this.routeRequest.details === d,
+            notes = { no_reply: _('No route reply'), waiting: _('Waiting for measurement'),
+                unknown: _('No recent traffic'), unavailable: _('Route measurement unavailable'),
+                unsupported: _('Route measurements unavailable') },
+            text = d && notes[this.routeOff ? 'unsupported' : d.routeState] || '';
+
+        if (!n || !n.routeBox)
+            return;
+        if (stale)
+            text = _('Measurement expired');
+        n.routeValue.textContent = result && !stale ? msText(result.rtt) : '–';
+        n.routeMeta.hidden = !result;
+        n.routeMeta.textContent = result ? _('%s · TTL %d · %d s ago').format(result.responder, result.ttl, Math.floor(age / 1000)) : '';
+        n.routeMeta.title = result ? new Date(result.measured_at).toLocaleString() : '';
+        n.routeHint.textContent = result && result.endpoint ? _('ICMP reply from the destination.') : _('To an intermediate router, not the game server.');
+        n.routeNote.textContent = text;
+        n.routeNote.hidden = !text;
+        n.routeButton.textContent = measuring ? _('Measuring…') : d.routeAttempted ? _('Refresh') : _('Measure');
+        n.routeButton.disabled = !!this.routeRequest || this.routeOff || !this.routePanelActive(d) || now < d.routeNextAt;
     },
 
     // Status, filter and geo text of the selected server, as the table shows the server now: its
@@ -4183,6 +4339,7 @@ return view.extend({
         if (!poll.active()) {
             if (d.state !== 'refresh') {
                 d.state = 'refresh';
+                this.invalidateServerRoute(d);
                 this.showDetails();
             }
             d.timer = window.setTimeout(L.bind(this.sampleDetails, this), DETAILS_INTERVAL);
@@ -4191,10 +4348,12 @@ return view.extend({
         if (performance.now() - d.started >= DETAILS_SESSION) {
             d.manualPause = false;
             d.state = 'paused';
+            this.invalidateServerRoute(d);
             return this.showDetails();
         }
 
         d.busy = true;
+        this.sampleServerRoute(d, false);
         epoch = d.sampleEpoch;
         sent = performance.now();
         callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
@@ -4208,6 +4367,7 @@ return view.extend({
             if (self.details !== d)
                 return;
             self.showDetails();
+            self.sampleServerRoute(d, false);
             if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden)
                 d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (performance.now() - sent)));
         });
@@ -4288,6 +4448,7 @@ return view.extend({
 
         if (!d)
             return;
+        this.showServerRoute(d);
         var points = d.points,
             end = points.length ? points[points.length - 1].t : 0,
             from = end - DETAILS_SPAN,
