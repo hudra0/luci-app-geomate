@@ -3858,7 +3858,7 @@ return view.extend({
 
         n.serverTitle = E('h3', { 'class': 'gm-server-title' }, [ _('Server') ]);
         n.serverToggle = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'aria-controls': 'gm-server-body', 'aria-expanded': 'true', 'hidden': '', 'click': L.bind(this.toggleServerPanel, this) }, [ _('Hide') ]);
-        n.serverClose = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'hidden': '', 'click': L.bind(this.closeServerPanel, this) }, [ _('Close') ]);
+        n.serverClose = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.closeServerPanel, this) }, [ _('Close') ]);
         n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a connection') ]);
         n.serverBody = E('div', { 'id': 'gm-server-body', 'class': 'gm-server-body' });
         n.serverPanel = E('section', { 'id': 'gm-server-panel', 'class': 'cbi-section gm-details', 'tabindex': '-1', 'aria-labelledby': 'gm-server-title' }, [
@@ -3921,7 +3921,7 @@ return view.extend({
             overview = n.serverPanel.closest('#geomate-overview');
 
         n.serverBody.hidden = collapsed;
-        n.serverToggle.hidden = n.serverClose.hidden = !d;
+        n.serverToggle.hidden = !d;
         n.serverToggle.textContent = collapsed ? _('Show') : _('Hide');
         n.serverToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
         n.serverPanel.classList.toggle('gm-server-collapsed', collapsed);
@@ -3956,7 +3956,12 @@ return view.extend({
     closeServerPanel: function() {
         var n = this.nodes, target = n.connectionsWrap && n.connectionsWrap.querySelector('.gm-server-link[aria-current="true"]');
 
-        this.closeDetails();
+        if (this.details)
+            this.closeDetails();
+        else {
+            n.serverPanel.hidden = true;
+            this.updateServerPanelLayout();
+        }
         target = target || n.frame;
         if (target)
             target.focus({ preventScroll: true });
