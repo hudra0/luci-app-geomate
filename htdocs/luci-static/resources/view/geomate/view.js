@@ -1703,16 +1703,19 @@ return view.extend({
             #geomate-overview { container: gm-overview / inline-size; margin-top: 12px; }
             .gm-overview-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: 12px; align-items: stretch; }
             .gm-overview--single .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
-            #geomate-map-container { margin: 0; min-width: 0; }
-            .gm-map-frame { display: block; width: 100%; height: clamp(400px, 54vh, 490px); border: 0; }
+            /* The map is shorter while the connections are shown; a taller server panel beside it
+               stretches the map instead of leaving a gap below it */
+            #geomate-map-container { margin: 0; min-width: 0; display: flex; flex-direction: column; }
+            .gm-map-frame { display: block; flex: 1 0 auto; width: 100%; height: 80vh; border: 0; }
+            .gm-map-frame.gm-map-frame--short { height: 600px; height: min(600px, 80vh); }
             @container gm-overview (max-width: 900px) {
                 .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
-                .gm-map-frame { height: clamp(260px, 42vh, 360px); }
+                .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
             }
             @supports not (container-type: inline-size) {
                 @media (max-width: 1100px) {
                     .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
-                    .gm-map-frame { height: 360px; }
+                    .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
                 }
             }
             /* Fullscreen: the map covers the window. An ancestor with its own z-index (Argon's
@@ -1866,7 +1869,7 @@ return view.extend({
     },
 
     // Section below the map: a <details> whose summary is the "Active connections (n)" heading
-    // with a Show/Hide label, and the table, open initially
+    // with a Show/Hide label, and the table, collapsed until shown
     renderConnections: function() {
         var n = this.nodes;
 
@@ -2067,7 +2070,7 @@ return view.extend({
 
         // updateActiveConnectionsList() sets the count in the title span
         n.connectionsTitle = E('span', { 'class': 'gm-connections-title' }, [ _('Active connections') ]);
-        n.connectionsToggle = E('span', {}, [ _('Hide') ]);
+        n.connectionsToggle = E('span', {}, [ _('Show') ]);
         // With flow offloading the firewall forwards an established connection past geomate's
         // prerouting rules, which fill the live list and count the packets (updateStatus shows it
         // and sets the text)
@@ -2076,7 +2079,6 @@ return view.extend({
         n.connections = E('details', {
             'class': 'cbi-section',
             'id': 'active-connections-container',
-            'open': '',
             'toggle': L.bind(this.toggleConnections, this)
         }, [
             style,
@@ -2116,6 +2118,7 @@ return view.extend({
     connectionsSorted: function() {
         this.updateActiveConnectionsList();
         this.showSortChoice();
+        this.updateSelectedConnection();
     },
 
     // Show the choice the table is sorted by in the "Sort by" select: its column in its direction.
@@ -2152,14 +2155,17 @@ return view.extend({
         wrap.classList.add('gm-sticky-fill');
     },
 
-    // After the connections section opened or closed: update its label and sticky header
+    // After the connections section opened or closed: the map gets smaller while the table is shown
     toggleConnections: function() {
         var n = this.nodes,
             show = n.connections.open;
 
         n.connectionsToggle.textContent = show ? _('Hide') : _('Show');
-        if (show)
+        n.frame.classList.toggle('gm-map-frame--short', show);
+        if (show) {
             this.updateStickyHeader();
+            n.connections.scrollIntoView({ behavior: 'smooth' });
+        }
     },
 
     // Show the last status and health check in the status row; polled: with a new status reply,
@@ -3875,7 +3881,7 @@ return view.extend({
         n.serverTitle = E('h3', { 'class': 'gm-server-title' }, [ _('Server') ]);
         n.serverToggle = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'aria-controls': 'gm-server-body', 'aria-expanded': 'true', 'hidden': '', 'click': L.bind(this.toggleServerPanel, this) }, [ _('Hide') ]);
         n.serverClose = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.closeServerPanel, this) }, [ _('Close') ]);
-        n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a connection') ]);
+        n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a server') ]);
         n.serverBody = E('div', { 'id': 'gm-server-body', 'class': 'gm-server-body' });
         n.serverPanel = E('section', { 'id': 'gm-server-panel', 'class': 'cbi-section gm-details', 'tabindex': '-1', 'aria-labelledby': 'gm-server-title' }, [
             E('style', {}, `
@@ -3978,7 +3984,8 @@ return view.extend({
     },
 
     closeServerPanel: function() {
-        var n = this.nodes, target = n.connectionsWrap && n.connectionsWrap.querySelector('.gm-server-link[aria-current="true"]');
+        var n = this.nodes, target = n.connections && n.connections.open && n.connectionsWrap &&
+            n.connectionsWrap.querySelector('.gm-server-link[aria-current="true"]');
 
         if (this.details)
             this.closeDetails();
@@ -4019,7 +4026,7 @@ return view.extend({
             return;
         if (this.fullscreen)
             this.setFullscreen(false);
-        if (this.details && this.details.filter === filter && this.details.ip === ip) {
+        if (this.details && this.details.filter === filter && this.details.ip === ip && !this.details.stopped) {
             if (this.details.collapsed)
                 return this.toggleServerPanel();
             return this.focusServerPanel();
@@ -4380,7 +4387,9 @@ return view.extend({
 
         d.failures = 0;
         d.wait = (reply.error === 'limit') ? DETAILS_LIMIT_RETRY : DETAILS_INTERVAL;
-        if (reply.error === 'busy' || reply.error === 'limit' || reply.error === 'unknown') {
+        if (reply.error === 'busy')
+            return;
+        if (reply.error === 'limit' || reply.error === 'unknown') {
             d.state = reply.error;
             d.currentRtt = null;
             d.pingTimeout = false;
@@ -4426,7 +4435,6 @@ return view.extend({
         d.wait = DETAILS_INTERVAL;
         d.currentRtt = null;
         d.pingTimeout = false;
-        d.last = null;
         // LuCI translates ubus status text; the numeric method/resource/permission codes stay
         // stable. JSON-RPC reports a missing method or denied session with its own error codes
         if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
@@ -4437,8 +4445,9 @@ return view.extend({
             this.updateActiveConnectionsList();
             this.sendMessageToMap('serverDetails', { on: false });
         }
-        else
-            d.state = ++d.failures >= 3 ? 'offline' : 'pending';
+        else if (++d.failures >= 3) {
+            d.state = 'offline';
+        }
     },
 
     // Graphs, figures and note of the selected server from its points. Only attributes and texts
@@ -4456,7 +4465,6 @@ return view.extend({
                 refresh: _('Auto refresh paused'),
                 paused: d.manualPause ? _('Paused') : _('Paused after 10 minutes'),
                 unknown: _('No recent traffic'),
-                busy: _('Waiting for measurement'),
                 pending: _('Waiting for measurement'),
                 limit: _('Waiting for another measurement'),
                 offline: _('Router unavailable'),
