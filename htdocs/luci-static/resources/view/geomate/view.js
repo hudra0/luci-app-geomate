@@ -1021,8 +1021,8 @@ return view.extend({
     restartAt: 0,           // time of that change
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
-    // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
-    // the status. Each call may fail on its own; the page then renders with what it got
+    // runs call by call, so the status calls would delay the map. startPolls() fetches the
+    // status. Each call may fail on its own; the page then renders with what it got
     load: function() {
         this.reported = {};
         return Promise.all([
@@ -2151,9 +2151,10 @@ return view.extend({
             version: L.bind(this.checkForUpdates, this)
         };
 
-        if (!document.hidden)
+        if (!document.hidden) {
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
-        poll.add(this.pollFns.status, STATUS_INTERVAL);
+            poll.add(this.pollFns.status, STATUS_INTERVAL);
+        }
         poll.add(this.pollFns.version, VERSION_INTERVAL);
 
         this.pollConnections();
@@ -2164,16 +2165,22 @@ return view.extend({
         window.addEventListener('pagehide', L.bind(this.saveRecent, this, true));
     },
 
-    // No connection requests while the tab is hidden
+    // No connection and status requests while the tab is hidden. Keep the version poll in LuCI's
+    // queue: poll.remove() stops LuCI's poll when the queue runs empty, and the header would
+    // show "Paused" until the next poll.add()
     handleVisibilityChange: function() {
         if (document.hidden) {
             poll.remove(this.pollFns.connections);
+            poll.remove(this.pollFns.status);
             this.saveRecent(true);
         } else {
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
+            poll.add(this.pollFns.status, STATUS_INTERVAL);
             // Fresh data at once, unless the user paused LuCI's auto refresh
-            if (poll.active())
+            if (poll.active()) {
                 this.pollConnections();
+                this.pollStatus();
+            }
         }
     },
 
