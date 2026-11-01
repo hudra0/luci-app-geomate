@@ -342,16 +342,6 @@ local function read_set(set_name)
     return set
 end
 
--- Addresses in the elements block of a set, as the former grep counted them: a range counts
--- both ends, a prefix its address
-local function count_set_addresses(set_name)
-    local count = 0
-    for _ in set_elements(set_name):gmatch("%d+%.%d+%.%d+%.%d+") do
-        count = count + 1
-    end
-    return count
-end
-
 -- allowed_ip of a filter section, split like the backend splits it: list entries only
 -- (config_list_foreach), so a hand-written 'option allowed_ip', which arrives as a string,
 -- whitelists nothing; an entry can hold several addresses, prefixes or ranges, separated by
@@ -911,23 +901,14 @@ local function get_service_status()
         end
     end
 
-    -- Get filter information
+    -- Get filter information. No element counts: no view reads them, and counting listed the
+    -- _allowed and _blocked sets of every enabled filter on each status poll (13k elements in
+    -- a CoD _blocked set are about 100 ms and 19 MB of nft memory on an Intel N100)
     uci:foreach('geomate', 'geo_filter', function(s)
-        local filter_info = {
+        table.insert(status.filters, {
             name = s.name,
-            enabled = (s.enabled == '1'),
-            allowed_count = 0,
-            blocked_count = 0
-        }
-
-        local set_name = filter_set_name(s.name)
-        if filter_info.enabled and status.nft_active and set_name then
-            -- Count only the elements: the set header holds the filter name
-            filter_info.allowed_count = count_set_addresses(set_name .. "_allowed")
-            filter_info.blocked_count = count_set_addresses(set_name .. "_blocked")
-        end
-
-        table.insert(status.filters, filter_info)
+            enabled = (s.enabled == '1')
+        })
     end)
 
     -- Get recent nft errors (last 5 lines)
