@@ -909,9 +909,12 @@ return view.extend({
             // A hand-written value that is no choice stays a choice of its own: the select would
             // otherwise show the first choice and the next save would write it. Its text names
             // what the backend uses instead of a value outside 300-3600 or no number
-            var loadInterval = o.load;
+            var loadInterval = o.load, intervalChoices = o.keylist.length;
             o.load = function(section_id) {
                 var value = loadInterval.apply(this, arguments), seconds = intervalSeconds(value);
+
+                this.keylist = this.keylist.slice(0, intervalChoices);
+                this.vallist = this.vallist.slice(0, intervalChoices);
 
                 if (value != null && value !== '' && this.keylist.indexOf(String(value)) < 0)
                     this.value(value, (String(seconds) === String(value))
