@@ -889,8 +889,8 @@ var DETAILS_INTERVAL = 1000,
     DETAILS_LIMIT_RETRY = 3000,
     PING_GIVE_UP = 3,
     PING_GIVE_UP_LATER = 10,
-    ROUTE_INTERVAL = 5000,
-    ROUTE_STALE = 15000;
+    ROUTE_INTERVAL = 2000,
+    ROUTE_STALE = 10000;
 
 // Packets per second between two counter readings of getServerSample ({ packets, bytes }) dt ms
 // apart: { pps, packets, bytes } with the counts in between. null when one is missing or a count
@@ -3915,6 +3915,7 @@ return view.extend({
                 .gm-details .gm-line { stroke: var(--gm-primary); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
                 .gm-details .gm-line--tx { stroke: currentColor; stroke-opacity: 0.6; stroke-dasharray: 6 4; }
                 .gm-details .gm-line--lost { stroke: var(--gm-danger); stroke-linecap: butt; }
+                .gm-details .gm-line--route { stroke: var(--gm-warning); }
                 .gm-details .gm-chart-label { position: absolute; top: 4px; left: 2px; font-size: 11px; line-height: 1; opacity: 0.7; pointer-events: none; }
                 .gm-details .gm-chart-label--half { top: 50%; }
                 .gm-details-caption { margin: 2px 0 0; font-size: 11px; opacity: 0.65; text-align: right; }
@@ -4042,7 +4043,7 @@ return view.extend({
             started: performance.now(), wait: DETAILS_INTERVAL, failures: 0,
             busy: false, stopped: false, collapsed: false, sampleEpoch: 0, timer: null, nodes: {},
             routeEnabled: false, routeEpoch: 0, routeNextAt: 0, routeResult: null,
-            routeReceivedAt: 0, routeState: '', routeAttempted: false
+            routeReceivedAt: 0, routeState: '', routePoints: []
         };
         n = d.nodes;
         n.status = E('span');
@@ -4062,7 +4063,7 @@ return view.extend({
             stat(_('Jitter'), n.jitter, _('Variation between successful ping replies')),
             stat(_('Ping loss'), n.loss, _('ICMP probes without a reply'))
         ]);
-        n.ping = detailsChart([ 'gm-line--rtt', 'gm-line--lost' ]);
+        n.ping = detailsChart([ 'gm-line--rtt', 'gm-line--route', 'gm-line--lost' ]);
         n.pingEmpty = E('span', { 'class': 'gm-ping-empty' }, [ _('Waiting for reply') ]);
         n.pingState = E('span', { 'class': 'gm-ping-method' }, [ _('ICMP') ]);
         n.pingBox = E('div', {}, [
@@ -4223,7 +4224,6 @@ return view.extend({
             return;
 
         job = this.routeRequest = { details: d, epoch: d.routeEpoch };
-        d.routeAttempted = true;
         d.routeState = 'measuring';
         this.showServerRoute(d);
         return callServerRoute(d.filter, d.ip).then(function(reply) {
@@ -4242,8 +4242,7 @@ return view.extend({
         }).finally(function() {
             if (self.routeRequest === job)
                 self.routeRequest = null;
-            if (self.details)
-                self.showServerRoute(self.details);
+            self.showDetails();
         });
     },
 
@@ -4282,13 +4281,36 @@ return view.extend({
         d.routeReceivedAt = now;
         d.routeState = reply.status;
         d.routeResult = reply.status === 'ok' ? reply : null;
+        this.addRoutePoint(d, reply);
+    },
+
+    // History of the route graph, on the router's clock like the samples: a point per measurement,
+    // a gap for one without reply and before a changed answering router or TTL. A cached reply
+    // repeats the last measurement and adds nothing
+    addRoutePoint: function(d, reply) {
+        var points = d.routePoints, last = points[points.length - 1], t = reply.measured_at;
+
+        if (last && t === last.t)
+            return;
+        // The router's clock went back: the graph starts over
+        if (last && t < last.t)
+            points.length = 0;
+        last = points[points.length - 1];
+        if (reply.status !== 'ok')
+            points.push({ t: t, rtt: null });
+        else {
+            if (last && last.rtt != null && (last.responder !== reply.responder || last.ttl !== reply.ttl))
+                points.push({ t: t, rtt: null });
+            points.push({ t: t, rtt: reply.rtt, responder: reply.responder, ttl: reply.ttl });
+        }
+        while (t - points[0].t > DETAILS_SPAN)
+            points.shift();
     },
 
     showServerRoute: function(d) {
         var n = d && d.nodes, now = performance.now(), result = d && d.routeResult,
             age = result ? result.age_ms + Math.max(0, now - d.routeReceivedAt) : 0,
             stale = !!result && age >= ROUTE_STALE,
-            measuring = this.routeRequest && this.routeRequest.details === d,
             notes = { no_reply: _('No route reply'), waiting: _('Waiting for measurement'),
                 unknown: _('No recent traffic'), unavailable: _('Route measurement unavailable'),
                 unsupported: _('Route measurements unavailable') },
@@ -4300,13 +4322,13 @@ return view.extend({
             text = _('Measurement expired');
         n.routeValue.textContent = result && !stale ? msText(result.rtt) : '–';
         n.routeMeta.hidden = !result;
-        n.routeMeta.textContent = result ? _('%s · TTL %d · %d s ago').format(result.responder, result.ttl, Math.floor(age / 1000)) : '';
+        n.routeMeta.textContent = result ? _('%s · Hop %d · %d s ago').format(result.responder, result.ttl, Math.floor(age / 1000)) : '';
         n.routeMeta.title = result ? new Date(result.measured_at).toLocaleString() : '';
         n.routeHint.textContent = result && result.endpoint ? _('ICMP reply from the destination.') : _('To an intermediate router, not the game server.');
         n.routeNote.textContent = text;
         n.routeNote.hidden = !text;
-        n.routeButton.textContent = measuring ? _('Measuring…') : d.routeAttempted ? _('Refresh') : _('Measure');
-        n.routeButton.disabled = !!this.routeRequest || this.routeOff || !this.routePanelActive(d) || now < d.routeNextAt;
+        n.routeButton.hidden = d.routeEnabled || this.routeOff;
+        n.routeButton.disabled = !!this.routeRequest || !this.routePanelActive(d) || now < d.routeNextAt;
     },
 
     // Status, filter and geo text of the selected server, as the table shows the server now: its
@@ -4458,8 +4480,8 @@ return view.extend({
         if (!d)
             return;
         this.showServerRoute(d);
-        var points = d.points,
-            end = points.length ? points[points.length - 1].t : 0,
+        var points = d.points, route = d.routePoints,
+            end = Math.max(points.length ? points[points.length - 1].t : 0, route.length ? route[route.length - 1].t : 0),
             from = end - DETAILS_SPAN,
             notes = {
                 refresh: _('Auto refresh paused'),
@@ -4480,19 +4502,25 @@ return view.extend({
         n.retryPing.hidden = d.ping || d.stopped;
         n.retryPing.disabled = d.state === 'paused' || d.state === 'refresh';
 
+        // Without any ping reply the graph shows the route RTT instead, as a line of its own; it
+        // never enters Ping, Jitter or Ping loss
         var ping = pingStats(points), rtts = points.filter(function(p) { return p.rtt != null; }),
-            pingTop = niceMax(Math.max.apply(null, [ 0 ].concat(rtts.map(function(p) { return p.rtt; }))), 50);
+            routed = !rtts.length ? route.filter(function(p) { return p.rtt != null && p.t >= from; }) : [],
+            pingTop = niceMax(Math.max.apply(null, [ 0 ].concat((routed.length ? routed : rtts).map(function(p) { return p.rtt; }))), 50),
+            rtt = function(p) { return p.rtt; };
 
-        n.ping.paths['gm-line--rtt'].setAttribute('d', chartPath(points, function(p) { return p.rtt; }, from, DETAILS_SPAN, pingTop));
+        n.ping.paths['gm-line--rtt'].setAttribute('d', routed.length ? '' : chartPath(points, rtt, from, DETAILS_SPAN, pingTop));
+        n.ping.paths['gm-line--route'].setAttribute('d', routed.length ? chartPath(route, rtt, from, DETAILS_SPAN, pingTop) : '');
         n.ping.paths['gm-line--lost'].setAttribute('d', rtts.length ? points.filter(function(p) { return p.rtt === null && p.t >= from; }).map(function(p) {
             return 'M' + ((p.t - from) * 1000 / DETAILS_SPAN).toFixed(1) + ' 100V88';
         }).join('') : '');
         n.ping.top.textContent = msText(pingTop);
         n.ping.half.textContent = msText(pingTop / 2);
-        n.pingEmpty.hidden = !!rtts.length;
+        n.pingEmpty.hidden = !!rtts.length || !!routed.length;
         n.pingEmpty.textContent = d.pingTimeout ? _('No ping reply')
             : (d.state && d.state !== 'refresh' && d.state !== 'paused') ? _('No measurements') : _('Waiting for reply');
-        n.pingState.textContent = d.pingTimeout && rtts.length ? _('ICMP · No reply') : _('ICMP');
+        n.pingState.textContent = routed.length ? _('Route RTT · Hop %d').format(routed[routed.length - 1].ttl)
+            : d.pingTimeout && rtts.length ? _('ICMP · No reply') : _('ICMP');
         n.pingValue.textContent = d.currentRtt != null ? msText(d.currentRtt) : '–';
         n.pingValue.title = ping && ping.avg != null ? _('Average %s').format(msText(ping.avg)) : '';
         n.jitter.textContent = ping && ping.jitter != null ? msText(ping.jitter) : '–';
