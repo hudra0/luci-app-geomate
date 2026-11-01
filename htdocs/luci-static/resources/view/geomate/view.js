@@ -333,7 +333,8 @@ function untrackedNote(filterName) {
         return _('Filter has no regions.') + ' ' + effect;
 
     // Static mode collects no new servers, daily geolocation looks them up once a day. Frequent
-    // updates run every 30 minutes, every hour while there was nothing to look up
+    // updates run once per check interval (global check_interval, 30 minutes by default), every
+    // second check while there was nothing to look up
     if (mode === 'static')
         next = _('Static mode does not add it to the IP list.');
     else if (uci.get('geomate', 'global', 'geolocation_mode') === 'daily')

@@ -1162,7 +1162,8 @@ local methods = {
     getGeolocationStatus = {
         call = function()
             -- Read pre-computed geolocation status from JSON file
-            -- This file is updated every 30 minutes by geomate.sh
+            -- geomate.sh writes this file at start and after every check of dynamic and monitor
+            -- mode (global check_interval, 1800 s by default)
             local status_file = "/etc/geomate.d/runtime/geolocation_status.json"
             local nft_error_file = "/tmp/geomate_nft_errors.log"
             local f = io.open(status_file, "r")

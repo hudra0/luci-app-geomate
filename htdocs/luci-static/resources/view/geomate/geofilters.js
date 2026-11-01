@@ -174,6 +174,22 @@ function hasCapability(token) {
     return !!geoStats && Array.isArray(geoStats.capabilities) && geoStats.capabilities.indexOf(token) > -1;
 }
 
+// Seconds between two checks of the service (harvest and geolocation trigger) for a value of the
+// global option check_interval. Only a backend with the check_interval token reads the option;
+// older ones check every 1800 s. Like the backend, a missing or non-numeric value counts as 1800
+// and a number is clamped to 300-3600
+function checkInterval(value) {
+    if (!hasCapability('check_interval') || !/^[0-9]+$/.test(value != null ? String(value) : ''))
+        return 1800;
+    return Math.min(3600, Math.max(300, +value));
+}
+
+// Choice text of frequent geolocation: new servers are looked up once per check interval, every
+// second check after a run without new servers
+function frequentLabel(interval) {
+    return _('Frequent - Update every %d-%d minutes').format(Math.round(interval / 60), Math.round(interval / 30));
+}
+
 // A full geolocation (manual or daily) is running. A missing field (older backend) is unknown
 // and counts as no run
 function geolocationRunning() {
@@ -844,14 +860,54 @@ return view.extend({
         o.default = 'dynamic';
         o.rmempty = false;
 
+        // **Check Interval Option**
+        // Seconds between two checks for new servers (checkInterval). Only for a backend that
+        // reads it; same default as the backend
+        if (hasCapability('check_interval')) {
+            o = s.option(form.ListValue, 'check_interval', _('Check Interval'),
+                _('How often Geomate adds newly seen servers to the IP lists and, with frequent updates, geolocates them. A shorter interval handles new servers sooner and uses more CPU time.'));
+            o.value('300', _('5 minutes'));
+            o.value('600', _('10 minutes'));
+            o.value('900', _('15 minutes'));
+            o.value('1800', _('30 minutes'));
+            o.value('3600', _('60 minutes'));
+            o.default = '1800';
+            o.rmempty = false;
+            // A hand-written value that is no choice stays a choice of its own: the select would
+            // otherwise show the first choice and the next save would write it
+            var loadInterval = o.load;
+            o.load = function(section_id) {
+                var value = loadInterval.apply(this, arguments);
+
+                if (value != null && value !== '' && this.keylist.indexOf(String(value)) < 0)
+                    this.value(value, _('%s seconds').format(value));
+                return value;
+            };
+            // The text of frequent geolocation follows the selected interval
+            o.onchange = function(ev, section_id, value) {
+                var mode = this.map.lookupOption('geolocation_mode', section_id),
+                    widget = mode ? mode[0].getUIElement(mode[1]) : null,
+                    choice = widget ? widget.node.querySelector('option[value="frequent"]') : null;
+
+                if (choice)
+                    choice.textContent = frequentLabel(checkInterval(value));
+            };
+        }
+
         // **Geolocation Mode Option**
-        // Choose how often to update IP geolocation data
+        // Choose how often to update IP geolocation data. The text of frequent geolocation comes
+        // from the saved or staged check interval on every render of the form
         o = s.option(form.ListValue, 'geolocation_mode', _('Geolocation Update Mode'),
             _('Choose how often to update IP geolocation data'));
-        o.value('frequent', _('Frequent - Update every 30-60 minutes'));
+        o.value('frequent', frequentLabel(1800));
         o.value('daily', _('Daily - Update once per day'));
         o.default = 'frequent';
         o.rmempty = false;
+        var renderMode = o.renderWidget;
+        o.renderWidget = function(section_id) {
+            this.vallist[this.keylist.indexOf('frequent')] = frequentLabel(checkInterval(uci.get('geomate', section_id, 'check_interval')));
+            return renderMode.apply(this, arguments);
+        };
 
         // **Geo Filters Section**
         // Main section for configuring individual geographic filters. The table shows only the
