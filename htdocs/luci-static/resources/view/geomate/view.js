@@ -1163,7 +1163,7 @@ return view.extend({
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
     problems: [],       // problems of the last status poll: 'process' and check keys (updateStatus)
-    problemsAt: 0,      // time that status poll was sent
+    problemsAt: null,   // monotonic time that the last counted status poll was sent
     confirmed: [],      // problems seen on two polls in a row; a new one opens the details
     versionInfo: null,  // last versionState() result, null before the first check
     readonly: true,     // no write access, or no configuration: the map only shows
@@ -2238,7 +2238,8 @@ return view.extend({
         // A failed reply tells nothing, and the service builds its table while it loads. A poll
         // sent less than STATUS_INTERVAL after the one before (the tab is shown again, a direct
         // call) does not count either: both replies could fall into one restart
-        if (!polled || !st || !checks || loading || polled - this.problemsAt < (STATUS_INTERVAL - 1) * 1000)
+        if (polled == null || !st || !checks || loading ||
+            (this.problemsAt != null && polled - this.problemsAt < (STATUS_INTERVAL - 1) * 1000))
             return;
         var last = this.problems,
             confirmed = problems.filter(function(p) { return last.indexOf(p) >= 0; });
@@ -2348,6 +2349,7 @@ return view.extend({
 
         document.addEventListener('visibilitychange', L.bind(this.handleVisibilityChange, this));
         window.addEventListener('pagehide', L.bind(this.saveRecent, this, true));
+        window.addEventListener('pagehide', L.bind(this.closeDetails, this));
     },
 
     // No connection requests while the tab is hidden, and the status only every
@@ -2390,7 +2392,7 @@ return view.extend({
 
     // One request at a time, like pollConnections()
     pollStatus: function() {
-        var self = this, sent = Date.now();
+        var self = this, sent = performance.now();
 
         if (!this.statusBusy)
             this.statusBusy = Promise.all([
@@ -3857,7 +3859,7 @@ return view.extend({
             last: null,         // { t, rx, tx } of the last reading
             points: [],         // samplePoint() results of the last DETAILS_SPAN ms
             state: '',          // note of the window: '', 'refresh', 'paused', 'unknown', 'limit', 'offline', 'invalid', 'unavailable'
-            started: Date.now(),
+            started: performance.now(),
             wait: DETAILS_INTERVAL,
             failures: 0,        // failed requests in a row
             busy: false,
@@ -3993,7 +3995,7 @@ return view.extend({
         if (this.details !== d || d.stopped)
             return;
         d.state = '';
-        d.started = Date.now();
+        d.started = performance.now();
         this.showDetails();
         this.sampleDetails();
     },
@@ -4050,23 +4052,26 @@ return view.extend({
             d.timer = window.setTimeout(L.bind(this.sampleDetails, this), DETAILS_INTERVAL);
             return;
         }
-        if (Date.now() - d.started >= DETAILS_SESSION) {
+        if (performance.now() - d.started >= DETAILS_SESSION) {
             d.state = 'paused';
             return this.showDetails();
         }
 
         d.busy = true;
-        sent = Date.now();
+        sent = performance.now();
         callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
-            self.detailsReply(d, L.isObject(reply) ? reply : {});
+            if (self.details === d && !d.stopped && self.detailsShown(d))
+                self.detailsReply(d, L.isObject(reply) ? reply : {});
         }, function(err) {
-            self.detailsFailed(d, err);
+            if (self.details === d && !d.stopped && self.detailsShown(d))
+                self.detailsFailed(d, err);
         }).finally(function() {
             d.busy = false;
-            if (self.details !== d || d.stopped)
+            if (self.details !== d)
                 return;
             self.showDetails();
-            d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (Date.now() - sent)));
+            if (!d.stopped)
+                d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (performance.now() - sent)));
         });
     },
 
