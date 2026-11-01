@@ -167,6 +167,18 @@ var callKnownServers = rpc.declare({
     reject: true
 });
 
+// Counters and ping of one server for the details window (getServerSample), polled once per
+// second while it is open. nobatch: a status batch (several hundred ms) never delays a sample. An
+// older rpcd ACL or luci.geomate rejects it
+var callServerSample = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getServerSample',
+    params: [ 'filter', 'ip', 'ping' ],
+    expect: { '': {} },
+    reject: true,
+    nobatch: true
+});
+
 // A getKnownServers answer as the map takes it: { total, approx, decimals, missing, points:
 // [[lat, lon, n]] }, or null for an error or an answer of another form, which the map then shows
 // as unknown. decimals (how far merged positions were rounded) only when it is 0, 1 or 2: an older
@@ -790,6 +802,15 @@ function packetsText(n) {
     return _('%dM packets').format(Math.round(n / 1000000));
 }
 
+// A packet rate as text. The format follows the rounded rate: 9.96 is '10 pkt/s', not '10.0 pkt/s'
+function rateText(rate) {
+    if (+rate.toFixed(1) >= 10 || rate == 0)
+        return _('%d pkt/s').format(Math.round(rate));
+    if (+rate.toFixed(2) >= 0.1)
+        return _('%.1f pkt/s').format(rate);
+    return _('%.2f pkt/s').format(rate);
+}
+
 // Traffic cell of a row (rec: its entry of the recent list): the packet rate of a live row, the
 // packets in total of a past row and of a live row before its rate is known, '–' without counters
 // (older backend, static mode, a row an older view stored without them). The packets count those
@@ -802,16 +823,8 @@ function showTraffic(node, rec, live) {
         secs = (rec && rec.firstSeen) ? Math.round((rec.lastSeen - rec.firstSeen) / 1000) : 0,
         text = '–', title = [];
 
-    // The format follows the rounded rate: 9.96 is '10 pkt/s', not '10.0 pkt/s'
     if (t) {
-        if (rate == null)
-            text = packetsText(t.packets);
-        else if (+rate.toFixed(1) >= 10 || rate == 0)
-            text = _('%d pkt/s').format(Math.round(rate));
-        else if (+rate.toFixed(2) >= 0.1)
-            text = _('%.1f pkt/s').format(rate);
-        else
-            text = _('%.2f pkt/s').format(rate);
+        text = (rate == null) ? packetsText(t.packets) : rateText(rate);
 
         title.push(N_(t.packets, '%d packet sent to the server, %s', '%d packets sent to the server, %s')
             .format(t.packets, '%1024.1mB'.format(t.bytes)));
@@ -840,6 +853,167 @@ function searchText(conn) {
     return [ conn.dst, conn.filter_name, geo.country, geo.countryCode, geo.city, geo.isp ].filter(function(s) {
         return typeof s == 'string';
     }).join('\n').toLowerCase();
+}
+
+// Server details window (openServerDetails): one getServerSample request per DETAILS_INTERVAL
+// ms while it is open and the tab is visible, the next only after the reply. The graphs show the
+// last DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
+// give no rate, and the lines break there. The figures take the last DETAILS_STATS rates. After
+// DETAILS_SESSION ms the window pauses until Continue, so a forgotten window does not sample and
+// ping for hours. While other servers use up the router's limit (sample 'limit'), it asks again
+// every DETAILS_LIMIT_RETRY ms. Ping stops after PING_GIVE_UP timeouts in a row, or after
+// PING_GIVE_UP_LATER once the server has answered
+var DETAILS_INTERVAL = 1000,
+    DETAILS_SPAN = 180 * 1000,
+    DETAILS_MAX_GAP = 5000,
+    DETAILS_STATS = 10,
+    DETAILS_SESSION = 10 * 60 * 1000,
+    DETAILS_LIMIT_RETRY = 3000,
+    PING_GIVE_UP = 3,
+    PING_GIVE_UP_LATER = 10;
+
+// Packets per second between two counter readings of getServerSample ({ packets, bytes }) dt ms
+// apart: { pps, packets, bytes } with the counts in between. null when one is missing or a count
+// went down: the set was built again (service restart) or the server's element expired, and the
+// counting starts over from the newer reading
+function counterRate(a, b, dt) {
+    if (!a || !b || !isCount(a.packets) || !isCount(a.bytes) || !isCount(b.packets) || !isCount(b.bytes) ||
+        b.packets < a.packets || b.bytes < a.bytes || !(dt > 0))
+        return null;
+    return { pps: (b.packets - a.packets) * 1000 / dt, packets: b.packets - a.packets, bytes: b.bytes - a.bytes };
+}
+
+// A point of the graphs from a getServerSample reply and the reading before it (last: { t, rx,
+// tx }, null for none): { t, rx, tx, rtt }. rx and tx are counterRate() results or null; rtt is
+// the round trip in ms, null for a ping without reply, undefined without a ping. t is the router's
+// time of the reading, so the delay of the request does not change the rates. null for a reply
+// without a time
+function samplePoint(last, reply) {
+    var t = reply.t, dt, p;
+
+    if (typeof t != 'number' || !isFinite(t))
+        return null;
+    p = { t: t, rx: null, tx: null, rtt: undefined };
+    dt = last ? t - last.t : 0;
+    if (dt > 0 && dt <= DETAILS_MAX_GAP) {
+        p.rx = counterRate(last.rx, reply.rx, dt);
+        p.tx = counterRate(last.tx, reply.tx, dt);
+    }
+    if (reply.ping === 'ok' && typeof reply.rtt == 'number' && isFinite(reply.rtt) && reply.rtt >= 0)
+        p.rtt = reply.rtt;
+    else if (reply.ping === 'timeout')
+        p.rtt = null;
+    return p;
+}
+
+function median(values) {
+    var v = values.slice().sort(function(a, b) { return a - b; }), m = v.length >> 1;
+
+    return !v.length ? null : (v.length % 2) ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+
+// Figures of one direction ('rx' or 'tx') over the last DETAILS_STATS rates of the points: { rate:
+// their median in packets per second, size: bytes per packet, steady: at least 5 rates of at least
+// 1 pkt/s that vary by at most 20% (coefficient of variation) }. null without rates
+function rateStats(points, key) {
+    var rates = points.filter(function(p) { return p[key]; }).slice(-DETAILS_STATS).map(function(p) { return p[key]; }),
+        pps = rates.map(function(r) { return r.pps; }),
+        packets = 0, bytes = 0, mean, sd;
+
+    if (!rates.length)
+        return null;
+    rates.forEach(function(r) { packets += r.packets; bytes += r.bytes; });
+    mean = pps.reduce(function(s, v) { return s + v; }, 0) / pps.length;
+    sd = Math.sqrt(pps.reduce(function(s, v) { return s + (v - mean) * (v - mean); }, 0) / pps.length);
+    return { rate: median(pps), size: packets ? bytes / packets : null, steady: pps.length >= 5 && mean >= 1 && sd <= 0.2 * mean };
+}
+
+// Ping figures of the points: { last: the latest reply in ms, avg, jitter: the mean difference
+// between consecutive replies, loss: pings without reply in percent }. Values without replies are
+// null; null without any ping
+function pingStats(points) {
+    var rtts = [], sent = 0, jitter = 0, i;
+
+    points.forEach(function(p) {
+        if (p.rtt === undefined)
+            return;
+        sent++;
+        if (p.rtt !== null)
+            rtts.push(p.rtt);
+    });
+    if (!sent)
+        return null;
+    for (i = 1; i < rtts.length; i++)
+        jitter += Math.abs(rtts[i] - rtts[i - 1]);
+    return {
+        last: rtts.length ? rtts[rtts.length - 1] : null,
+        avg: rtts.length ? rtts.reduce(function(s, v) { return s + v; }, 0) / rtts.length : null,
+        jitter: (rtts.length > 1) ? jitter / (rtts.length - 1) : null,
+        loss: (sent - rtts.length) * 100 / sent
+    };
+}
+
+// The smallest of 1, 2, 2.5, 5 times a power of ten that is at least v and floor: the top of a
+// graph's scale
+function niceMax(v, floor) {
+    var m = Math.max(v || 0, floor), p = Math.pow(10, Math.floor(Math.log10(m)));
+
+    return [ 1, 2, 2.5, 5, 10 ].map(function(s) { return s * p; }).find(function(s) { return s >= m * (1 - 1e-9); });
+}
+
+// The 'd' of a graph line in the 1000 x 100 units of detailsChart(): value(p) of the points from
+// 'from' on over span ms, scaled to max. The line breaks at a point without value and between
+// points more than DETAILS_MAX_GAP apart; each piece starts with a dot ('h0', round line caps),
+// so a single point shows
+function chartPath(points, value, from, span, max) {
+    var d = [], prev = null;
+
+    points.forEach(function(p) {
+        var v = value(p);
+
+        if (v == null || p.t < from) {
+            prev = null;
+            return;
+        }
+        var x = ((p.t - from) * 1000 / span).toFixed(1), y = (100 - Math.min(v, max) * 98 / max).toFixed(1);
+        d.push((prev == null || p.t - prev > DETAILS_MAX_GAP) ? 'M' + x + ' ' + y + 'h0' : 'L' + x + ' ' + y);
+        prev = p.t;
+    });
+    return d.join('');
+}
+
+// A round trip in ms as text
+function msText(ms) {
+    return (ms < 10) ? _('%.1f ms').format(ms) : _('%d ms').format(Math.round(ms));
+}
+
+// An SVG element; E() creates HTML elements only
+function svgNode(tag, attrs) {
+    var el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+
+    Object.keys(attrs || {}).forEach(function(k) { el.setAttribute(k, attrs[k]); });
+    return el;
+}
+
+// A graph of the details window: an SVG of 1000 x 100 units stretched to its box (the lines keep
+// their width: non-scaling-stroke), a path per class in lines, a grid line at the top and at half
+// height with their values as text at the left edge. Built once; showDetails() sets the paths and
+// the values. Returns { box, paths: { class: path }, top, half }
+function detailsChart(lines) {
+    var svg = svgNode('svg', { 'viewBox': '0 0 1000 100', 'preserveAspectRatio': 'none', 'aria-hidden': 'true' }),
+        chart = { paths: {}, top: E('span', { 'class': 'gm-chart-label' }), half: E('span', { 'class': 'gm-chart-label gm-chart-label--half' }) };
+
+    svg.appendChild(svgNode('path', { 'class': 'gm-chart-grid', 'd': 'M0 2H1000M0 51H1000M0 100H1000' }));
+    lines.forEach(function(cls) {
+        svg.appendChild(chart.paths[cls] = svgNode('path', { 'class': 'gm-line ' + cls }));
+    });
+    chart.box = E('div', { 'class': 'gm-chart' }, [ svg, chart.top, chart.half ]);
+    return chart;
+}
+
+// A legend entry of a graph line
+function legendKey(cls, label) {
+    return E('span', {}, [ E('span', { 'class': 'gm-key ' + cls }), label ]);
 }
 
 // check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
@@ -1022,6 +1196,8 @@ return view.extend({
     serversLoads: {},       // running getKnownServers request per filter section
     restartPid: null,       // PID of the service when a mode change was applied, until it restarted
     restartAt: 0,           // time of that change
+    details: null,          // the open server details window (openServerDetails), null when closed
+    detailsOff: false,      // getServerSample is missing or not granted: no details links
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
     // runs call by call, so the status calls would delay the map. startPolls() fetches the
@@ -1097,7 +1273,7 @@ return view.extend({
 
         var style = E('style', {}, `
             /* Theme colors with fallbacks, for the status row and the connection pills */
-            #geomate-status, #gm-mode-menu, #active-connections-container {
+            #geomate-status, #gm-mode-menu, #active-connections-container, .gm-details {
                 --gm-success: var(--success, var(--success-color-high, var(--success-color, #1a7f37)));
                 --gm-danger: var(--danger, var(--error-color-high, var(--danger-color, var(--error-color, #cf222e))));
                 --gm-primary: var(--primary, var(--primary-color-high, var(--main-bright-color, #1a6fd1)));
@@ -2184,6 +2360,9 @@ return view.extend({
             poll.remove(this.pollFns.status);
             this.pollHidden(true);
             this.saveRecent(true);
+            // A sample on its way finishes, the next one waits for the tab (sampleDetails)
+            if (this.details)
+                window.clearTimeout(this.details.timer);
         } else {
             this.pollHidden(false);
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
@@ -2193,6 +2372,7 @@ return view.extend({
                 this.pollConnections();
                 this.pollStatus();
             }
+            this.sampleDetails();
         }
     },
 
@@ -2294,6 +2474,7 @@ return view.extend({
         this.saveRecent(false);
         this.sendMessageToMap('updateConnections', list);
         this.updateActiveConnectionsList();
+        this.showDetailsHead();
     },
 
     // Note the servers of a reply as seen at now, with their counters (trafficOf) and the time this
@@ -2436,6 +2617,8 @@ return view.extend({
             this.sendTheme(true);
             this.sendMessageToMap('fullscreen', { on: this.fullscreen });
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
+            // Before the connections: their popups get the Details link
+            this.sendMessageToMap('serverDetails', { on: !this.detailsOff });
             // Once, before the first setFilters, which then fits the start view to this filter
             if (this.focusSid) {
                 this.sendMessageToMap('fitFilter', { sid: this.focusSid });
@@ -2471,6 +2654,9 @@ return view.extend({
             break;
         case 'loadKnownServers':
             this.loadKnownServers(String(d.sid || ''));
+            break;
+        case 'openServerDetails':
+            this.openServerDetails(String(d.filter || ''), String(d.ip || ''));
             break;
         }
     },
@@ -3571,7 +3757,7 @@ return view.extend({
 
             // Every cell is an element: names and provider strings never run as markup
             cells = [
-                textCell(r.ip),
+                self.ipCell(r),
                 textCell(r.filter),
                 E('span', attrs, [ status[1] ]),
                 countryCell(r.geo[0], r.geo[1]),
@@ -3621,6 +3807,403 @@ return view.extend({
         if (tokens.indexOf(ip) > -1)
             return 'blocked-entry';
         return rangeCoversIp(tokens, ip) ? 'blocked-range' : 'allow-block';
+    },
+
+    // IP cell of a row: a link that opens the server details window, plain text once the details
+    // turned out not to be available (detailsOff)
+    ipCell: function(r) {
+        if (this.detailsOff || !validIPv4(r.ip) || !FILTER_NAME_RE.test(r.filter || ''))
+            return textCell(r.ip);
+        return E('a', {
+            'href': '#',
+            'title': _('Show details'),
+            'click': L.bind(function(ev) {
+                ev.preventDefault();
+                this.openServerDetails(r.filter, r.ip);
+            }, this)
+        }, [ r.ip ]);
+    },
+
+    /**
+     * Server details window of a server of a filter (IP link of the table, Details link of a map
+     * popup): head with status, filter and geo text, a graph of the packets per second from and
+     * to the server, a ping graph once the server answers, and their figures. The packets come
+     * from the filter's nft sets, not from conntrack, whose counters nlbwmon resets every 30 s:
+     * 'From server' only with the backend token rx_counters, 'To server' with set_counters, none
+     * in static mode. Samples run while the window is open (sampleDetails).
+     * @param {string} filter - The filter name of the row.
+     * @param {string} ip - The server address.
+     */
+    openServerDetails: function(filter, ip) {
+        var mode = this.statusMode() || uci.get('geomate', 'global', 'operational_mode') || 'dynamic',
+            counts = mode !== 'static',
+            tickNote = _('Most games send one packet per server tick, so this is close to the server\'s tick rate. Voice chat and large updates split over several packets can raise it.'),
+            d, n, column;
+
+        if (this.detailsOff)
+            return notify(_('Server details are not available. Reload the page or log in again.'));
+        if (!validIPv4(ip) || !FILTER_NAME_RE.test(filter))
+            return;
+        this.closeDetails();
+
+        d = this.details = {
+            ip: ip,
+            filter: filter,
+            rx: counts && hasCapability(this.status, 'rx_counters'),
+            tx: counts && hasCapability(this.status, 'set_counters'),
+            ping: true,         // ask for a ping with the next sample
+            pingFails: 0,       // pings without reply in a row
+            pingReplied: false, // the server has answered a ping since the last start
+            last: null,         // { t, rx, tx } of the last reading
+            points: [],         // samplePoint() results of the last DETAILS_SPAN ms
+            state: '',          // note of the window: '', 'refresh', 'paused', 'unknown', 'limit', 'offline', 'invalid', 'unavailable'
+            started: Date.now(),
+            wait: DETAILS_INTERVAL,
+            failures: 0,        // failed requests in a row
+            busy: false,
+            stopped: false,
+            timer: null,
+            nodes: {}
+        };
+        n = d.nodes;
+
+        n.status = E('span');
+        n.geo = E('span', { 'class': 'gm-details-geo' });
+        n.noteText = E('span');
+        n.continue = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.continueDetails, this, d) }, [ _('Continue') ]);
+        n.retryPing = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.retryPing, this, d) }, [ _('Try again') ]);
+        n.note = E('p', { 'class': 'gm-details-note', 'hidden': '' }, [ n.noteText, ' ', n.continue, n.retryPing ]);
+
+        n.rates = detailsChart([ 'gm-line--tx', 'gm-line--rx' ]);
+        n.ping = detailsChart([ 'gm-line--rtt', 'gm-line--lost' ]);
+        n.pingBox = E('div', { 'hidden': '' }, [
+            E('div', { 'class': 'gm-legend' }, [ legendKey('gm-key--rtt', _('Ping')), legendKey('gm-key--lost', _('No reply')) ]),
+            n.ping.box
+        ]);
+
+        // Figures: a column per direction the backend counts
+        n.cells = {};
+        column = function(key, label, title) {
+            n.cells[key] = { rate: E('span', {}, [ '–' ]), size: E('span', {}, [ '–' ]) };
+            return E('span', { 'class': 'gm-details-col', 'title': title || '' }, [ label ]);
+        };
+        var columns = [].concat(d.rx ? [ column('rx', _('From server'), tickNote) ] : [],
+            d.tx ? [ column('tx', _('To server')) ] : []);
+        var keys = Object.keys(n.cells);
+
+        n.stats = E('div', { 'class': 'gm-details-stats', 'style': 'grid-template-columns: max-content repeat(%d, max-content)'.format(keys.length) }, [].concat(
+            [ E('span') ], columns,
+            [ E('span', { 'class': 'gm-muted' }, [ _('Rate') ]) ], keys.map(function(k) { return n.cells[k].rate; }),
+            [ E('span', { 'class': 'gm-muted' }, [ _('Packet size') ]) ], keys.map(function(k) { return n.cells[k].size; })
+        ));
+        n.tick = E('p', { 'class': 'gm-details-hint', 'hidden': '', 'title': tickNote });
+
+        n.pingValue = E('span', {}, [ '–' ]);
+        n.jitter = E('span', {}, [ '–' ]);
+        n.loss = E('span', {}, [ '–' ]);
+        n.pingStats = E('div', { 'class': 'gm-details-ping' }, [
+            E('span', { 'class': 'gm-muted', 'title': _('Ping from the router to the server. Game traffic can see another delay.') }, [ _('Ping') ]), n.pingValue,
+            E('span', { 'class': 'gm-muted' }, [ _('Jitter') ]), n.jitter,
+            E('span', { 'class': 'gm-muted' }, [ _('Loss') ]), n.loss
+        ]);
+
+        d.root = E('div', { 'class': 'gm-details' }, [
+            E('style', {}, `
+                .gm-details [hidden] { display: none; }
+                .gm-details-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0 0 8px; }
+                .gm-details-geo { min-width: 0; overflow-wrap: anywhere; opacity: 0.75; }
+                .gm-details-note { margin: 8px 0; }
+                .gm-details-note .cbi-button { margin: 0 0 0 4px; }
+                .gm-details .gm-muted { opacity: 0.65; }
+                .gm-details .gm-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 12px 0 4px; font-size: 90%; }
+                .gm-details .gm-key { display: inline-block; width: 18px; margin: 0 6px 0 0; vertical-align: middle; border-top: 2px solid var(--gm-primary); }
+                .gm-details .gm-key--tx { border-top: 2px dashed currentColor; opacity: 0.7; }
+                .gm-details .gm-key--lost { width: 0; height: 10px; border-top: 0; border-left: 2px solid var(--gm-danger); }
+                .gm-details .gm-chart { position: relative; height: 110px; }
+                .gm-details .gm-chart svg { display: block; width: 100%; height: 100%; overflow: visible; }
+                .gm-details .gm-chart path { fill: none; vector-effect: non-scaling-stroke; }
+                .gm-details .gm-chart-grid { stroke: currentColor; stroke-opacity: 0.15; stroke-width: 1; }
+                .gm-details .gm-line { stroke: var(--gm-primary); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+                .gm-details .gm-line--tx { stroke: currentColor; stroke-opacity: 0.6; stroke-dasharray: 6 4; }
+                .gm-details .gm-line--lost { stroke: var(--gm-danger); stroke-linecap: butt; }
+                .gm-details .gm-chart-label { position: absolute; top: 4px; left: 2px; font-size: 11px; line-height: 1; opacity: 0.7; pointer-events: none; }
+                .gm-details .gm-chart-label--half { top: 50%; }
+                .gm-details-caption { margin: 2px 0 0; font-size: 11px; opacity: 0.7; text-align: right; }
+                .gm-details-stats, .gm-details-ping { display: grid; gap: 2px 16px; margin: 12px 0 0; }
+                .gm-details-ping { grid-template-columns: repeat(3, max-content minmax(0, max-content)); gap: 2px 8px; }
+                .gm-details-col[title]:not([title=""]) { text-decoration: underline dotted; cursor: help; }
+                .gm-details-hint { margin: 6px 0 0; font-size: 90%; opacity: 0.75; }
+                @media (max-width: 480px) {
+                    .gm-details-ping { grid-template-columns: max-content minmax(0, 1fr); }
+                }
+            `),
+            E('div', { 'class': 'gm-details-head' }, [ n.status, n.geo ]),
+            n.note,
+            n.ratesBox = E('div', {}, [
+                E('div', { 'class': 'gm-legend' }, [].concat(
+                    d.rx ? [ legendKey('gm-key--rx', _('From server')) ] : [],
+                    d.tx ? [ legendKey('gm-key--tx', _('To server')) ] : [])),
+                n.rates.box
+            ]),
+            n.pingBox,
+            n.caption = E('p', { 'class': 'gm-details-caption' }, [ _('Last 3 minutes') ]),
+            n.statsBox = E('div', {}, [ n.stats, n.tick ]),
+            n.pingStats,
+            n.countsHint = E('p', { 'class': 'gm-details-hint' }, [
+                !counts ? _('Static mode counts no packets.')
+                    : (!d.rx && !d.tx) ? _('Update geomate to see the packet rates.')
+                    : !d.rx ? _('Update geomate to see the packets from the server.') : ''
+            ]),
+            // LuCI's dialog clicks the first button of '.right' on Escape
+            E('div', { 'class': 'right' }, [
+                E('button', { 'class': 'btn cbi-button', 'click': L.bind(this.closeDetails, this) }, [ _('Close') ])
+            ])
+        ]);
+        n.ratesBox.hidden = !(d.rx || d.tx);
+        n.statsBox.hidden = !keys.length;
+        n.countsHint.hidden = !n.countsHint.textContent;
+
+        d.dialog = ui.showModal(_('Server %s').format(ip), [ d.root ]);
+        this.showDetailsHead();
+        this.showDetails();
+        this.sampleDetails();
+    },
+
+    // The details window is still shown: LuCI's dialog is open and holds it. Another dialog
+    // replaces its content; ui.hideModal() leaves the content in place
+    detailsShown: function(d) {
+        return document.body.classList.contains('modal-overlay-active') && !!d.dialog && d.dialog.contains(d.root);
+    },
+
+    // Close the details window and stop its samples; a reply still on its way is dropped
+    closeDetails: function() {
+        var d = this.details;
+
+        if (!d)
+            return;
+        this.details = null;
+        d.stopped = true;
+        window.clearTimeout(d.timer);
+        if (this.detailsShown(d))
+            ui.hideModal();
+    },
+
+    // Continue after the pause of DETAILS_SESSION
+    continueDetails: function(d) {
+        if (this.details !== d || d.stopped)
+            return;
+        d.state = '';
+        d.started = Date.now();
+        this.showDetails();
+        this.sampleDetails();
+    },
+
+    // Ping again after PING_GIVE_UP timeouts, with the next sample
+    retryPing: function(d) {
+        if (this.details !== d)
+            return;
+        d.ping = true;
+        d.pingFails = 0;
+        d.pingReplied = false;
+        this.showDetails();
+    },
+
+    // Status, filter and geo text of the details window, as the table shows the server now: its
+    // row in the last reply, else its entry of the recent list
+    showDetailsHead: function() {
+        var d = this.details, n = d && d.nodes, conn, e, status, geo;
+
+        if (!d)
+            return;
+        conn = this.connections.find(function(c) { return c && c.dst === d.ip && c.filter_name === d.filter; });
+        e = conn ? { conn: conn, live: true } : (this.recent || {})[recentKey({ filter_name: d.filter, dst: d.ip })];
+        status = !e ? [ 'unknown', _('Unknown'), null ]
+            : (conn && this.connectionsFailed < CONNECTIONS_STALE_AFTER) ? connectionStatus(conn)
+            : pastStatus(e, this.connectionAction(e.conn));
+        geo = geoText(e && e.conn.geo);
+
+        n.status.className = 'gm-status gm-status--' + status[0];
+        n.status.textContent = status[1];
+        n.status.title = status[2] || '';
+        n.geo.textContent = [ d.filter, geo.country, geo.city, geo.isp ].filter(function(s) { return s; }).join(' · ');
+    },
+
+    // One sample of the details window, then the next DETAILS_INTERVAL ms after this one was sent
+    // (d.wait), never two at a time. Nothing while the tab is hidden (handleVisibilityChange starts
+    // again) or LuCI's auto refresh is paused; the window stops when its dialog is gone
+    sampleDetails: function() {
+        var self = this, d = this.details, sent;
+
+        if (!d || d.busy || d.stopped)
+            return;
+        window.clearTimeout(d.timer);
+        d.timer = null;
+        if (!this.detailsShown(d))
+            return this.closeDetails();
+        if (document.hidden || d.state === 'paused')
+            return;
+        if (!poll.active()) {
+            if (d.state !== 'refresh') {
+                d.state = 'refresh';
+                this.showDetails();
+            }
+            d.timer = window.setTimeout(L.bind(this.sampleDetails, this), DETAILS_INTERVAL);
+            return;
+        }
+        if (Date.now() - d.started >= DETAILS_SESSION) {
+            d.state = 'paused';
+            return this.showDetails();
+        }
+
+        d.busy = true;
+        sent = Date.now();
+        callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
+            self.detailsReply(d, L.isObject(reply) ? reply : {});
+        }, function(err) {
+            self.detailsFailed(d, err);
+        }).finally(function() {
+            d.busy = false;
+            if (self.details !== d || d.stopped)
+                return;
+            self.showDetails();
+            d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (Date.now() - sent)));
+        });
+    },
+
+    // A getServerSample reply: a new point, or the note of an error. 'busy': another page sampled
+    // the server just now, the next sample comes as usual
+    detailsReply: function(d, reply) {
+        var p, last;
+
+        d.failures = 0;
+        d.wait = (reply.error === 'limit') ? DETAILS_LIMIT_RETRY : DETAILS_INTERVAL;
+        if (reply.error === 'busy')
+            return;
+        if (reply.error === 'limit' || reply.error === 'unknown') {
+            d.state = reply.error;
+            // No rate across the time without readings
+            d.last = null;
+            return;
+        }
+        p = (reply.error == null) ? samplePoint(d.last, reply) : null;
+        if (!p) {
+            d.state = 'invalid';
+            d.stopped = true;
+            return;
+        }
+
+        d.state = '';
+        d.last ={ t: p.t, rx: reply.rx, tx: reply.tx };
+        last = d.points[d.points.length - 1];
+        // The router's clock went back: the graphs start over
+        if (last && p.t <= last.t)
+            d.points = [];
+        d.points.push(p);
+        while (p.t - d.points[0].t > DETAILS_SPAN)
+            d.points.shift();
+
+        if (p.rtt != null) {
+            d.pingReplied = true;
+            d.pingFails = 0;
+        }
+        else if (p.rtt === null && ++d.pingFails >= (d.pingReplied ? PING_GIVE_UP_LATER : PING_GIVE_UP)) {
+            d.ping = false;
+        }
+    },
+
+    // A failed getServerSample request. A missing method or ACL entry (older luci.geomate or an
+    // rpcd that was not restarted) stops the window, and the IPs are no links from now on. Other
+    // errors (timeout, no connection) keep sampling, and the window says so from the third in a
+    // row
+    detailsFailed: function(d, err) {
+        d.wait = DETAILS_INTERVAL;
+        if (/Access denied|Method not found|Object not found/.test(errorText(err))) {
+            d.state = 'unavailable';
+            d.stopped = true;
+            this.detailsOff = true;
+            this.connectionsKey = null;
+            this.updateActiveConnectionsList();
+            this.sendMessageToMap('serverDetails', { on: false });
+        }
+        else if (++d.failures >= 3) {
+            d.state = 'offline';
+        }
+    },
+
+    // Graphs, figures and note of the details window from its points. Only attributes and texts
+    // change: the nodes are built once (openServerDetails)
+    showDetails: function() {
+        var d = this.details, n = d && d.nodes;
+
+        if (!d)
+            return;
+
+        var points = d.points,
+            end = points.length ? points[points.length - 1].t : 0,
+            from = end - DETAILS_SPAN,
+            notes = {
+                refresh: _('Auto refresh is paused.'),
+                paused: _('Paused after 10 minutes.'),
+                unknown: _('No traffic with this server right now.'),
+                limit: _('Paused: details of other servers are open.'),
+                offline: _('No answer from the router.'),
+                invalid: _('This server cannot be checked.'),
+                unavailable: _('Server details are not available. Reload the page or log in again.')
+            },
+            pingText = d.ping ? '' : d.pingReplied ? _('The server no longer answers ping.')
+                : _('No reply to ping. Many game servers do not answer ping; the packet rates still work.'),
+            text = notes[d.state] || pingText;
+
+        if (n.noteText.textContent !== text)
+            n.noteText.textContent = text;
+        n.note.hidden = !text;
+        n.continue.hidden = d.state !== 'paused';
+        n.retryPing.hidden = !pingText || !!notes[d.state];
+
+        // Packets per second, the same scale for both directions
+        var rate = function(key) { return function(p) { return p[key] ? p[key].pps : null; }; },
+            top = 0;
+        points.forEach(function(p) {
+            top = Math.max(top, (d.rx && p.rx) ? p.rx.pps : 0, (d.tx && p.tx) ? p.tx.pps : 0);
+        });
+        top = niceMax(top, 10);
+        n.rates.paths['gm-line--rx'].setAttribute('d', d.rx ? chartPath(points, rate('rx'), from, DETAILS_SPAN, top) : '');
+        n.rates.paths['gm-line--tx'].setAttribute('d', d.tx ? chartPath(points, rate('tx'), from, DETAILS_SPAN, top) : '');
+        n.rates.top.textContent = rateText(top);
+        n.rates.half.textContent = rateText(top / 2);
+
+        Object.keys(n.cells).forEach(function(key) {
+            var s = rateStats(points, key), c = n.cells[key],
+                rateValue = s ? rateText(s.rate) : '–',
+                sizeValue = (s && s.size != null) ? _('%d bytes').format(Math.round(s.size)) : '–';
+
+            if (c.rate.textContent !== rateValue)
+                c.rate.textContent = rateValue;
+            if (c.size.textContent !== sizeValue)
+                c.size.textContent = sizeValue;
+            if (key === 'rx') {
+                n.tick.hidden = !(s && s.steady);
+                if (s && s.steady)
+                    n.tick.textContent = _('The server sends about %d updates per second.').format(Math.round(s.rate));
+            }
+        });
+
+        // Ping: a graph once the server has answered, with a mark per ping without reply
+        var ping = pingStats(points), rtts = points.filter(function(p) { return p.rtt != null; }),
+            pingTop = niceMax(Math.max.apply(null, [ 0 ].concat(rtts.map(function(p) { return p.rtt; }))), 50);
+
+        n.pingBox.hidden = !rtts.length;
+        n.caption.hidden = n.pingBox.hidden && !(d.rx || d.tx);
+        n.ping.paths['gm-line--rtt'].setAttribute('d', chartPath(points, function(p) { return p.rtt; }, from, DETAILS_SPAN, pingTop));
+        n.ping.paths['gm-line--lost'].setAttribute('d', points.filter(function(p) { return p.rtt === null && p.t >= from; }).map(function(p) {
+            return 'M' + ((p.t - from) * 1000 / DETAILS_SPAN).toFixed(1) + ' 100V88';
+        }).join(''));
+        n.ping.top.textContent = msText(pingTop);
+        n.ping.half.textContent = msText(pingTop / 2);
+        n.pingValue.textContent = (ping && ping.last != null) ? msText(ping.last) : '–';
+        n.pingValue.title = (ping && ping.avg != null) ? _('Average %s').format(msText(ping.avg)) : '';
+        n.jitter.textContent = (ping && ping.jitter != null) ? msText(ping.jitter) : '–';
+        n.loss.textContent = ping ? _('%d%%').format(Math.round(ping.loss)) : '–';
     },
 
     // The cell of connectionAction: one or two buttons, or '–' with a tooltip. Two buttons sit in
