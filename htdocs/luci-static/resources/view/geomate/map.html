@@ -103,6 +103,8 @@
         .gm-popup-fields { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; margin: 0; }
         .gm-popup-fields dt { color: var(--gm-muted); }
         .gm-popup-fields dd { margin: 0; overflow-wrap: anywhere; }
+        .gm-popup-details { display: inline-block; margin-top: 6px; }
+        .leaflet-container a.gm-popup-details { color: var(--gm-accent); }
 
         /* Map toolbar: labelled buttons in two groups (drawing, view) */
         .gm-toolbar { display: flex; flex-direction: column; gap: 10px; }
@@ -684,6 +686,9 @@
         // dst -> marker of a connection shown on the map; marker.gm = { kind, key }
         var connectionMarkers = {};
 
+        // The parent opens a details window for a server (serverDetails): the popups get a Details link
+        var detailsLink = false;
+
         // Initialize MarkerCluster group with customized iconCreateFunction
         var markerClusters = L.markerClusterGroup({
             iconCreateFunction: function(cluster) {
@@ -788,12 +793,13 @@
 
         /**
          * Popup of a connection marker, built from elements and text nodes: filter names and
-         * provider strings never run as markup. Country, city and ISP only when known.
+         * provider strings never run as markup. Country, city and ISP only when known; a Details
+         * link that asks the parent for the server details window, when it has one.
          * @param {Object} conn - The connection.
          * @param {string} kind - connectionKind(conn).
          */
         function connectionPopup(conn, kind) {
-            var geo = conn.geo, box = L.DomUtil.create('div', 'gm-popup'), fields,
+            var geo = conn.geo, box = L.DomUtil.create('div', 'gm-popup'), fields, link,
                 country = geoText(geo, 'country'), code = geoText(geo, 'countryCode'),
                 isp = geoText(geo, 'isp'), org = geoText(geo, 'org');
 
@@ -811,6 +817,14 @@
                 L.DomUtil.create('dt', '', fields).textContent = f[0];
                 L.DomUtil.create('dd', '', fields).textContent = f[1];
             });
+            if (detailsLink) {
+                link = L.DomUtil.create('a', 'gm-popup-details', box);
+                link.href = '#';
+                link.textContent = 'Details';
+                onTap(link, function() {
+                    post('openServerDetails', { ip: conn.dst, filter: String(conn.filter_name || '') });
+                });
+            }
             return box;
         }
 
@@ -834,7 +848,7 @@
 
                 seen[ip] = true;
                 kind = connectionKind(conn);
-                key = JSON.stringify([kind, conn.filter_name, geo.country, geo.countryCode, geo.city, geo.isp, geo.org]);
+                key = JSON.stringify([kind, conn.filter_name, geo.country, geo.countryCode, geo.city, geo.isp, geo.org, detailsLink]);
                 marker = connectionMarkers[ip];
 
                 if (!marker) {
@@ -2649,10 +2663,12 @@
          *   toastAction       { name, sid, id }                button in a toast: undo, enableFilter
          *   fullscreen        { on }                           fullscreen button or Escape asks for it
          *   loadKnownServers  { sid }                          server button in the legend, or a circle selected
+         *   openServerDetails { ip, filter }                   Details link in a connection popup
          * parent -> map:
          *   theme             { dark, bg, fg, border, accent, accentFg, danger, dangerFg, success }
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
+         *   serverDetails     { on }                           connection popups get a Details link when true
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }] }
          *   fitFilter         { sid }                          start view: the circles of this filter, once, before the first setFilters
          *   cancelDraw        -                                Escape outside the map
@@ -2680,6 +2696,8 @@
                 setTheme(data);
             } else if (type === 'fullscreen' && data) {
                 setFullscreenState(data.on === true);
+            } else if (type === 'serverDetails' && data) {
+                detailsLink = data.on === true;
             } else if (type === 'setReadonly') {
                 setReadonly(!data || data.readonly !== false);
             } else if (type === 'cancelDraw') {

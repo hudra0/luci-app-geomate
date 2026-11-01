@@ -53,6 +53,9 @@ var geoTimer = null, geoChecking = false, geoUnknown = 0;
 // Source IP suggestions and host names (hostChoices), loaded with the page
 var hosts = { keys: [], labels: {}, names: {} };
 
+// The router's own addresses (ownAddresses), loaded with the page; none without the permission
+var routerAddrs = {};
+
 // Staged changes of this LuCI session (uci changes): loaded with the page and again after every
 // save of the form. The backend sees only what Save & Apply has committed
 var pending = {};
@@ -67,6 +70,44 @@ function formatTime(seconds) {
 // Suggested IP list path for a filter name (same rule as in view.js)
 function ipListPath(name) {
     return '/etc/geomate.d/' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_servers.txt';
+}
+
+// Filter names the backend supports in nft set and file names (filter_set_name in geomate.sh
+// and luci.geomate, FILTER_NAME_RE in view.js)
+var FILTER_NAME_RE = /^[\w .-]+$/;
+
+// Check a filter name. The backend skips a filter whose name has other characters, so a saved
+// name fails too. A name other than the saved one must not start or end with a space (the map
+// dialog and Create Empty List trim names, so they could not reach that filter) and must not
+// clash with the name of another filter (others): a space and '_' give the same nft set name,
+// so 'A B' and 'A_B' would share their sets, and names match without regard to case (the map's
+// region dialog uses the same rule, filterKey in view.js). Returns true or the error text
+function checkFilterName(name, saved, others) {
+    var key = function(n) { return String(n).toLowerCase().replace(/ /g, '_'); };
+    var clash;
+
+    if (!FILTER_NAME_RE.test(name))
+        return _('Use only letters, digits, spaces, "_", "." and "-"');
+    if (name === saved)
+        return true;
+    if (/^\s|\s$/.test(name))
+        return _('The name must not start or end with a space.');
+
+    clash = others.filter(function(n) { return n != null && key(n) === key(name); })[0];
+    return (clash == null) || _('Name conflicts with filter %s.').format(clash);
+}
+
+// What is wrong with an IP list path, null if nothing. The service takes the path as it is: a
+// space at either end names a different file (a leading one even a relative path)
+function listPathError(path) {
+    path = String(path);
+    if (/[\r\n]/.test(path))
+        return _('The path must be on one line.');
+    if (/^\s|\s$/.test(path))
+        return _('The path must not start or end with a space: the service would use a different file.');
+    if (path.charAt(0) != '/')
+        return _('The path must start with "/".');
+    return null;
 }
 
 // The message of an error without the stack trace, which L.raise() appends to RPC errors (same
@@ -131,6 +172,44 @@ function matchItems(section_id, option) {
 // counts as not supported
 function hasCapability(token) {
     return !!geoStats && Array.isArray(geoStats.capabilities) && geoStats.capabilities.indexOf(token) > -1;
+}
+
+// The seconds a backend with the check_interval token uses for a value of the global option
+// check_interval: like the backend, a missing or non-numeric value counts as 1800 and a number
+// is clamped to 300-3600
+function intervalSeconds(value) {
+    if (!/^[0-9]+$/.test(value != null ? String(value) : ''))
+        return 1800;
+    return Math.min(3600, Math.max(300, +value));
+}
+
+// Seconds between two checks of the service (harvest and geolocation trigger) for a value of
+// check_interval and an operational mode. Only a backend with the check_interval token reads the
+// option; older ones check every 1800 s. Static mode does not use it: its loop runs the trigger
+// once an hour, and its text stays as it was before the option
+function checkInterval(value, mode) {
+    return (hasCapability('check_interval') && mode !== 'static') ? intervalSeconds(value) : 1800;
+}
+
+// Choice text of frequent geolocation: new servers are looked up once per check interval, every
+// second check after a run without new servers
+function frequentLabel(interval) {
+    return _('Frequent - Update every %d-%d minutes').format(Math.round(interval / 60), Math.round(interval / 30));
+}
+
+// Set the text of frequent geolocation in the open form from the check interval and the
+// operational mode selected there, before they are saved
+function updateFrequentLabel(map, section_id) {
+    var formValue = function(name) {
+        var opt = map.lookupOption(name, section_id);
+        return opt ? opt[0].formvalue(opt[1]) : null;
+    };
+    var mode = map.lookupOption('geolocation_mode', section_id),
+        widget = mode ? mode[0].getUIElement(mode[1]) : null,
+        choice = widget ? widget.node.querySelector('option[value="frequent"]') : null;
+
+    if (choice)
+        choice.textContent = frequentLabel(checkInterval(formValue('check_interval'), formValue('operational_mode')));
 }
 
 // A full geolocation (manual or daily) is running. A missing field (older backend) is unknown
@@ -221,25 +300,32 @@ function checkGeolocation() {
     });
 }
 
-// Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
-// 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
-// 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
-// once. Returns { keys: the addresses in numeric order, labels: { address: node }, names:
-// { address: host name } }; a label is a node, because LuCI puts a string label in as HTML
-// (same function in view.js)
-function hostChoices(hints, devices) {
-    var own = {}, text = {}, names = {}, labels = {}, keys;
+// The router's own IPv4 addresses on every interface, WAN included, from luci-rpc
+// getNetworkDevices, which lists each address as { address, netmask, ... }. Returns
+// { address: true }, empty for a reply that is no object (a session without the permission)
+function ownAddresses(devices) {
+    var own = {};
 
-    hints = L.isObject(hints) ? hints : {};
     devices = L.isObject(devices) ? devices : {};
-
-    // getNetworkDevices lists each address as { address, netmask, ... }
     Object.keys(devices).forEach(function(dev) {
         L.toArray(L.isObject(devices[dev]) ? devices[dev].ipaddrs : null).forEach(function(a) {
             if (L.isObject(a) && typeof a.address == 'string')
                 own[a.address] = true;
         });
     });
+    return own;
+}
+
+// Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
+// 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (ownAddresses) and
+// 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
+// once. Returns { keys: the addresses in numeric order, labels: { address: node }, names:
+// { address: host name } }; a label is a node, because LuCI puts a string label in as HTML
+// (same function in view.js, which reads the router's addresses inline)
+function hostChoices(hints, devices) {
+    var own = ownAddresses(devices), text = {}, names = {}, labels = {}, keys;
+
+    hints = L.isObject(hints) ? hints : {};
 
     Object.keys(hints).forEach(function(mac) {
         var h = L.isObject(hints[mac]) ? hints[mac] : {};
@@ -263,20 +349,22 @@ function plainIPv4(s) {
     return validation.parseIPv4(s) != null && !/(^|\.)0\d/.test(s);
 }
 
+// An IPv4 address as a number, for comparing and sorting
+function ipv4Number(ip) {
+    return validation.parseIPv4(ip).reduce(function(n, o) { return n * 256 + o; }, 0);
+}
+
 // An entry of Source IP as geomate.sh (is_ipv4_entry) takes it: an IPv4 address, a.b.c.d/0-32
 // or a range a.b.c.d-e.f.g.h whose first address is not above the last. nft rejects a dotted
 // mask (a.b.c.d/255.255.255.0) and a range the other way round
 function srcIpEntry(s) {
     var m = /^([\d.]+)(?:\/(3[0-2]|[12]?\d)|-([\d.]+))?$/.exec(s);
-    var number = function(ip) {
-        return validation.parseIPv4(ip).reduce(function(n, o) { return n * 256 + o; }, 0);
-    };
 
     if (!m || !plainIPv4(m[1]))
         return false;
     if (m[3] == null)
         return true;
-    return plainIPv4(m[3]) && number(m[1]) <= number(m[3]);
+    return plainIPv4(m[3]) && ipv4Number(m[1]) <= ipv4Number(m[3]);
 }
 
 // The entries of a Source IP value (a string, or an array of strings), split at white space.
@@ -453,6 +541,11 @@ function listPath(opt, sid) {
     return error ? null : path;
 }
 
+// The message for an IP list path that names a directory, such as /etc/geomate.d/runtime
+function directoryError(path) {
+    return _('%s is a directory, not an IP list file.').format(path);
+}
+
 // Write the chosen file as the IP list. A new file is written at once; an existing list is
 // replaced only after the user confirmed
 function uploadList(opt, sid, path, file) {
@@ -470,7 +563,9 @@ function uploadList(opt, sid, path, file) {
         });
     };
 
-    return fs.stat(path).then(function() {
+    return fs.stat(path).then(function(st) {
+        if (st && st.type == 'directory')
+            return dom.content(status, [ directoryError(path) ]);
         dom.content(status, [
             _('%s already exists. Replace it with %s?').format(path, file.name), ' ',
             E('button', { 'class': 'btn cbi-button-negative', 'click': write }, [ _('Replace') ]), ' ',
@@ -482,6 +577,95 @@ function uploadList(opt, sid, path, file) {
         if (err && err.name == 'NotFoundError')
             return write();
         dom.content(status, [ _('Cannot check %s: %s').format(path, errorText(err)) ]);
+    });
+}
+
+// A public IPv4 address: none of the ranges the harvest skips (is_valid_public_ip in
+// geomate.sh): 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16 and 224/3, and not in the
+// carrier-grade NAT range 100.64/10, which the harvest keeps (a WAN behind CGNAT has one)
+function publicIPv4(ip) {
+    var o = validation.parseIPv4(ip);
+
+    return !(o[0] == 0 || o[0] == 10 || o[0] == 127 || o[0] >= 224 || (o[0] == 169 && o[1] == 254) ||
+        (o[0] == 172 && o[1] >= 16 && o[1] <= 31) || (o[0] == 192 && o[1] == 168) ||
+        (o[0] == 100 && o[1] >= 64 && o[1] <= 127));
+}
+
+// An IP list cleaned for sharing: the address of each line without its time stamp (which shows
+// when someone played), only public IPv4 addresses that are none of the router's own (own:
+// { address: true }), each once, in numeric order. Returns { ips: the addresses, skipped: the
+// lines left out, not counting empty ones }
+function cleanList(text, own) {
+    var seen = {}, ips = [], skipped = 0;  // seen: address -> number
+
+    own = own || {};
+    String(text).split('\n').forEach(function(line) {
+        var ip = line.split(',')[0].trim();
+
+        if (!line.trim())
+            return;
+        if (!plainIPv4(ip) || !publicIPv4(ip) || own[ip] || seen[ip] != null) {
+            skipped++;
+            return;
+        }
+        seen[ip] = ipv4Number(ip);
+        ips.push(ip);
+    });
+    ips.sort(function(a, b) { return seen[a] - seen[b]; });
+    return { ips: ips, skipped: skipped };
+}
+
+// Save the IP list, cleaned by cleanList, as a file of the same name with one address per line:
+// the format of Upload List and of the shipped lists. Reads through cgi-download (needs the
+// cgi-io download ACL and read access to the path), which has no size limit, unlike rpcd's
+// file.read (fs.read), which refuses files of 256 KiB or more
+function downloadList(opt, path) {
+    var status = opt.status;
+
+    dom.content(status, [ _('Loading...') ]);
+    return fs.read_direct(path, 'text').then(function(text) {
+        var list, link;
+
+        if (!String(text).trim())
+            return dom.content(status, [ _('%s is empty.').format(path) ]);
+
+        list = cleanList(text, routerAddrs);
+        if (!list.ips.length)
+            return dom.content(status, [ _('%s has no public IPv4 addresses.').format(path) ]);
+
+        link = E('a', {
+            'href': URL.createObjectURL(new Blob([ list.ips.join('\n') + '\n' ], { 'type': 'text/plain' })),
+            'download': path.replace(/^.*\//, ''),
+            'style': 'display: none'
+        });
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        // After the browser has taken the file
+        window.setTimeout(function() { URL.revokeObjectURL(link.href); }, 60000);
+
+        dom.content(status, [ list.skipped
+            ? _('Downloaded %d addresses, left out %d lines: private or router addresses, duplicates and invalid entries.').format(list.ips.length, list.skipped)
+            : _('Downloaded %d addresses.').format(list.ips.length) ]);
+    }).catch(function(err) {
+        var name = err ? err.name : null;
+
+        if (name == 'NotFoundError')
+            return dom.content(status, [ _('%s does not exist.').format(path) ]);
+        if (name != 'PermissionError')
+            return dom.content(status, [ _('Failed to read %s: %s').format(path, errorText(err)) ]);
+
+        // cgi-download refuses a directory with the same status as a path the ACL denies. Look
+        // the path up in its folder's listing: luci-base lets every session list, but only some
+        // may stat
+        var base = path.replace(/^.*\//, '');
+        return fs.list(path.replace(/\/[^\/]*$/, '')).then(function(entries) {
+            return (entries || []).some(function(e) { return e.name == base && e.type == 'directory'; });
+        }, function() {
+            return false;
+        }).then(function(dir) {
+            dom.content(status, [ dir ? directoryError(path) : _('No permission to read %s.').format(path) ]);
+        });
     });
 }
 
@@ -499,6 +683,7 @@ return view.extend({
             geoStats = data[0] || null;
             pending = data[1] || {};
             hosts = hostChoices(data[2], data[3]);
+            routerAddrs = ownAddresses(data[3]);
             return data;
         });
     },
@@ -696,15 +881,66 @@ return view.extend({
         o.value('monitor', _('Monitor - Only visualize connections, no blocking'));
         o.default = 'dynamic';
         o.rmempty = false;
+        // Static mode does not use the check interval (checkInterval)
+        if (hasCapability('check_interval'))
+            o.onchange = function(ev, section_id) { updateFrequentLabel(this.map, section_id); };
+
+        // **Check Interval Option**
+        // Seconds between two checks for new servers (checkInterval). Only for a backend that
+        // reads it; same default as the backend
+        if (hasCapability('check_interval')) {
+            o = s.option(form.ListValue, 'check_interval', _('Check Interval'),
+                _('How often Geomate adds newly seen servers to the IP lists and, with frequent updates, geolocates them. A shorter interval handles new servers sooner but writes to flash and uses CPU time more often. Not used in static mode.'));
+            o.value('300', _('5 minutes'));
+            o.value('600', _('10 minutes'));
+            o.value('900', _('15 minutes'));
+            o.value('1800', _('30 minutes'));
+            o.value('3600', _('60 minutes'));
+            o.default = '1800';
+            o.rmempty = false;
+            // A missing or empty option reads as the default, so a save without a change of this
+            // select writes nothing: the backend has the same default, and a new line in the
+            // config would cost a restart. Called with two arguments, it stores the loaded value
+            var intervalValue = o.cfgvalue;
+            o.cfgvalue = function(section_id) {
+                var value = intervalValue.apply(this, arguments);
+                return (arguments.length > 1 || (value != null && value !== '')) ? value : this.default;
+            };
+            // A hand-written value that is no choice stays a choice of its own: the select would
+            // otherwise show the first choice and the next save would write it. Its text names
+            // what the backend uses instead of a value outside 300-3600 or no number
+            var loadInterval = o.load, intervalChoices = o.keylist.length;
+            o.load = function(section_id) {
+                var value = loadInterval.apply(this, arguments), seconds = intervalSeconds(value);
+
+                this.keylist = this.keylist.slice(0, intervalChoices);
+                this.vallist = this.vallist.slice(0, intervalChoices);
+
+                if (value != null && value !== '' && this.keylist.indexOf(String(value)) < 0)
+                    this.value(value, (String(seconds) === String(value))
+                        ? _('%s seconds').format(value)
+                        : _('%s (uses %d minutes)').format(value, seconds / 60));
+                return value;
+            };
+            // The text of frequent geolocation follows the selected interval
+            o.onchange = function(ev, section_id) { updateFrequentLabel(this.map, section_id); };
+        }
 
         // **Geolocation Mode Option**
-        // Choose how often to update IP geolocation data
+        // Choose how often to update IP geolocation data. The text of frequent geolocation comes
+        // from the saved or staged check interval on every render of the form
         o = s.option(form.ListValue, 'geolocation_mode', _('Geolocation Update Mode'),
             _('Choose how often to update IP geolocation data'));
-        o.value('frequent', _('Frequent - Update every 30-60 minutes'));
+        o.value('frequent', frequentLabel(1800));
         o.value('daily', _('Daily - Update once per day'));
         o.default = 'frequent';
         o.rmempty = false;
+        var renderMode = o.renderWidget;
+        o.renderWidget = function(section_id) {
+            this.vallist[this.keylist.indexOf('frequent')] = frequentLabel(checkInterval(
+                uci.get('geomate', section_id, 'check_interval'), uci.get('geomate', section_id, 'operational_mode')));
+            return renderMode.apply(this, arguments);
+        };
 
         // **Geo Filters Section**
         // Main section for configuring individual geographic filters. The table shows only the
@@ -727,6 +963,14 @@ return view.extend({
         // Filter name identifier
         o = s.option(form.Value, 'name', _('Name'));
         o.rmempty = false;
+        // Checked as typed: no trimming, no renaming. An empty name fails before validate
+        o.validate = function(section_id, value) {
+            var others = uci.sections('geomate', 'geo_filter').filter(function(f) {
+                return f['.name'] !== section_id;
+            }).map(function(f) { return f.name; });
+
+            return checkFilterName(value, this.cfgvalue(section_id), others);
+        };
 
         // Tooltip of the status and regions columns for a hand-written 'option allowed_region'
         var optionNote = _('Written as "option allowed_region" instead of "list allowed_region": the service start skips it and the map cannot show it.');
@@ -739,6 +983,7 @@ return view.extend({
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
             var enabled = uci.get('geomate', section_id, 'enabled') === '1';
+            var ipList = uci.get('geomate', section_id, 'ip_list');
             // The checks below read staged values: a staged change of the global switch
             // (service disabled) is unsaved for every enabled filter too
             var staged = isPending(section_id) || (enabled && isPending('global', 'enabled'));
@@ -748,17 +993,21 @@ return view.extend({
                 if (note) notes.push(note);
             };
 
-            if (!filterName) return '–';
+            // An enabled filter without a name goes on to "Invalid name": the service skips it
+            if (!filterName && !enabled) return '–';
             if (!enabled && !staged) return _('Disabled');
 
             if (staged) words.push(_('Unsaved'));
             if (enabled) {
                 // The service does not start while Geomate is disabled globally
                 if (uci.get('geomate', 'global', 'enabled') !== '1') problem(_('Service off'), _('Geomate is disabled in the global settings.'));
-                if (hasNftError(filterName)) problem(_('nftables error'), _('See /tmp/geomate_nft_errors.log on the router.'));
+                // The service skips a filter with such a name
+                if (!FILTER_NAME_RE.test(filterName || '')) problem(_('Invalid name'), _('The service skips this filter. Use only letters, digits, spaces, "_", "." and "-".'));
+                if (filterName && hasNftError(filterName)) problem(_('nftables error'), _('See /tmp/geomate_nft_errors.log on the router.'));
                 if (regionIsOption(section_id)) problem(_('Region not a list'), optionNote);
                 else if (!regionList(section_id).some(function(r) { return parseRegion(r) !== null; })) problem(_('No regions'));
-                if (!uci.get('geomate', section_id, 'ip_list')) problem(_('No IP list'));
+                if (!ipList) problem(_('No IP list'));
+                else if (listPathError(ipList)) problem(_('Invalid list path'), listPathError(ipList));
             }
 
             if (!words.length) return _('Active');
@@ -926,6 +1175,11 @@ return view.extend({
         o = s.option(form.Value, 'ip_list', _('IP List File'));
         o.rmempty = false;
         o.modalonly = true;
+        // Only a changed path is checked: a saved one does not block saving the other options
+        // (the status column names its problem)
+        o.validate = function(section_id, value) {
+            return value === this.cfgvalue(section_id) || listPathError(value) || true;
+        };
 
         // IP expiry days - removes inactive IPs after specified days
         o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
@@ -978,6 +1232,21 @@ return view.extend({
                 this.status.parentNode.appendChild(this.fileInput);
             }
             this.fileInput.click();
+        };
+
+        // Download List button: saves the IP list without time stamps, private addresses and
+        // the router's own, for sharing or as a backup. Reading the list needs no write access,
+        // so a read-only session can use it too
+        o = s.option(form.Button, '_download', _('Download IP List'));
+        o.inputtitle = _('Download List');
+        o.inputstyle = 'apply';
+        o.modalonly = true;
+        o.readonly = false;
+        withStatus(o);
+        o.onclick = function(ev, section_id) {
+            var path = listPath(this, section_id);
+
+            return path ? downloadList(this, path) : null;
         };
 
         return m.render().then(function(node) {

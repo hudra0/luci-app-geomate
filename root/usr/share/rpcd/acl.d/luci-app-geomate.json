@@ -4,11 +4,12 @@
         "read": {
             "ubus": {
                 "file": [ "exec" ],
-                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers", "getServerSample", "getServerRoute" ],
                 "luci-rpc": [ "getHostHints", "getNetworkDevices" ],
                 "uci": [ "get", "state" ]
             },
             "uci": [ "geomate" ],
+            "cgi-io": [ "download" ],
             "file": {
                 "/etc/init.d/geomate": [ "read" ],
                 "/etc/init.d/geomate check_version": [ "exec" ],
@@ -23,7 +24,7 @@
         },
         "write": {
             "ubus": {
-                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers", "getServerSample", "getServerRoute" ],
                 "uci": [ "set", "commit", "apply" ]
             },
             "uci": [ "geomate" ],

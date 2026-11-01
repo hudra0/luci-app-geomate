@@ -38,6 +38,13 @@ function validRegion(region) {
 // Filter names the backend supports in nft set and file names (filter_set_name in luci.geomate)
 var FILTER_NAME_RE = /^[\w .-]+$/;
 
+// Two filter names clash when their keys match: a space and '_' give the same nft set name, so
+// 'A B' and 'A_B' would share their sets, and names match without regard to case (same rule as
+// checkFilterName in geofilters.js)
+function filterKey(name) {
+    return String(name == null ? '' : name).toLowerCase().replace(/ /g, '_');
+}
+
 // Filter colors by section order, readable on the OSM tiles
 var PALETTE = ['#0072B2', '#E69F00', '#CC79A7', '#009E73', '#D55E00', '#56B4E9', '#7F4FBF', '#8C6D31'];
 
@@ -165,6 +172,28 @@ var callKnownServers = rpc.declare({
     params: [ 'sid' ],
     expect: { '': {} },
     reject: true
+});
+
+// Counters and ping of the selected server (getServerSample), polled once per
+// second while it is open. nobatch: a status batch (several hundred ms) never delays a sample. An
+// older rpcd ACL or luci.geomate rejects it
+var callServerSample = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getServerSample',
+    params: [ 'filter', 'ip', 'ping' ],
+    expect: { '': {} },
+    reject: true,
+    nobatch: true
+});
+
+// A bounded route measurement, separate from direct ICMP samples and their statistics.
+var callServerRoute = rpc.declare({
+    object: 'luci.geomate',
+    method: 'getServerRoute',
+    params: [ 'filter', 'ip' ],
+    expect: { '': {} },
+    reject: true,
+    nobatch: true
 });
 
 // A getKnownServers answer as the map takes it: { total, approx, decimals, missing, points:
@@ -326,7 +355,8 @@ function untrackedNote(filterName) {
         return _('Filter has no regions.') + ' ' + effect;
 
     // Static mode collects no new servers, daily geolocation looks them up once a day. Frequent
-    // updates run every 30 minutes, every hour while there was nothing to look up
+    // updates run once per check interval (global check_interval, 30 minutes by default), every
+    // second check while there was nothing to look up
     if (mode === 'static')
         next = _('Static mode does not add it to the IP list.');
     else if (uci.get('geomate', 'global', 'geolocation_mode') === 'daily')
@@ -617,6 +647,7 @@ function splitEntries(widget) {
 // Poll intervals in seconds
 var CONNECTIONS_INTERVAL = 5,
     STATUS_INTERVAL = 10,
+    STATUS_HIDDEN_INTERVAL = 300,   // while the tab is hidden (pollHidden)
     VERSION_INTERVAL = 3600,
     // Failed getGeomateConnections requests in a row before the status row says the list is old
     CONNECTIONS_STALE_AFTER = 3;
@@ -739,7 +770,7 @@ function showSeen(node, lastSeen, now) {
 var COLUMN_IP = 0, COLUMN_COUNTRY = 3, COLUMN_SEEN = 6, COLUMN_TRAFFIC = 7;
 
 // Choices of the "Sort by" select of the card layout: [ column, descending ]. Last seen from the
-// newest, traffic from the most packets
+// newest, traffic from the current rate, then the packet total
 var SORT_CHOICES = [ [ COLUMN_SEEN, false ], [ COLUMN_TRAFFIC, true ], [ COLUMN_IP, false ], [ COLUMN_COUNTRY, false ] ];
 
 // The packet rate of a server is taken over the replies of the last RATE_WINDOW ms, once they
@@ -776,6 +807,18 @@ function trafficRate(t) {
     return (first && last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
 }
 
+// Traffic column sort key, fixed width so a string compare matches the numeric order. Current
+// packets per second (hundredths) come first, the packet total breaks ties. A past row and a live
+// row that has no rate yet sort as 0 pkt/s, so a quiet history stays below anything still sending
+function trafficSortValue(rec, live) {
+    var t = rec && rec.traffic,
+        rate = (t && live) ? trafficRate(t) : null,
+        pps = (rate == null || rate < 0) ? 0 : Math.min(rate, 99999999.99),
+        packets = t ? Math.min(t.packets, 999999999999) : 0;
+
+    return ('0000000000' + Math.round(pps * 100)).slice(-10) + '-' + ('000000000000' + packets).slice(-12);
+}
+
 // Packets in total for a Traffic cell: exact below 10000, then rounded ('108k packets', '1.2M
 // packets'). The table never wraps the Traffic column, so a long session's total would widen
 // it; this way the text stays at most 12 characters. The tooltip keeps the exact count
@@ -789,28 +832,29 @@ function packetsText(n) {
     return _('%dM packets').format(Math.round(n / 1000000));
 }
 
+// A packet rate as text. The format follows the rounded rate: 9.96 is '10 pkt/s', not '10.0 pkt/s'
+function rateText(rate) {
+    if (+rate.toFixed(1) >= 10 || rate == 0)
+        return _('%d pkt/s').format(Math.round(rate));
+    if (+rate.toFixed(2) >= 0.1)
+        return _('%.1f pkt/s').format(rate);
+    return _('%.2f pkt/s').format(rate);
+}
+
 // Traffic cell of a row (rec: its entry of the recent list): the packet rate of a live row, the
 // packets in total of a past row and of a live row before its rate is known, '–' without counters
 // (older backend, static mode, a row an older view stored without them). The packets count those
 // the devices of the filter sent to the server since its first packet after the last service
-// start or after an hour without one. data-value: the packets, for sorting. The tooltip adds the
-// bytes, the average packet size and how long this page has seen the server
+// start or after an hour without one. data-value is trafficSortValue(), what the column sorts by.
+// The tooltip adds the bytes, the average packet size and how long this page has seen the server
 function showTraffic(node, rec, live) {
     var t = rec && rec.traffic,
         rate = (t && live) ? trafficRate(t) : null,
         secs = (rec && rec.firstSeen) ? Math.round((rec.lastSeen - rec.firstSeen) / 1000) : 0,
         text = '–', title = [];
 
-    // The format follows the rounded rate: 9.96 is '10 pkt/s', not '10.0 pkt/s'
     if (t) {
-        if (rate == null)
-            text = packetsText(t.packets);
-        else if (+rate.toFixed(1) >= 10 || rate == 0)
-            text = _('%d pkt/s').format(Math.round(rate));
-        else if (+rate.toFixed(2) >= 0.1)
-            text = _('%.1f pkt/s').format(rate);
-        else
-            text = _('%.2f pkt/s').format(rate);
+        text = (rate == null) ? packetsText(t.packets) : rateText(rate);
 
         title.push(N_(t.packets, '%d packet sent to the server, %s', '%d packets sent to the server, %s')
             .format(t.packets, '%1024.1mB'.format(t.bytes)));
@@ -824,7 +868,7 @@ function showTraffic(node, rec, live) {
         node.textContent = text;
     node.classList.toggle('gm-traffic--none', !t);
     node.classList.toggle('gm-traffic--past', !live);
-    node.setAttribute('data-value', t ? t.packets : 0);
+    node.setAttribute('data-value', trafficSortValue(rec, live));
     if (title.length)
         node.setAttribute('title', title.join('\n'));
     else
@@ -839,6 +883,172 @@ function searchText(conn) {
     return [ conn.dst, conn.filter_name, geo.country, geo.countryCode, geo.city, geo.isp ].filter(function(s) {
         return typeof s == 'string';
     }).join('\n').toLowerCase();
+}
+
+// Selected server (openServerDetails): one getServerSample request per DETAILS_INTERVAL
+// ms while it is open and the tab is visible, the next only after the reply. The graphs show the
+// last DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
+// give no rate, and the lines break there. The figures take the last DETAILS_STATS rates. After
+// DETAILS_SESSION ms the window pauses until Continue, so a forgotten window does not sample and
+// ping for hours. While other servers use up the router's limit (sample 'limit'), it asks again
+// every DETAILS_LIMIT_RETRY ms. Ping stops after PING_GIVE_UP timeouts in a row, or after
+// PING_GIVE_UP_LATER once the server has answered
+var DETAILS_INTERVAL = 1000,
+    DETAILS_SPAN = 180 * 1000,
+    DETAILS_MAX_GAP = 5000,
+    DETAILS_STATS = 10,
+    DETAILS_SESSION = 10 * 60 * 1000,
+    DETAILS_LIMIT_RETRY = 3000,
+    PING_GIVE_UP = 3,
+    PING_GIVE_UP_LATER = 10,
+    ROUTE_INTERVAL = 2000,
+    ROUTE_STALE = 10000,
+    ROUTE_GRAPH_GAP = 20000;
+
+// Packets per second between two counter readings of getServerSample ({ packets, bytes }) dt ms
+// apart: { pps, packets, bytes } with the counts in between. null when one is missing or a count
+// went down: the set was built again (service restart) or the server's element expired, and the
+// counting starts over from the newer reading
+function counterRate(a, b, dt) {
+    if (!a || !b || !isCount(a.packets) || !isCount(a.bytes) || !isCount(b.packets) || !isCount(b.bytes) ||
+        b.packets < a.packets || b.bytes < a.bytes || !(dt > 0))
+        return null;
+    return { pps: (b.packets - a.packets) * 1000 / dt, packets: b.packets - a.packets, bytes: b.bytes - a.bytes };
+}
+
+// A point of the graphs from a getServerSample reply and the reading before it (last: { t, rx,
+// tx }, null for none): { t, rx, tx, rtt }. rx and tx are counterRate() results or null; rtt is
+// the round trip in ms, null for a ping without reply, undefined without a ping. t is the router's
+// time of the reading, so the delay of the request does not change the rates. null for a reply
+// without a time
+function samplePoint(last, reply) {
+    var t = reply.t, dt, p;
+
+    if (typeof t != 'number' || !isFinite(t))
+        return null;
+    p = { t: t, rx: null, tx: null, rtt: undefined };
+    dt = last ? t - last.t : 0;
+    if (dt > 0 && dt <= DETAILS_MAX_GAP) {
+        p.rx = counterRate(last.rx, reply.rx, dt);
+        p.tx = counterRate(last.tx, reply.tx, dt);
+    }
+    if (reply.ping === 'ok' && typeof reply.rtt == 'number' && isFinite(reply.rtt) && reply.rtt >= 0)
+        p.rtt = reply.rtt;
+    else if (reply.ping === 'timeout')
+        p.rtt = null;
+    return p;
+}
+
+function median(values) {
+    var v = values.slice().sort(function(a, b) { return a - b; }), m = v.length >> 1;
+
+    return !v.length ? null : (v.length % 2) ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+
+// Figures of one direction ('rx' or 'tx') over the last DETAILS_STATS rates of the points: { rate:
+// their median in packets per second, size: bytes per packet, steady: at least 5 rates of at least
+// 1 pkt/s that vary by at most 20% (coefficient of variation) }. null without rates
+function rateStats(points, key) {
+    var rates = points.filter(function(p) { return p[key]; }).slice(-DETAILS_STATS).map(function(p) { return p[key]; }),
+        pps = rates.map(function(r) { return r.pps; }),
+        packets = 0, bytes = 0, mean, sd;
+
+    if (!rates.length)
+        return null;
+    rates.forEach(function(r) { packets += r.packets; bytes += r.bytes; });
+    mean = pps.reduce(function(s, v) { return s + v; }, 0) / pps.length;
+    sd = Math.sqrt(pps.reduce(function(s, v) { return s + (v - mean) * (v - mean); }, 0) / pps.length);
+    return { rate: median(pps), size: packets ? bytes / packets : null, steady: pps.length >= 5 && mean >= 1 && sd <= 0.2 * mean };
+}
+
+// Ping figures of the points: { last: the latest reply in ms, avg, jitter: the mean difference
+// between consecutive replies, loss: pings without reply in percent }. Values without replies are
+// null; null without any ping
+function pingStats(points) {
+    var rtts = [], sent = 0, jitter = 0, i;
+
+    points.forEach(function(p) {
+        if (p.rtt === undefined)
+            return;
+        sent++;
+        if (p.rtt !== null)
+            rtts.push(p.rtt);
+    });
+    if (!sent)
+        return null;
+    for (i = 1; i < rtts.length; i++)
+        jitter += Math.abs(rtts[i] - rtts[i - 1]);
+    return {
+        last: rtts.length ? rtts[rtts.length - 1] : null,
+        avg: rtts.length ? rtts.reduce(function(s, v) { return s + v; }, 0) / rtts.length : null,
+        jitter: (rtts.length > 1) ? jitter / (rtts.length - 1) : null,
+        loss: (sent - rtts.length) * 100 / sent
+    };
+}
+
+// The smallest of 1, 2, 2.5, 5 times a power of ten that is at least v and floor: the top of a
+// graph's scale
+function niceMax(v, floor) {
+    var m = Math.max(v || 0, floor), p = Math.pow(10, Math.floor(Math.log10(m)));
+
+    return [ 1, 2, 2.5, 5, 10 ].map(function(s) { return s * p; }).find(function(s) { return s >= m * (1 - 1e-9); });
+}
+
+// The 'd' of a graph line in the 1000 x 100 units of detailsChart(): value(p) of the points from
+// 'from' on over span ms, scaled to max. The line breaks at a point without value and between
+// points more than DETAILS_MAX_GAP apart; each piece starts with a dot ('h0', round line caps),
+// so a single point shows
+function chartPath(points, value, from, span, max, maxGap) {
+    var d = [], prev = null;
+
+    if (maxGap == null)
+        maxGap = DETAILS_MAX_GAP;
+    points.forEach(function(p) {
+        var v = value(p);
+
+        if (v == null || p.t < from) {
+            prev = null;
+            return;
+        }
+        var x = ((p.t - from) * 1000 / span).toFixed(1), y = (100 - Math.min(v, max) * 98 / max).toFixed(1);
+        d.push((prev == null || p.t - prev > maxGap) ? 'M' + x + ' ' + y + 'h0' : 'L' + x + ' ' + y);
+        prev = p.t;
+    });
+    return d.join('');
+}
+
+// A round trip in ms as text
+function msText(ms) {
+    return (ms < 10) ? _('%.1f ms').format(ms) : _('%d ms').format(Math.round(ms));
+}
+
+// An SVG element; E() creates HTML elements only
+function svgNode(tag, attrs) {
+    var el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+
+    Object.keys(attrs || {}).forEach(function(k) { el.setAttribute(k, attrs[k]); });
+    return el;
+}
+
+// A graph of the selected server: an SVG of 1000 x 100 units stretched to its box (the lines keep
+// their width: non-scaling-stroke), a path per class in lines, a grid line at the top and at half
+// height with their values as text at the left edge. Built once; showDetails() sets the paths and
+// the values. Returns { box, paths: { class: path }, top, half }
+function detailsChart(lines) {
+    var svg = svgNode('svg', { 'viewBox': '0 0 1000 100', 'preserveAspectRatio': 'none', 'aria-hidden': 'true' }),
+        chart = { paths: {}, top: E('span', { 'class': 'gm-chart-label' }), half: E('span', { 'class': 'gm-chart-label gm-chart-label--half' }) };
+
+    svg.appendChild(svgNode('path', { 'class': 'gm-chart-grid', 'd': 'M0 2H1000M0 51H1000M0 100H1000' }));
+    lines.forEach(function(cls) {
+        svg.appendChild(chart.paths[cls] = svgNode('path', { 'class': 'gm-line ' + cls }));
+    });
+    chart.box = E('div', { 'class': 'gm-chart' }, [ svg, chart.top, chart.half ]);
+    return chart;
+}
+
+// A legend entry of a graph line
+function legendKey(cls, label) {
+    return E('span', {}, [ E('span', { 'class': 'gm-key ' + cls }), label ]);
 }
 
 // check_version asks the GitHub API, which allows 60 unauthenticated requests per hour and public
@@ -988,6 +1198,7 @@ return view.extend({
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
     problems: [],       // problems of the last status poll: 'process' and check keys (updateStatus)
+    problemsAt: null,   // monotonic time that the last counted status poll was sent
     confirmed: [],      // problems seen on two polls in a row; a new one opens the details
     versionInfo: null,  // last versionState() result, null before the first check
     readonly: true,     // no write access, or no configuration: the map only shows
@@ -998,6 +1209,7 @@ return view.extend({
     drawing: false,     // the map is drawing a circle (drawState)
     connectionsBusy: null,  // running getGeomateConnections request
     statusBusy: null,       // running status request
+    hiddenTimer: null,      // window timer of the status poll while the tab is hidden (pollHidden)
     versionBusy: null,      // running check_version request
     versionInstalled: null, // installed versions (installedKey) for which a check was last started
     connectionsTable: null, // ui.Table of the active connections
@@ -1019,10 +1231,14 @@ return view.extend({
     serversLoads: {},       // running getKnownServers request per filter section
     restartPid: null,       // PID of the service when a mode change was applied, until it restarted
     restartAt: 0,           // time of that change
+    details: null,          // the selected server (openServerDetails), null without a selection
+    detailsOff: false,      // getServerSample is missing or not granted: no details links
+    routeOff: false,        // missing route method/permission; direct samples remain available
+    routeRequest: null,     // one route call across selections, including late replies
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
-    // runs call by call, so getStatus (about 0.3 s) would delay the map. startPolls() fetches
-    // the status. Each call may fail on its own; the page then renders with what it got
+    // runs call by call, so the status calls would delay the map. startPolls() fetches the
+    // status. Each call may fail on its own; the page then renders with what it got
     load: function() {
         this.reported = {};
         return Promise.all([
@@ -1051,7 +1267,10 @@ return view.extend({
         if (!this.readonly && this.knownChanges !== '[]')
             this.showNotice();
 
-        var nodes = E([], [ this.renderStatus(), this.renderMap(), this.renderConnections() ]);
+        var nodes = E([], [ this.renderStatus(),
+            E('div', { 'id': 'geomate-overview', 'class': 'gm-overview--single' }, [
+                E('div', { 'class': 'gm-overview-grid' }, [ this.renderMap(), this.renderServerPanel() ])
+            ]), this.renderConnections() ]);
 
         window.addEventListener('message', L.bind(this.handleMessage, this), false);
         // Escape outside the map also ends drawing, then fullscreen; the map handles it when it
@@ -1094,7 +1313,7 @@ return view.extend({
 
         var style = E('style', {}, `
             /* Theme colors with fallbacks, for the status row and the connection pills */
-            #geomate-status, #gm-mode-menu, #active-connections-container {
+            #geomate-status, #gm-mode-menu, #active-connections-container, .gm-details {
                 --gm-success: var(--success, var(--success-color-high, var(--success-color, #1a7f37)));
                 --gm-danger: var(--danger, var(--error-color-high, var(--danger-color, var(--error-color, #cf222e))));
                 --gm-primary: var(--primary, var(--primary-color-high, var(--main-bright-color, #1a6fd1)));
@@ -1496,11 +1715,23 @@ return view.extend({
 
         var style = E('style', {}, `
             /* No side margin: the map and the sections around it share the edges of the page content */
-            #geomate-map-container { margin: 12px 0 0; }
-            .gm-map-frame { display: block; width: 100%; height: 80vh; border: 0; }
+            #geomate-overview { container: gm-overview / inline-size; margin-top: 12px; }
+            .gm-overview-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: 12px; align-items: stretch; }
+            .gm-overview--single .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
+            /* The map is shorter while the connections are shown; a taller server panel beside it
+               stretches the map instead of leaving a gap below it */
+            #geomate-map-container { margin: 0; min-width: 0; display: flex; flex-direction: column; }
+            .gm-map-frame { display: block; flex: 1 0 auto; width: 100%; height: 80vh; border: 0; }
             .gm-map-frame.gm-map-frame--short { height: 600px; height: min(600px, 80vh); }
-            @media (max-width: 767px) {
+            @container gm-overview (max-width: 900px) {
+                .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
                 .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+            }
+            @supports not (container-type: inline-size) {
+                @media (max-width: 1100px) {
+                    .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
+                    .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+                }
             }
             /* Fullscreen: the map covers the window. An ancestor with its own z-index (Argon's
                #maincontent) is lifted with it; a LuCI dialog stays above both */
@@ -1827,6 +2058,10 @@ return view.extend({
             options.captionClasses.push([ 'cbi-section-actions', 'gm-col-action' ]);
         }
         this.connectionsTable = new ui.Table(captions, options, E('em', {}, [ _('Loading connections…') ]));
+        // First visit sorts by the current rate. A sort the user already picked stays in LuCI's
+        // table-sort storage and is left as it is
+        if (!this.connectionsTable.getActiveSortState())
+            this.connectionsTable.setActiveSortState(COLUMN_TRAFFIC, true);
         // A click on a column title sorts in ui.Table's handler on the title row, before this one
         this.connectionsTable.render().addEventListener('click', L.bind(function(ev) {
             if (ev.target.matches('th[data-sortable-row]'))
@@ -1902,6 +2137,7 @@ return view.extend({
     connectionsSorted: function() {
         this.updateActiveConnectionsList();
         this.showSortChoice();
+        this.updateSelectedConnection();
     },
 
     // Show the choice the table is sorted by in the "Sort by" select: its column in its direction.
@@ -1951,10 +2187,10 @@ return view.extend({
         }
     },
 
-    // Show the last status and health check in the status row; polled: with a new status reply.
-    // A problem (service stopped although enabled, a check with an error or warning) seen on two
-    // polls in a row opens the details once, so a restart or one failed reply does not; they
-    // never close on their own
+    // Show the last status and health check in the status row; polled: with a new status reply,
+    // the time its request was sent. A problem (service stopped although enabled, a check with an
+    // error or warning) seen on two polls in a row opens the details once, so a restart or one
+    // failed reply does not; they never close on their own
     updateStatus: function(polled) {
         var n = this.nodes,
             st = this.status,
@@ -2056,14 +2292,18 @@ return view.extend({
             n.offloading.hidden = st.flow_offloading !== true;
         }
 
-        // A failed reply tells nothing, and the service builds its table while it loads
-        if (!polled || !st || !checks || loading)
+        // A failed reply tells nothing, and the service builds its table while it loads. A poll
+        // sent less than STATUS_INTERVAL after the one before (the tab is shown again, a direct
+        // call) does not count either: both replies could fall into one restart
+        if (polled == null || !st || !checks || loading ||
+            (this.problemsAt != null && polled - this.problemsAt < (STATUS_INTERVAL - 1) * 1000))
             return;
         var last = this.problems,
             confirmed = problems.filter(function(p) { return last.indexOf(p) >= 0; });
         if (confirmed.some(function(p) { return this.confirmed.indexOf(p) < 0; }, this))
             n.statusRow.open = true;
         this.problems = problems;
+        this.problemsAt = polled;
         this.confirmed = confirmed;
     },
 
@@ -2151,9 +2391,13 @@ return view.extend({
             version: L.bind(this.checkForUpdates, this)
         };
 
-        if (!document.hidden)
+        if (!document.hidden) {
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
-        poll.add(this.pollFns.status, STATUS_INTERVAL);
+            poll.add(this.pollFns.status, STATUS_INTERVAL);
+        }
+        else {
+            this.pollHidden(true);
+        }
         poll.add(this.pollFns.version, VERSION_INTERVAL);
 
         this.pollConnections();
@@ -2162,24 +2406,52 @@ return view.extend({
 
         document.addEventListener('visibilitychange', L.bind(this.handleVisibilityChange, this));
         window.addEventListener('pagehide', L.bind(this.saveRecent, this, true));
+        window.addEventListener('pagehide', L.bind(this.closeDetails, this));
     },
 
-    // No connection requests while the tab is hidden
+    // No connection requests while the tab is hidden, and the status only every
+    // STATUS_HIDDEN_INTERVAL seconds (pollHidden). Keep the version poll in LuCI's queue:
+    // poll.remove() stops LuCI's poll when the queue runs empty, and the header would show
+    // "Paused" until the next poll.add()
     handleVisibilityChange: function() {
         if (document.hidden) {
             poll.remove(this.pollFns.connections);
+            poll.remove(this.pollFns.status);
+            this.pollHidden(true);
             this.saveRecent(true);
+            // A sample on its way finishes, the next one waits for the tab (sampleDetails)
+            if (this.details) {
+                window.clearTimeout(this.details.timer);
+                this.invalidateServerRoute(this.details);
+            }
         } else {
+            this.pollHidden(false);
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
+            poll.add(this.pollFns.status, STATUS_INTERVAL);
             // Fresh data at once, unless the user paused LuCI's auto refresh
-            if (poll.active())
+            if (poll.active()) {
                 this.pollConnections();
+                this.pollStatus();
+            }
+            this.sampleDetails();
         }
+    },
+
+    // The status poll of a hidden tab runs on a window timer: its requests keep the LuCI session,
+    // and the changes staged in it, alive. LuCI's poll counts ticks, and browsers slow the timers
+    // of a hidden tab down to one per minute, so an interval in ticks could take 60 times as
+    // long. A paused auto refresh sends nothing, as in a visible tab
+    pollHidden: function(on) {
+        window.clearInterval(this.hiddenTimer);
+        this.hiddenTimer = on ? window.setInterval(L.bind(function() {
+            if (poll.active())
+                this.pollStatus();
+        }, this), STATUS_HIDDEN_INTERVAL * 1000) : null;
     },
 
     // One request at a time, like pollConnections()
     pollStatus: function() {
-        var self = this;
+        var self = this, sent = performance.now();
 
         if (!this.statusBusy)
             this.statusBusy = Promise.all([
@@ -2204,7 +2476,7 @@ return view.extend({
                     self.backendPid = pid;
                 }
                 self.statusLoaded = true;
-                self.updateStatus(true);
+                self.updateStatus(sent);
                 self.showVersions();
                 self.checkAfterUpdate();
             }).finally(function() {
@@ -2263,6 +2535,7 @@ return view.extend({
         this.saveRecent(false);
         this.sendMessageToMap('updateConnections', list);
         this.updateActiveConnectionsList();
+        this.showDetailsHead();
     },
 
     // Note the servers of a reply as seen at now, with their counters (trafficOf) and the time this
@@ -2405,6 +2678,8 @@ return view.extend({
             this.sendTheme(true);
             this.sendMessageToMap('fullscreen', { on: this.fullscreen });
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
+            // Before the connections: their popups get the Details link
+            this.sendMessageToMap('serverDetails', { on: !this.detailsOff });
             // Once, before the first setFilters, which then fits the start view to this filter
             if (this.focusSid) {
                 this.sendMessageToMap('fitFilter', { sid: this.focusSid });
@@ -2440,6 +2715,9 @@ return view.extend({
             break;
         case 'loadKnownServers':
             this.loadKnownServers(String(d.sid || ''));
+            break;
+        case 'openServerDetails':
+            this.openServerDetails(String(d.filter || ''), String(d.ip || ''));
             break;
         }
     },
@@ -3065,10 +3343,11 @@ return view.extend({
         if (!validRegion(region))
             return Promise.reject(new Error(_('Invalid circle %s').format(region)));
 
-        // Existing filter names match without regard to case
+        // The existing filter whose name clashes with this one (filterKey): the region goes to it,
+        // so that no 'A_B' appears next to 'A B'
         var findFilter = function(name) {
-            name = name.toLowerCase();
-            return sections.find(function(s) { return s.name.toLowerCase() === name; }) || null;
+            name = filterKey(name);
+            return sections.find(function(s) { return filterKey(s.name) === name; }) || null;
         };
 
         // Every filter in config order, then 'New filter…'; without filters the name field shows at once
@@ -3266,7 +3545,9 @@ return view.extend({
             if (/\.(json|md5)$/i.test(path))
                 return dom.content(status, [ _('%s is not an IP list file.').format(path) ]);
 
-            fs.stat(path).then(function() {
+            fs.stat(path).then(function(st) {
+                if (st && st.type == 'directory')
+                    return dom.content(status, [ _('%s is a directory, not an IP list file.').format(path) ]);
                 dom.content(status, [
                     _('%s already exists. Replace it with %s?').format(path, file.name), ' ',
                     E('button', { 'class': 'btn cbi-button-negative', 'click': function() { writeList(path, file); } }, [ _('Replace') ]), ' ',
@@ -3380,14 +3661,14 @@ return view.extend({
     // changed; a new one gets every non-empty option, its enabled flag comes from the checkbox.
     // The caller has loaded the configuration again after the dialog, sec is the dialog's copy:
     // its id may name another filter or none now (movedFilter), or a filter of the new name may
-    // exist (names match without regard to case, as in the dialog)
+    // exist (names match by filterKey, as in the dialog)
     saveRegion: function(token, region, name, sec, values, initial) {
         var self = this, sid, before = null;
 
         if (sec && uci.get('geomate', sec['.name'], 'name') !== sec.name)
             throw filtersChanged();
         if (!sec && uci.sections('geomate', 'geo_filter').some(function(s) {
-            return String(s.name || '').toLowerCase() === name.toLowerCase();
+            return s.name && filterKey(s.name) === filterKey(name);
         }))
             throw failure(_('Not applied: filter %s was created in the meantime.').format(name));
 
@@ -3503,12 +3784,13 @@ return view.extend({
         var sorting = table.getActiveSortState();
         var key = JSON.stringify([ rows, placeholder ]);
 
-        // The order ui.Table gives the rows: descending negates the comparison, equal packets
-        // keep the order of the rows (stable sort)
+        // The order ui.Table gives the rows: descending negates the comparison, equal keys
+        // keep the order of the rows (stable sort). Live means a fresh reply, as showTraffic
         if (sorting && sorting[0] === COLUMN_TRAFFIC)
             key += JSON.stringify(entries.map(function(e, i) { return i; }).sort(function(a, b) {
-                var ta = entries[a].rec && entries[a].rec.traffic, tb = entries[b].rec && entries[b].rec.traffic;
-                return (sorting[1] ? -1 : 1) * ((ta ? ta.packets : 0) - (tb ? tb.packets : 0)) || (a - b);
+                var ka = trafficSortValue(entries[a].rec, entries[a].lastSeen == null),
+                    kb = trafficSortValue(entries[b].rec, entries[b].lastSeen == null);
+                return (sorting[1] ? -1 : 1) * (ka < kb ? -1 : ka > kb ? 1 : 0) || (a - b);
             }));
 
         if (key === this.connectionsKey) {
@@ -3540,7 +3822,7 @@ return view.extend({
 
             // Every cell is an element: names and provider strings never run as markup
             cells = [
-                textCell(r.ip),
+                self.ipCell(r),
                 textCell(r.filter),
                 E('span', attrs, [ status[1] ]),
                 countryCell(r.geo[0], r.geo[1]),
@@ -3554,6 +3836,7 @@ return view.extend({
             return cells;
         }), placeholder);
         this.showSortChoice();
+        this.updateSelectedConnection();
     },
 
     // Buttons of a table row, from the configuration as loaded. The allowed IPs come first, as in
@@ -3590,6 +3873,696 @@ return view.extend({
         if (tokens.indexOf(ip) > -1)
             return 'blocked-entry';
         return rangeCoversIp(tokens, ip) ? 'blocked-range' : 'allow-block';
+    },
+
+    // IP cell of a row: a link that selects the server, plain text once the details
+    // turned out not to be available (detailsOff)
+    ipCell: function(r) {
+        if (this.detailsOff || !validIPv4(r.ip) || !FILTER_NAME_RE.test(r.filter || ''))
+            return textCell(r.ip);
+        return E('a', {
+            'href': '#',
+            'title': _('Show server'),
+            'class': 'gm-server-link',
+            'data-filter': r.filter,
+            'data-ip': r.ip,
+            'aria-controls': 'gm-server-panel',
+            'click': L.bind(function(ev) {
+                ev.preventDefault();
+                this.openServerDetails(r.filter, r.ip);
+            }, this)
+        }, [ r.ip ]);
+    },
+
+    // Persistent server panel beside the map; its host stays in place across selections.
+    renderServerPanel: function() {
+        var n = this.nodes;
+
+        n.serverTitle = E('h3', { 'class': 'gm-server-title' }, [ _('Server') ]);
+        n.serverToggle = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'aria-controls': 'gm-server-body', 'aria-expanded': 'true', 'hidden': '', 'click': L.bind(this.toggleServerPanel, this) }, [ _('Hide') ]);
+        n.serverClose = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.closeServerPanel, this) }, [ _('Close') ]);
+        n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a server') ]);
+        n.serverBody = E('div', { 'id': 'gm-server-body', 'class': 'gm-server-body' });
+        n.serverPanel = E('section', { 'id': 'gm-server-panel', 'class': 'cbi-section gm-details', 'tabindex': '-1', 'aria-labelledby': 'gm-server-title' }, [
+            E('style', {}, `
+                #gm-server-panel { margin: 0; padding: 12px 16px; min-width: 0; box-sizing: border-box; }
+                #gm-server-panel[hidden], .gm-details [hidden] { display: none !important; }
+                .gm-server-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+                .gm-server-collapsed .gm-server-heading { margin-bottom: 0; }
+                .gm-details .gm-server-title { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
+                .gm-server-heading .cbi-button { flex: none; margin: 0; }
+                .gm-server-empty { margin: 28px 0; opacity: 0.65; }
+                .gm-server-head { display: flex; align-items: flex-start; gap: 8px; }
+                .gm-server-meta { flex: 1; min-width: 0; }
+                .gm-server-meta .gm-status { margin-bottom: 4px; }
+                .gm-details-geo { display: block; overflow-wrap: anywhere; opacity: 0.75; font-size: 90%; }
+                .gm-server-head .cbi-button { flex: none; margin: 0; }
+                .gm-details-note { margin: 8px 0; font-size: 90%; }
+                .gm-details .gm-muted { opacity: 0.65; }
+                .gm-ping-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 14px 0 10px; }
+                .gm-ping-stat { min-width: 0; }
+                .gm-ping-label { display: block; font-size: 90%; opacity: 0.7; margin-bottom: 4px; }
+                .gm-ping-value { display: block; font-size: 1.45em; line-height: 1.2; white-space: nowrap; }
+                .gm-ping-tools { display: flex; align-items: center; justify-content: space-between; min-height: 25px; gap: 8px; font-size: 85%; }
+                .gm-ping-tools .cbi-button { margin: 0; }
+                .gm-ping-method { opacity: 0.65; }
+                .gm-ping-plot { position: relative; }
+                .gm-ping-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; opacity: 0.65; font-size: 90%; pointer-events: none; }
+                .gm-details .gm-chart { position: relative; height: 125px; }
+                .gm-details .gm-chart svg { display: block; width: 100%; height: 100%; overflow: visible; }
+                .gm-details .gm-chart path { fill: none; vector-effect: non-scaling-stroke; }
+                .gm-details .gm-chart-grid { stroke: currentColor; stroke-opacity: 0.15; stroke-width: 1; }
+                .gm-details .gm-line { stroke: var(--gm-primary); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+                .gm-details .gm-line--tx { stroke: currentColor; stroke-opacity: 0.6; stroke-dasharray: 6 4; }
+                .gm-details .gm-line--lost { stroke: var(--gm-danger); stroke-linecap: butt; }
+                .gm-details .gm-line--route { stroke: var(--gm-warning); }
+                .gm-details .gm-chart-label { position: absolute; top: 4px; left: 2px; font-size: 11px; line-height: 1; opacity: 0.7; pointer-events: none; }
+                .gm-details .gm-chart-label--half { top: 50%; }
+                .gm-details-caption { margin: 2px 0 0; font-size: 11px; opacity: 0.65; text-align: right; }
+                .gm-route { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(128, 128, 128, 0.3); }
+                .gm-route-head { display: flex; align-items: center; gap: 8px; }
+                .gm-route-head .cbi-button { margin: 0 0 0 auto; flex: none; }
+                .gm-route-value { font-size: 1.15em; white-space: nowrap; }
+                .gm-route-label { font-size: 90%; opacity: 0.7; }
+                .gm-route-meta, .gm-route-hint, .gm-route-note { display: block; margin-top: 4px; font-size: 85%; overflow-wrap: anywhere; }
+                .gm-route-meta, .gm-route-hint { opacity: 0.65; }
+                .gm-packet-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-top: 14px; font-size: 90%; }
+                .gm-packet-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+                .gm-packet-stat { white-space: nowrap; }
+                .gm-packet-stat .gm-key { display: inline-block; width: 14px; margin-right: 5px; vertical-align: middle; border-top: 2px solid var(--gm-primary); }
+                .gm-packet-stat .gm-key--tx { border-top: 2px dashed currentColor; opacity: 0.65; }
+                .gm-packets .gm-chart { height: 70px; margin-top: 6px; }
+                .gm-details-hint { margin: 6px 0 0; font-size: 85%; opacity: 0.65; }
+                #active-connections-container .gm-server-link[aria-current="true"] { font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+                #active-connections-container .gm-server-selected { box-shadow: inset 3px 0 var(--gm-primary); }
+                @container gm-overview (max-width: 900px) {
+                    .gm-details .gm-chart { height: 110px; }
+                    .gm-packets .gm-chart { height: 65px; }
+                }
+            `), E('div', { 'class': 'gm-server-heading' }, [ n.serverTitle, n.serverToggle, n.serverClose ]), n.serverEmpty, n.serverBody
+        ]);
+        n.serverTitle.id = 'gm-server-title';
+        n.serverPanel.hidden = true;
+        return n.serverPanel;
+    },
+
+    // A collapsed panel keeps its selection below the full-width map; a closed panel is absent.
+    updateServerPanelLayout: function() {
+        var n = this.nodes, d = this.details, collapsed = !!d && d.collapsed,
+            overview = n.serverPanel.closest('#geomate-overview');
+
+        n.serverBody.hidden = collapsed;
+        n.serverToggle.hidden = !d;
+        n.serverToggle.textContent = collapsed ? _('Show') : _('Hide');
+        n.serverToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        n.serverPanel.classList.toggle('gm-server-collapsed', collapsed);
+        if (overview)
+            overview.classList.toggle('gm-overview--single', n.serverPanel.hidden || collapsed);
+    },
+
+    toggleServerPanel: function() {
+        var d = this.details;
+
+        if (!d)
+            return;
+        d.collapsed = !d.collapsed;
+        if (d.collapsed) {
+            d.sampleEpoch++;
+            this.invalidateServerRoute(d);
+            window.clearTimeout(d.timer);
+            d.timer = null;
+            d.currentRtt = null;
+            d.pingTimeout = false;
+            d.last = null;
+        }
+        else if (d.state !== 'paused' && !d.stopped)
+            d.state = 'pending';
+        this.updateServerPanelLayout();
+        this.showDetails();
+        if (!d.collapsed) {
+            this.focusServerPanel();
+            this.sampleDetails();
+        }
+    },
+
+    closeServerPanel: function() {
+        var n = this.nodes, target = n.connections && n.connections.open && n.connectionsWrap &&
+            n.connectionsWrap.querySelector('.gm-server-link[aria-current="true"]');
+
+        if (this.details)
+            this.closeDetails();
+        else {
+            n.serverPanel.hidden = true;
+            this.updateServerPanelLayout();
+        }
+        target = target || n.frame;
+        if (target)
+            target.focus({ preventScroll: true });
+    },
+
+    updateSelectedConnection: function() {
+        var wrap = this.nodes && this.nodes.connectionsWrap, d = this.details;
+
+        if (!wrap)
+            return;
+        wrap.querySelectorAll('.gm-server-link').forEach(function(link) {
+            var selected = !!d && link.getAttribute('data-ip') === d.ip && link.getAttribute('data-filter') === d.filter,
+                row = link.closest('.tr, tr');
+            if (selected)
+                link.setAttribute('aria-current', 'true');
+            else
+                link.removeAttribute('aria-current');
+            if (row)
+                row.classList.toggle('gm-server-selected', selected);
+        });
+    },
+
+    // Select one server for the persistent panel. Repeated selection keeps its history.
+    openServerDetails: function(filter, ip) {
+        var mode = this.statusMode() || uci.get('geomate', 'global', 'operational_mode') || 'dynamic',
+            counts = mode !== 'static', d, n;
+
+        if (this.detailsOff)
+            return notify(_('Server measurements unavailable. Reload the page.'));
+        if (!validIPv4(ip) || !FILTER_NAME_RE.test(filter))
+            return;
+        if (this.fullscreen)
+            this.setFullscreen(false);
+        if (this.details && this.details.filter === filter && this.details.ip === ip && !this.details.stopped) {
+            if (this.details.collapsed)
+                return this.toggleServerPanel();
+            return this.focusServerPanel();
+        }
+        this.closeDetails();
+
+        d = this.details = {
+            ip: ip, filter: filter,
+            rx: counts && hasCapability(this.status, 'rx_counters'),
+            tx: counts && hasCapability(this.status, 'set_counters'),
+            ping: true, pingFails: 0, pingReplied: false, currentRtt: null, pingTimeout: false,
+            last: null, points: [], state: '', manualPause: false,
+            started: performance.now(), wait: DETAILS_INTERVAL, failures: 0,
+            busy: false, stopped: false, collapsed: false, sampleEpoch: 0, timer: null, nodes: {},
+            routeEnabled: false, routeEpoch: 0, routeNextAt: 0, routeResult: null,
+            routeReceivedAt: 0, routeState: '', routePoints: []
+        };
+        n = d.nodes;
+        n.status = E('span');
+        n.geo = E('span', { 'class': 'gm-details-geo' });
+        n.noteText = E('span');
+        n.note = E('p', { 'class': 'gm-details-note', 'hidden': '' }, [ n.noteText ]);
+        n.pause = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.toggleDetails, this, d) }, [ _('Pause') ]);
+        n.retryPing = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.retryPing, this, d), 'hidden': '' }, [ _('Retry') ]);
+        n.pingValue = E('strong', { 'class': 'gm-ping-value' }, [ '–' ]);
+        n.jitter = E('strong', { 'class': 'gm-ping-value' }, [ '–' ]);
+        n.loss = E('strong', { 'class': 'gm-ping-value' }, [ '–' ]);
+        var stat = function(label, value, title) {
+            return E('div', { 'class': 'gm-ping-stat', 'title': title }, [ E('span', { 'class': 'gm-ping-label' }, [ label ]), value ]);
+        };
+        n.pingStats = E('div', { 'class': 'gm-ping-stats' }, [
+            stat(_('Ping'), n.pingValue, _('Round-trip time from router to server')),
+            stat(_('Jitter'), n.jitter, _('Variation between successful ping replies')),
+            stat(_('Ping loss'), n.loss, _('ICMP probes without a reply'))
+        ]);
+        n.ping = detailsChart([ 'gm-line--rtt', 'gm-line--route', 'gm-line--lost' ]);
+        n.pingEmpty = E('span', { 'class': 'gm-ping-empty' }, [ _('Waiting for reply') ]);
+        n.pingState = E('span', { 'class': 'gm-ping-method' }, [ _('ICMP') ]);
+        n.pingBox = E('div', {}, [
+            E('div', { 'class': 'gm-ping-tools' }, [ n.pingState, n.retryPing ]),
+            E('div', { 'class': 'gm-ping-plot' }, [ n.ping.box, n.pingEmpty ]),
+            E('p', { 'class': 'gm-details-caption' }, [ _('Last 3 minutes') ])
+        ]);
+
+        n.routeValue = E('strong', { 'class': 'gm-route-value' }, [ '–' ]);
+        n.routeMeta = E('span', { 'class': 'gm-route-meta', 'hidden': '' });
+        n.routeHint = E('span', { 'class': 'gm-route-hint' });
+        n.routeNote = E('span', { 'class': 'gm-route-note', 'hidden': '' });
+        n.routeButton = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.sampleServerRoute, this, d, true) }, [ _('Measure') ]);
+        n.routeBox = E('div', { 'class': 'gm-route' }, [
+            E('div', { 'class': 'gm-route-head' }, [ E('span', { 'class': 'gm-route-label' }, [ _('Route RTT') ]), n.routeValue, n.routeButton ]),
+            n.routeMeta, n.routeNote, n.routeHint
+        ]);
+
+        n.rates = detailsChart([ 'gm-line--tx', 'gm-line--rx' ]);
+        n.cells = {};
+        var packet = function(key, label) {
+            var cell = n.cells[key] = { rate: E('span', {}, [ '–' ]) };
+            return E('span', { 'class': 'gm-packet-stat' }, [
+                E('span', { 'class': 'gm-key gm-key--' + key }), label, ' ', cell.rate
+            ]);
+        };
+        n.ratesBox = E('div', { 'class': 'gm-packets' }, [
+            E('div', { 'class': 'gm-packet-head' }, [
+                E('span', { 'class': 'gm-muted' }, [ _('Packets') ]),
+                E('span', { 'class': 'gm-packet-stats' }, [].concat(
+                    d.rx ? [ packet('rx', _('Received')) ] : [], d.tx ? [ packet('tx', _('Sent')) ] : []))
+            ]), n.rates.box
+        ]);
+        n.countsHint = E('p', { 'class': 'gm-details-hint' }, [
+            !counts ? _('Packet counters unavailable in static mode')
+                : (!d.rx && !d.tx) ? _('Update Geomate to show packet counters')
+                : !d.rx ? _('Update Geomate to show receive counters') : ''
+        ]);
+        d.root = E('div', { 'class': 'gm-server-content' }, [
+            E('div', { 'class': 'gm-server-head' }, [
+                E('div', { 'class': 'gm-server-meta' }, [ n.status, n.geo ]), n.pause
+            ]), n.note, n.pingStats, n.pingBox, n.routeBox, n.ratesBox, n.countsHint
+        ]);
+        n.ratesBox.hidden = !(d.rx || d.tx);
+        n.countsHint.hidden = !n.countsHint.textContent;
+        this.nodes.serverTitle.textContent = ip;
+        this.nodes.serverPanel.hidden = false;
+        this.nodes.serverEmpty.hidden = true;
+        this.nodes.serverBody.appendChild(d.root);
+        this.updateServerPanelLayout();
+        this.showDetailsHead();
+        this.showDetails();
+        this.updateSelectedConnection();
+        this.focusServerPanel();
+        this.sampleDetails();
+    },
+
+    // Selection from a long table or fullscreen map reveals the panel without an overlay.
+    focusServerPanel: function() {
+        var panel = this.nodes.serverPanel, bounds = panel.getBoundingClientRect();
+
+        if (bounds.top < 0 || bounds.bottom > window.innerHeight)
+            panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        panel.focus({ preventScroll: true });
+    },
+
+    detailsShown: function(d) {
+        return !!(this.nodes && this.nodes.serverBody && this.nodes.serverBody.isConnected &&
+            this.nodes.serverBody.contains(d.root));
+    },
+
+    // Stop this selection; late responses cannot change the replacement panel.
+    closeDetails: function() {
+        var d = this.details;
+
+        if (!d)
+            return;
+        this.details = null;
+        d.stopped = true;
+        window.clearTimeout(d.timer);
+        if (d.root && d.root.parentNode)
+            d.root.parentNode.removeChild(d.root);
+        if (this.nodes && this.nodes.serverEmpty) {
+            this.nodes.serverEmpty.hidden = false;
+            this.nodes.serverTitle.textContent = _('Server');
+            this.nodes.serverPanel.hidden = true;
+            this.updateServerPanelLayout();
+        }
+        this.updateSelectedConnection();
+    },
+
+    toggleDetails: function(d) {
+        if (this.details !== d || d.stopped)
+            return;
+        if (d.state === 'paused')
+            return this.continueDetails(d);
+        d.state = 'paused';
+        d.manualPause = true;
+        this.invalidateServerRoute(d);
+        window.clearTimeout(d.timer);
+        d.timer = null;
+        this.showDetails();
+    },
+
+    // Continue after the pause of DETAILS_SESSION
+    continueDetails: function(d) {
+        if (this.details !== d || d.stopped)
+            return;
+        d.state = '';
+        d.manualPause = false;
+        d.started = performance.now();
+        this.showDetails();
+        this.sampleDetails();
+    },
+
+    // Ping again after PING_GIVE_UP timeouts, with the next sample
+    retryPing: function(d) {
+        if (this.details !== d)
+            return;
+        d.ping = true;
+        d.pingFails = 0;
+        d.pingReplied = false;
+        d.currentRtt = null;
+        d.pingTimeout = false;
+        d.routeEnabled = false;
+        this.invalidateServerRoute(d);
+        this.showDetails();
+    },
+
+    // A discarded route result must not become current again after Hide/Show or Pause/Resume.
+    invalidateServerRoute: function(d) {
+        d.routeEpoch++;
+        d.routeResult = null;
+        if (d.routeState === 'measuring' || d.routeState === 'ok')
+            d.routeState = '';
+    },
+
+    routePanelActive: function(d) {
+        return this.details === d && !d.stopped && !d.collapsed && !document.hidden &&
+            poll.active() && d.state !== 'paused' && d.state !== 'refresh' &&
+            performance.now() - d.started < DETAILS_SESSION && this.detailsShown(d);
+    },
+
+    // The existing sample tick checks the next due time; there are no additional per-IP timers.
+    sampleServerRoute: function(d, manual) {
+        var self = this, now = performance.now(), job;
+
+        if (!d || this.routeOff || !this.routePanelActive(d))
+            return;
+        if (manual)
+            d.routeEnabled = true;
+        if (!d.routeEnabled) {
+            if (d.ping || !d.pingFails)
+                return;
+            d.routeEnabled = true;
+        }
+        if (this.routeRequest || now < d.routeNextAt)
+            return;
+
+        job = this.routeRequest = { details: d, epoch: d.routeEpoch };
+        d.routeState = 'measuring';
+        this.showServerRoute(d);
+        return callServerRoute(d.filter, d.ip).then(function(reply) {
+            if (self.routePanelActive(d) && job.epoch === d.routeEpoch)
+                self.serverRouteReply(d, L.isObject(reply) ? reply : {});
+        }, function(err) {
+            if (!self.routePanelActive(d) || job.epoch !== d.routeEpoch)
+                return;
+            d.routeResult = null;
+            d.routeState = 'unavailable';
+            d.routeNextAt = performance.now() + ROUTE_INTERVAL;
+            if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
+                self.routeOff = true;
+                d.routeState = 'unsupported';
+            }
+        }).finally(function() {
+            if (self.routeRequest === job)
+                self.routeRequest = null;
+            self.showDetails();
+        });
+    },
+
+    serverRouteReply: function(d, reply) {
+        var now = performance.now(), delay = ROUTE_INTERVAL;
+
+        d.routeResult = null;
+        if (reply.error) {
+            d.routeState = reply.error === 'unsupported' ? 'unsupported'
+                : reply.error === 'busy' || reply.error === 'rate_limited' ? 'waiting'
+                : reply.error === 'unknown_target' ? 'unknown' : 'unavailable';
+            if (d.routeState === 'unsupported')
+                this.routeOff = true;
+            if (Number.isFinite(reply.retry_after_ms) && reply.retry_after_ms > 0)
+                delay = Math.max(ROUTE_INTERVAL, Math.min(60000, reply.retry_after_ms));
+            d.routeNextAt = now + delay;
+            return;
+        }
+        if (reply.ip !== d.ip || reply.method !== 'route' ||
+            (reply.status !== 'ok' && reply.status !== 'no_reply') ||
+            !Number.isFinite(reply.measured_at) || reply.measured_at <= 0 ||
+            !Number.isFinite(reply.age_ms) || reply.age_ms < 0 || typeof reply.cached !== 'boolean' ||
+            (reply.status === 'ok' && (!Number.isFinite(reply.rtt) || reply.rtt < 0 ||
+                typeof reply.responder !== 'string' || !validIPv4(reply.responder) ||
+                !Number.isInteger(reply.ttl) || reply.ttl < 1 || reply.ttl > 24 ||
+                typeof reply.endpoint !== 'boolean' || (reply.endpoint && reply.responder !== d.ip)))) {
+            d.routeState = 'unavailable';
+            d.routeNextAt = now + ROUTE_INTERVAL;
+            return;
+        }
+        if (Number.isFinite(reply.refresh_after_ms) && reply.refresh_after_ms >= 0)
+            delay = Math.max(1000, Math.min(ROUTE_INTERVAL, reply.refresh_after_ms));
+        else
+            delay = Math.max(1000, ROUTE_INTERVAL - reply.age_ms);
+        d.routeNextAt = now + delay;
+        d.routeReceivedAt = now;
+        d.routeState = reply.status;
+        d.routeResult = reply.status === 'ok' ? reply : null;
+        this.addRoutePoint(d, reply);
+    },
+
+    // History of the route graph, on the router's clock like the samples: a point per successful
+    // measurement, a gap only before a changed answering router or TTL. A missed hop reply is
+    // common and keeps the line. A cached reply repeats the last measurement and adds nothing
+    addRoutePoint: function(d, reply) {
+        var points = d.routePoints, last = points[points.length - 1], t = reply.measured_at;
+
+        if (last && t === last.t)
+            return;
+        // The router's clock went back: the graph starts over
+        if (last && t < last.t)
+            points.length = 0;
+        last = points[points.length - 1];
+        // A missed hop reply is common; keep the line and only break on a hop change
+        if (reply.status !== 'ok')
+            return;
+        if (last && last.rtt != null && (last.responder !== reply.responder || last.ttl !== reply.ttl))
+            points.push({ t: t, rtt: null });
+        points.push({ t: t, rtt: reply.rtt, responder: reply.responder, ttl: reply.ttl });
+        while (t - points[0].t > DETAILS_SPAN)
+            points.shift();
+    },
+
+    showServerRoute: function(d) {
+        var n = d && d.nodes, now = performance.now(), result = d && d.routeResult,
+            age = result ? result.age_ms + Math.max(0, now - d.routeReceivedAt) : 0,
+            stale = !!result && age >= ROUTE_STALE,
+            notes = { no_reply: _('No route reply'), waiting: _('Waiting for measurement'),
+                unknown: _('No recent traffic'), unavailable: _('Route measurement unavailable'),
+                unsupported: _('Route measurements unavailable') },
+            text = d && notes[this.routeOff ? 'unsupported' : d.routeState] || '';
+
+        if (!n || !n.routeBox)
+            return;
+        if (stale)
+            text = _('Measurement expired');
+        n.routeValue.textContent = result && !stale ? msText(result.rtt) : '–';
+        n.routeMeta.hidden = !result;
+        n.routeMeta.textContent = result ? _('%s · Hop %d · %d s ago').format(result.responder, result.ttl, Math.floor(age / 1000)) : '';
+        n.routeMeta.title = result ? new Date(result.measured_at).toLocaleString() : '';
+        n.routeHint.textContent = result && result.endpoint ? _('ICMP reply from the destination.') : _('To an intermediate router, not the game server.');
+        n.routeNote.textContent = text;
+        n.routeNote.hidden = !text;
+        n.routeButton.hidden = d.routeEnabled || this.routeOff;
+        n.routeButton.disabled = !!this.routeRequest || !this.routePanelActive(d) || now < d.routeNextAt;
+    },
+
+    // Status, filter and geo text of the selected server, as the table shows the server now: its
+    // row in the last reply, else its entry of the recent list
+    showDetailsHead: function() {
+        var d = this.details, n = d && d.nodes, conn, e, status, geo;
+
+        if (!d)
+            return;
+        conn = this.connections.find(function(c) { return c && c.dst === d.ip && c.filter_name === d.filter; });
+        e = conn ? { conn: conn, live: true } : (this.recent || {})[recentKey({ filter_name: d.filter, dst: d.ip })];
+        status = !e ? [ 'unknown', _('Unknown'), null ]
+            : (conn && this.connectionsFailed < CONNECTIONS_STALE_AFTER) ? connectionStatus(conn)
+            : pastStatus(e, this.connectionAction(e.conn));
+        geo = geoText(e && e.conn.geo);
+
+        n.status.className = 'gm-status gm-status--' + status[0];
+        n.status.textContent = status[1];
+        n.status.title = status[2] || '';
+        n.geo.textContent = [ d.filter, geo.country, geo.city, geo.isp ].filter(function(s) { return s; }).join(' · ');
+    },
+
+    // One sample of the selected server, then the next DETAILS_INTERVAL ms after this one was sent
+    // (d.wait), never two at a time. Nothing while the tab is hidden (handleVisibilityChange starts
+    // again) or LuCI's auto refresh is paused; samples stop when the panel is collapsed or removed
+    sampleDetails: function() {
+        var self = this, d = this.details, sent, epoch;
+
+        if (!d || d.busy || d.stopped || d.collapsed)
+            return;
+        window.clearTimeout(d.timer);
+        d.timer = null;
+        if (!this.detailsShown(d))
+            return this.closeDetails();
+        if (document.hidden || d.state === 'paused')
+            return;
+        if (!poll.active()) {
+            if (d.state !== 'refresh') {
+                d.state = 'refresh';
+                this.invalidateServerRoute(d);
+                this.showDetails();
+            }
+            d.timer = window.setTimeout(L.bind(this.sampleDetails, this), DETAILS_INTERVAL);
+            return;
+        }
+        if (performance.now() - d.started >= DETAILS_SESSION) {
+            d.manualPause = false;
+            d.state = 'paused';
+            this.invalidateServerRoute(d);
+            return this.showDetails();
+        }
+
+        d.busy = true;
+        this.sampleServerRoute(d, false);
+        epoch = d.sampleEpoch;
+        sent = performance.now();
+        callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
+            if (self.details === d && epoch === d.sampleEpoch && !d.stopped && !d.collapsed && d.state !== 'paused' && self.detailsShown(d))
+                self.detailsReply(d, L.isObject(reply) ? reply : {});
+        }, function(err) {
+            if (self.details === d && epoch === d.sampleEpoch && !d.stopped && !d.collapsed && d.state !== 'paused' && self.detailsShown(d))
+                self.detailsFailed(d, err);
+        }).finally(function() {
+            d.busy = false;
+            if (self.details !== d)
+                return;
+            self.showDetails();
+            self.sampleServerRoute(d, false);
+            if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden)
+                d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (performance.now() - sent)));
+        });
+    },
+
+    // A getServerSample reply: a new point, or a measurement gap. 'busy': another page sampled
+    // the server just now, the next sample comes as usual.
+    detailsReply: function(d, reply) {
+        var p, last;
+
+        d.failures = 0;
+        d.wait = (reply.error === 'limit') ? DETAILS_LIMIT_RETRY : DETAILS_INTERVAL;
+        if (reply.error === 'busy')
+            return;
+        if (reply.error === 'limit' || reply.error === 'unknown') {
+            d.state = reply.error;
+            d.currentRtt = null;
+            d.pingTimeout = false;
+            // No rate across the time without readings
+            d.last = null;
+            return;
+        }
+        p = (reply.error == null) ? samplePoint(d.last, reply) : null;
+        if (!p) {
+            d.state = 'invalid';
+            d.currentRtt = null;
+            d.pingTimeout = false;
+            d.stopped = true;
+            return;
+        }
+
+        d.state = '';
+        d.last ={ t: p.t, rx: reply.rx, tx: reply.tx };
+        last = d.points[d.points.length - 1];
+        // The router's clock went back: the graphs start over
+        if (last && p.t <= last.t)
+            d.points = [];
+        d.points.push(p);
+        while (p.t - d.points[0].t > DETAILS_SPAN)
+            d.points.shift();
+
+        d.currentRtt = p.rtt != null ? p.rtt : null;
+        d.pingTimeout = p.rtt === null || (p.rtt === undefined && !d.ping && d.pingFails > 0);
+        if (p.rtt != null) {
+            d.pingReplied = true;
+            d.pingFails = 0;
+        }
+        else if (p.rtt === null && ++d.pingFails >= (d.pingReplied ? PING_GIVE_UP_LATER : PING_GIVE_UP)) {
+            d.ping = false;
+        }
+    },
+
+    // A failed getServerSample request. A missing method or ACL entry (older luci.geomate or an
+    // rpcd that was not restarted) stops sampling, and the IPs are no links from now on. Other
+    // errors (timeout, no connection) keep sampling, and the panel says so from the third in a
+    // row
+    detailsFailed: function(d, err) {
+        d.wait = DETAILS_INTERVAL;
+        d.currentRtt = null;
+        d.pingTimeout = false;
+        // LuCI translates ubus status text; the numeric method/resource/permission codes stay
+        // stable. JSON-RPC reports a missing method or denied session with its own error codes
+        if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
+            d.state = 'unavailable';
+            d.stopped = true;
+            this.detailsOff = true;
+            this.connectionsKey = null;
+            this.updateActiveConnectionsList();
+            this.sendMessageToMap('serverDetails', { on: false });
+        }
+        else if (++d.failures >= 3) {
+            d.state = 'offline';
+        }
+    },
+
+    // Graphs, figures and note of the selected server from its points. Only attributes and texts
+    // change: the nodes are built once (openServerDetails)
+    showDetails: function() {
+        var d = this.details, n = d && d.nodes;
+
+        if (!d)
+            return;
+        this.showServerRoute(d);
+        var points = d.points, route = d.routePoints,
+            end = Math.max(points.length ? points[points.length - 1].t : 0, route.length ? route[route.length - 1].t : 0),
+            from = end - DETAILS_SPAN,
+            notes = {
+                refresh: _('Auto refresh paused'),
+                paused: d.manualPause ? _('Paused') : _('Paused after 10 minutes'),
+                unknown: _('No recent traffic'),
+                pending: _('Waiting for measurement'),
+                limit: _('Waiting for another measurement'),
+                offline: _('Router unavailable'),
+                invalid: _('Measurement unavailable'),
+                unavailable: _('Server measurements unavailable. Reload the page.')
+            },
+            text = notes[d.state] || '';
+
+        n.noteText.textContent = text;
+        n.note.hidden = !text;
+        n.pause.textContent = d.state === 'paused' ? _('Resume') : _('Pause');
+        n.pause.disabled = d.stopped;
+        n.retryPing.hidden = d.ping || d.stopped;
+        n.retryPing.disabled = d.state === 'paused' || d.state === 'refresh';
+
+        // Without any ping reply the graph shows the route RTT instead, as a line of its own; it
+        // never enters Ping, Jitter or Ping loss
+        var ping = pingStats(points), rtts = points.filter(function(p) { return p.rtt != null; }),
+            routed = !rtts.length ? route.filter(function(p) { return p.rtt != null && p.t >= from; }) : [],
+            pingTop = niceMax(Math.max.apply(null, [ 0 ].concat((routed.length ? routed : rtts).map(function(p) { return p.rtt; }))), 50),
+            rtt = function(p) { return p.rtt; };
+
+        n.ping.paths['gm-line--rtt'].setAttribute('d', routed.length ? '' : chartPath(points, rtt, from, DETAILS_SPAN, pingTop));
+        n.ping.paths['gm-line--route'].setAttribute('d', routed.length ? chartPath(route, rtt, from, DETAILS_SPAN, pingTop, ROUTE_GRAPH_GAP) : '');
+        n.ping.paths['gm-line--lost'].setAttribute('d', rtts.length ? points.filter(function(p) { return p.rtt === null && p.t >= from; }).map(function(p) {
+            return 'M' + ((p.t - from) * 1000 / DETAILS_SPAN).toFixed(1) + ' 100V88';
+        }).join('') : '');
+        n.ping.top.textContent = msText(pingTop);
+        n.ping.half.textContent = msText(pingTop / 2);
+        n.pingEmpty.hidden = !!rtts.length || !!routed.length;
+        n.pingEmpty.textContent = d.pingTimeout ? _('No ping reply')
+            : (d.state && d.state !== 'refresh' && d.state !== 'paused') ? _('No measurements') : _('Waiting for reply');
+        n.pingState.textContent = routed.length ? _('Route RTT · Hop %d').format(routed[routed.length - 1].ttl)
+            : d.pingTimeout && rtts.length ? _('ICMP · No reply') : _('ICMP');
+        n.pingValue.textContent = d.currentRtt != null ? msText(d.currentRtt) : '–';
+        n.pingValue.title = ping && ping.avg != null ? _('Average %s').format(msText(ping.avg)) : '';
+        n.jitter.textContent = ping && ping.jitter != null ? msText(ping.jitter) : '–';
+        // Without a successful probe there is no measured RTT; loss describes ICMP probes only.
+        n.loss.textContent = ping && rtts.length ? _('%d%%').format(Math.round(ping.loss)) : '–';
+
+        var rate = function(key) { return function(p) { return p[key] ? p[key].pps : null; }; }, top = 0;
+        points.forEach(function(p) {
+            top = Math.max(top, (d.rx && p.rx) ? p.rx.pps : 0, (d.tx && p.tx) ? p.tx.pps : 0);
+        });
+        top = niceMax(top, 10);
+        n.rates.paths['gm-line--rx'].setAttribute('d', d.rx ? chartPath(points, rate('rx'), from, DETAILS_SPAN, top) : '');
+        n.rates.paths['gm-line--tx'].setAttribute('d', d.tx ? chartPath(points, rate('tx'), from, DETAILS_SPAN, top) : '');
+        n.rates.top.textContent = rateText(top);
+        n.rates.half.textContent = rateText(top / 2);
+        Object.keys(n.cells).forEach(function(key) {
+            var latest = points[points.length - 1],
+                s = latest && latest[key] && (!d.state || d.state === 'paused' || d.state === 'refresh') ? rateStats(points, key) : null,
+                cell = n.cells[key];
+            cell.rate.textContent = s ? rateText(s.rate) : '–';
+            cell.rate.title = s && s.size != null ? _('Average packet size: %d bytes').format(Math.round(s.size)) : '';
+        });
     },
 
     // The cell of connectionAction: one or two buttons, or '–' with a tooltip. Two buttons sit in
