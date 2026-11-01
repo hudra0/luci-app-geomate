@@ -617,9 +617,12 @@ function downloadList(opt, path) {
         if (name != 'PermissionError')
             return dom.content(status, [ _('Failed to read %s: %s').format(path, errorText(err)) ]);
 
-        // cgi-download refuses a directory with the same status as a path the ACL denies
-        return fs.stat(path).then(function(st) {
-            return st && st.type == 'directory';
+        // cgi-download refuses a directory with the same status as a path the ACL denies. Look
+        // the path up in its folder's listing: luci-base lets every session list, but only some
+        // may stat
+        var base = path.replace(/^.*\//, '');
+        return fs.list(path.replace(/\/[^\/]*$/, '')).then(function(entries) {
+            return (entries || []).some(function(e) { return e.name == base && e.type == 'directory'; });
         }, function() {
             return false;
         }).then(function(dir) {

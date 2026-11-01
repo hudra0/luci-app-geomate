@@ -3274,7 +3274,9 @@ return view.extend({
             if (/\.(json|md5)$/i.test(path))
                 return dom.content(status, [ _('%s is not an IP list file.').format(path) ]);
 
-            fs.stat(path).then(function() {
+            fs.stat(path).then(function(st) {
+                if (st && st.type == 'directory')
+                    return dom.content(status, [ _('%s is a directory, not an IP list file.').format(path) ]);
                 dom.content(status, [
                     _('%s already exists. Replace it with %s?').format(path, file.name), ' ',
                     E('button', { 'class': 'btn cbi-button-negative', 'click': function() { writeList(path, file); } }, [ _('Replace') ]), ' ',
