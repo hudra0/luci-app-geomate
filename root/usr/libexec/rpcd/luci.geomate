@@ -787,20 +787,42 @@ local function sample_allowed(ip, now)
     return true
 end
 
--- Notes the sample time of a server, through a temp file and a rename. mkdirr comes with the Lua
--- part of nixio.fs, which require "nixio" does not load
+-- Notes the sample time of a server, through a temp file and a rename
 local function stamp_sample(ip, now)
-    require("nixio.fs").mkdirr(SAMPLE_DIR)
     local tmp = SAMPLE_DIR .. "/." .. ip .. "." .. nixio.getpid()
     local f = io.open(tmp, "w")
     if not f then
-        return
+        return false
     end
     local ok = f:write(tostring(now), "\n")
-    f:close()
-    if not (ok and os.rename(tmp, SAMPLE_DIR .. "/" .. ip)) then
+    local closed = f:close()
+    if not (ok and closed and os.rename(tmp, SAMPLE_DIR .. "/" .. ip)) then
         os.remove(tmp)
+        return false
     end
+    return true
+end
+
+-- Check and reserve under one non-blocking lock: concurrent rpcd processes must share the
+-- budget. Closing the descriptor releases the lock even if the process exits. Keep the lock
+-- file in place so every caller locks the same inode; no lock is held during nft or ping
+local function reserve_sample(ip)
+    require("nixio.fs").mkdirr(SAMPLE_DIR)
+    local lock = nixio.open(SAMPLE_DIR .. "/.lock", "w", "600")
+    if not lock then
+        return false, "busy"
+    end
+    if not lock:lock("tlock") then
+        lock:close()
+        return false, "busy"
+    end
+    local now = now_ms()
+    local ok, reason = sample_allowed(ip, now)
+    if ok and not stamp_sample(ip, now) then
+        ok, reason = false, "busy"
+    end
+    lock:close()
+    return ok, reason
 end
 
 -- Whether the 'nft list set' output of a set lists the address as an element of its own, with
@@ -851,10 +873,10 @@ local function get_server_sample(args)
     if type(ip) ~= "string" or not ip_number(ip) or not prefix or not is_public_ip(ip, router_addresses()) then
         return { error = "invalid" }
     end
-
-    local ok, reason = sample_allowed(ip, now_ms())
-    if not ok then
-        return { error = reason }
+    -- Carrier-grade NAT is not public either; keep the older connection-list policy unchanged
+    local first, second = ip:match("^(%d+)%.(%d+)%.")
+    if tonumber(first) == 100 and tonumber(second) >= 64 and tonumber(second) <= 127 then
+        return { error = "invalid" }
     end
 
     -- Read one after the other, each to its end (see get_ui_dynamic_ips)
@@ -867,7 +889,10 @@ local function get_server_sample(args)
             or set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)) then
         return { error = "unknown" }
     end
-    stamp_sample(ip, t)
+    local ok, reason = reserve_sample(ip)
+    if not ok then
+        return { error = reason }
+    end
 
     local reply = { t = t, ping = "off" }
     if tx_packets and tx_bytes then
