@@ -174,20 +174,42 @@ function hasCapability(token) {
     return !!geoStats && Array.isArray(geoStats.capabilities) && geoStats.capabilities.indexOf(token) > -1;
 }
 
-// Seconds between two checks of the service (harvest and geolocation trigger) for a value of the
-// global option check_interval. Only a backend with the check_interval token reads the option;
-// older ones check every 1800 s. Like the backend, a missing or non-numeric value counts as 1800
-// and a number is clamped to 300-3600
-function checkInterval(value) {
-    if (!hasCapability('check_interval') || !/^[0-9]+$/.test(value != null ? String(value) : ''))
+// The seconds a backend with the check_interval token uses for a value of the global option
+// check_interval: like the backend, a missing or non-numeric value counts as 1800 and a number
+// is clamped to 300-3600
+function intervalSeconds(value) {
+    if (!/^[0-9]+$/.test(value != null ? String(value) : ''))
         return 1800;
     return Math.min(3600, Math.max(300, +value));
+}
+
+// Seconds between two checks of the service (harvest and geolocation trigger) for a value of
+// check_interval and an operational mode. Only a backend with the check_interval token reads the
+// option; older ones check every 1800 s. Static mode does not use it: its loop runs the trigger
+// once an hour, and its text stays as it was before the option
+function checkInterval(value, mode) {
+    return (hasCapability('check_interval') && mode !== 'static') ? intervalSeconds(value) : 1800;
 }
 
 // Choice text of frequent geolocation: new servers are looked up once per check interval, every
 // second check after a run without new servers
 function frequentLabel(interval) {
     return _('Frequent - Update every %d-%d minutes').format(Math.round(interval / 60), Math.round(interval / 30));
+}
+
+// Set the text of frequent geolocation in the open form from the check interval and the
+// operational mode selected there, before they are saved
+function updateFrequentLabel(map, section_id) {
+    var formValue = function(name) {
+        var opt = map.lookupOption(name, section_id);
+        return opt ? opt[0].formvalue(opt[1]) : null;
+    };
+    var mode = map.lookupOption('geolocation_mode', section_id),
+        widget = mode ? mode[0].getUIElement(mode[1]) : null,
+        choice = widget ? widget.node.querySelector('option[value="frequent"]') : null;
+
+    if (choice)
+        choice.textContent = frequentLabel(checkInterval(formValue('check_interval'), formValue('operational_mode')));
 }
 
 // A full geolocation (manual or daily) is running. A missing field (older backend) is unknown
@@ -859,13 +881,16 @@ return view.extend({
         o.value('monitor', _('Monitor - Only visualize connections, no blocking'));
         o.default = 'dynamic';
         o.rmempty = false;
+        // Static mode does not use the check interval (checkInterval)
+        if (hasCapability('check_interval'))
+            o.onchange = function(ev, section_id) { updateFrequentLabel(this.map, section_id); };
 
         // **Check Interval Option**
         // Seconds between two checks for new servers (checkInterval). Only for a backend that
         // reads it; same default as the backend
         if (hasCapability('check_interval')) {
             o = s.option(form.ListValue, 'check_interval', _('Check Interval'),
-                _('How often Geomate adds newly seen servers to the IP lists and, with frequent updates, geolocates them. A shorter interval handles new servers sooner and uses more CPU time.'));
+                _('How often Geomate adds newly seen servers to the IP lists and, with frequent updates, geolocates them. A shorter interval handles new servers sooner but writes to flash and uses CPU time more often. Not used in static mode.'));
             o.value('300', _('5 minutes'));
             o.value('600', _('10 minutes'));
             o.value('900', _('15 minutes'));
@@ -873,25 +898,29 @@ return view.extend({
             o.value('3600', _('60 minutes'));
             o.default = '1800';
             o.rmempty = false;
+            // A missing or empty option reads as the default, so a save without a change of this
+            // select writes nothing: the backend has the same default, and a new line in the
+            // config would cost a restart. Called with two arguments, it stores the loaded value
+            var intervalValue = o.cfgvalue;
+            o.cfgvalue = function(section_id) {
+                var value = intervalValue.apply(this, arguments);
+                return (arguments.length > 1 || (value != null && value !== '')) ? value : this.default;
+            };
             // A hand-written value that is no choice stays a choice of its own: the select would
-            // otherwise show the first choice and the next save would write it
+            // otherwise show the first choice and the next save would write it. Its text names
+            // what the backend uses instead of a value outside 300-3600 or no number
             var loadInterval = o.load;
             o.load = function(section_id) {
-                var value = loadInterval.apply(this, arguments);
+                var value = loadInterval.apply(this, arguments), seconds = intervalSeconds(value);
 
                 if (value != null && value !== '' && this.keylist.indexOf(String(value)) < 0)
-                    this.value(value, _('%s seconds').format(value));
+                    this.value(value, (String(seconds) === String(value))
+                        ? _('%s seconds').format(value)
+                        : _('%s (uses %d minutes)').format(value, seconds / 60));
                 return value;
             };
             // The text of frequent geolocation follows the selected interval
-            o.onchange = function(ev, section_id, value) {
-                var mode = this.map.lookupOption('geolocation_mode', section_id),
-                    widget = mode ? mode[0].getUIElement(mode[1]) : null,
-                    choice = widget ? widget.node.querySelector('option[value="frequent"]') : null;
-
-                if (choice)
-                    choice.textContent = frequentLabel(checkInterval(value));
-            };
+            o.onchange = function(ev, section_id) { updateFrequentLabel(this.map, section_id); };
         }
 
         // **Geolocation Mode Option**
@@ -905,7 +934,8 @@ return view.extend({
         o.rmempty = false;
         var renderMode = o.renderWidget;
         o.renderWidget = function(section_id) {
-            this.vallist[this.keylist.indexOf('frequent')] = frequentLabel(checkInterval(uci.get('geomate', section_id, 'check_interval')));
+            this.vallist[this.keylist.indexOf('frequent')] = frequentLabel(checkInterval(
+                uci.get('geomate', section_id, 'check_interval'), uci.get('geomate', section_id, 'operational_mode')));
             return renderMode.apply(this, arguments);
         };
 
