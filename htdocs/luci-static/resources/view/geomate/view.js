@@ -4133,7 +4133,9 @@ return view.extend({
     // row
     detailsFailed: function(d, err) {
         d.wait = DETAILS_INTERVAL;
-        if (/Access denied|Method not found|Object not found/.test(errorText(err))) {
+        // LuCI translates ubus status text; the numeric method/resource/permission codes stay
+        // stable. JSON-RPC reports a missing method or denied session with its own error codes
+        if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
             d.state = 'unavailable';
             d.stopped = true;
             this.detailsOff = true;
