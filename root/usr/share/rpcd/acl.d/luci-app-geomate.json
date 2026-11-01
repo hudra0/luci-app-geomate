@@ -4,7 +4,7 @@
         "read": {
             "ubus": {
                 "file": [ "exec" ],
-                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers", "getServerSample" ],
                 "luci-rpc": [ "getHostHints", "getNetworkDevices" ],
                 "uci": [ "get", "state" ]
             },
@@ -24,7 +24,7 @@
         },
         "write": {
             "ubus": {
-                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers" ],
+                "luci.geomate": [ "getGeomateConnections", "getAllowedIPs", "getStatus", "getHealthCheck", "getGeolocationStatus", "getKnownServers", "getServerSample" ],
                 "uci": [ "set", "commit", "apply" ]
             },
             "uci": [ "geomate" ],

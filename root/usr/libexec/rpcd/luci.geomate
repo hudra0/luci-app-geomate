@@ -342,16 +342,6 @@ local function read_set(set_name)
     return set
 end
 
--- Addresses in the elements block of a set, as the former grep counted them: a range counts
--- both ends, a prefix its address
-local function count_set_addresses(set_name)
-    local count = 0
-    for _ in set_elements(set_name):gmatch("%d+%.%d+%.%d+%.%d+") do
-        count = count + 1
-    end
-    return count
-end
-
 -- allowed_ip of a filter section, split like the backend splits it: list entries only
 -- (config_list_foreach), so a hand-written 'option allowed_ip', which arrives as a string,
 -- whitelists nothing; an entry can hold several addresses, prefixes or ranges, separated by
@@ -752,6 +742,172 @@ local function get_known_servers(sid)
     return result
 end
 
+-- Server details window (getServerSample): one stamp file per server address with the time of
+-- its last sample in ms, in RAM. A sample of a server comes at most every SAMPLE_MIN_GAP ms, and
+-- at most SAMPLE_MAX_SERVERS servers get one within SAMPLE_WINDOW ms, across all pages and tabs
+local SAMPLE_DIR = "/tmp/geomate/samples"
+local SAMPLE_MIN_GAP = 800
+local SAMPLE_WINDOW = 3000
+local SAMPLE_MAX_SERVERS = 4
+-- Stamps of other servers older than this are deleted
+local SAMPLE_STALE = 60000
+
+local function now_ms()
+    local sec, usec = nixio.gettimeofday()
+    return sec * 1000 + math.floor(usec / 1000)
+end
+
+-- Whether a server may get a sample now: false plus 'busy' within SAMPLE_MIN_GAP of its last
+-- one, false plus 'limit' while SAMPLE_MAX_SERVERS other servers had one within SAMPLE_WINDOW.
+-- Read only, apart from deleting stale stamps. A stamp from the future (the clock was set back)
+-- counts as stale
+local function sample_allowed(ip, now)
+    local others = 0
+    for name in nixio.fs.dir(SAMPLE_DIR) or function() end do
+        local path = SAMPLE_DIR .. "/" .. name
+        local f = ip_number(name) and io.open(path, "r")
+        local last = f and tonumber(f:read("*l") or "")
+        if f then
+            f:close()
+        end
+        local age = last and now - last
+        if name == ip then
+            if age and age >= 0 and age < SAMPLE_MIN_GAP then
+                return false, "busy"
+            end
+        elseif age and age >= 0 and age < SAMPLE_WINDOW then
+            others = others + 1
+        elseif f and (not age or age < 0 or age > SAMPLE_STALE) then
+            os.remove(path)
+        end
+    end
+    if others >= SAMPLE_MAX_SERVERS then
+        return false, "limit"
+    end
+    return true
+end
+
+-- Notes the sample time of a server, through a temp file and a rename
+local function stamp_sample(ip, now)
+    local tmp = SAMPLE_DIR .. "/." .. ip .. "." .. nixio.getpid()
+    local f = io.open(tmp, "w")
+    if not f then
+        return false
+    end
+    local ok = f:write(tostring(now), "\n")
+    local closed = f:close()
+    if not (ok and closed and os.rename(tmp, SAMPLE_DIR .. "/" .. ip)) then
+        os.remove(tmp)
+        return false
+    end
+    return true
+end
+
+-- Check and reserve under one non-blocking lock: concurrent rpcd processes must share the
+-- budget. Closing the descriptor releases the lock even if the process exits. Keep the lock
+-- file in place so every caller locks the same inode; no lock is held during nft or ping
+local function reserve_sample(ip)
+    require("nixio.fs").mkdirr(SAMPLE_DIR)
+    local lock = nixio.open(SAMPLE_DIR .. "/.lock", "w", "600")
+    if not lock then
+        return false, "busy"
+    end
+    if not lock:lock("tlock") then
+        lock:close()
+        return false, "busy"
+    end
+    local now = now_ms()
+    local ok, reason = sample_allowed(ip, now)
+    if ok and not stamp_sample(ip, now) then
+        ok, reason = false, "busy"
+    end
+    lock:close()
+    return ok, reason
+end
+
+-- Whether the 'nft list set' output of a set lists the address as an element of its own, with
+-- or without a counter; element_counter() finds only elements with one
+local function set_lists(listing, ip)
+    local from = listing:find("elements = {", 1, true)
+    while from do
+        local p = listing:find(ip, from, true)
+        if not p then
+            return false
+        end
+        if listing:find("^[%s{]", p - 1) and listing:find("^[%s,}]", p + #ip) then
+            return true
+        end
+        from = p + 1
+    end
+    return false
+end
+
+-- One ICMP echo, as LuCI's Diagnostics page sends it: the round trip in ms, nil without a reply
+-- within 1 s. The address is a checked dotted quad
+local function ping_rtt(ip)
+    local handle = io.popen("ping -c1 -W1 -q '" .. ip .. "' 2>/dev/null")
+    if not handle then
+        return nil
+    end
+    local out = handle:read("*a") or ""
+    handle:close()
+    return tonumber(out:match("min/avg/max = [%d%.]+/([%d%.]+)/"))
+end
+
+-- getServerSample: the counters of one server of a filter for the details window, polled once
+-- per second while it is open. { t, tx = { packets, bytes }, rx = { packets, bytes }, ping, rtt }:
+-- t is the router's time of the counter read in ms, so the delay of the request does not change
+-- the rates. tx: what the filter's _dynamic set counted for the server (packets to it, backend
+-- token set_counters); rx: what its _rx set counted (packets from it, token rx_counters). Each
+-- only when the set has a counter for the server. ping: 'ok' with rtt in ms, 'timeout', or 'off'
+-- when not asked for. Errors: { error = 'invalid' } for an address that is no public IPv4
+-- address or a filter name the backend does not support, 'unknown' when no live or counter set
+-- of the filter has the server, 'busy' or 'limit' (sample_allowed).
+-- The server must be one of the filter's, so the page pings no other host. LuCI's Diagnostics
+-- page already pings any host, so this keeps the window to its purpose; it is no security
+-- boundary. 'nft list set' reads one set (1-2 ms each); 'nft get element' would load the whole
+-- ruleset, about 80 ms per call
+local function get_server_sample(args)
+    args = type(args) == "table" and args or {}
+    local ip, prefix = args.ip, filter_set_name(args.filter)
+    if type(ip) ~= "string" or not ip_number(ip) or not prefix or not is_public_ip(ip, router_addresses()) then
+        return { error = "invalid" }
+    end
+    -- Carrier-grade NAT is not public either; keep the older connection-list policy unchanged
+    local first, second = ip:match("^(%d+)%.(%d+)%.")
+    if tonumber(first) == 100 and tonumber(second) >= 64 and tonumber(second) <= 127 then
+        return { error = "invalid" }
+    end
+
+    -- Read one after the other, each to its end (see get_ui_dynamic_ips)
+    local dynamic = nft_list_set(prefix .. "_dynamic")
+    local rx_listing = nft_list_set(prefix .. "_rx")
+    local t = now_ms()
+    local tx_packets, tx_bytes = element_counter(dynamic, ip)
+    local rx_packets, rx_bytes = element_counter(rx_listing, ip)
+    if not (tx_packets or rx_packets or set_lists(dynamic, ip)
+            or set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)) then
+        return { error = "unknown" }
+    end
+    local ok, reason = reserve_sample(ip)
+    if not ok then
+        return { error = reason }
+    end
+
+    local reply = { t = t, ping = "off" }
+    if tx_packets and tx_bytes then
+        reply.tx = { packets = tx_packets, bytes = tx_bytes }
+    end
+    if rx_packets and rx_bytes then
+        reply.rx = { packets = rx_packets, bytes = rx_bytes }
+    end
+    if args.ping == true then
+        reply.rtt = ping_rtt(ip)
+        reply.ping = reply.rtt and "ok" or "timeout"
+    end
+    return reply
+end
+
 -- Function to check if an element is in a table
 function table_contains(tbl, element)
     for _, value in ipairs(tbl) do
@@ -835,6 +991,19 @@ local function flow_offloading()
     return on
 end
 
+-- 'nft -t list table inet geomate': the table without set elements, about 1.5 KB where the full
+-- listing runs to hundreds of KB with large IP lists. '' without the table, nil if nft could not
+-- be started. Enough to tell whether the table exists and to count its sets
+local function nft_table_terse()
+    local handle = io.popen("nft -t list table inet geomate 2>/dev/null")
+    if not handle then
+        return nil
+    end
+    local result = handle:read("*a") or ""
+    handle:close()
+    return result
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -886,39 +1055,26 @@ local function get_service_status()
     status.operational_mode = uci:get('geomate', 'global', 'operational_mode') or 'dynamic'
     status.debug_level = tonumber(uci:get('geomate', 'global', 'debug_level')) or 0
 
-    -- Check nftables status
-    local nft_check = io.popen("nft list table inet geomate 2>/dev/null")
-    if nft_check then
-        local result = nft_check:read("*a")
-        nft_check:close()
-        status.nft_active = (result ~= nil and result ~= "")
-    end
-
-    -- Count nft sets
-    local nft_sets = io.popen("nft list sets inet geomate 2>/dev/null | grep -c 'set geomate_'")
-    if nft_sets then
-        local count = nft_sets:read("*l")
-        nft_sets:close()
-        status.nft_sets_count = tonumber(count) or 0
-    end
-
-    -- Get filter information
-    uci:foreach('geomate', 'geo_filter', function(s)
-        local filter_info = {
-            name = s.name,
-            enabled = (s.enabled == '1'),
-            allowed_count = 0,
-            blocked_count = 0
-        }
-
-        local set_name = filter_set_name(s.name)
-        if filter_info.enabled and status.nft_active and set_name then
-            -- Count only the elements: the set header holds the filter name
-            filter_info.allowed_count = count_set_addresses(set_name .. "_allowed")
-            filter_info.blocked_count = count_set_addresses(set_name .. "_blocked")
+    -- Check nftables status and count the sets, as 'grep -c' counted the lines of the full
+    -- listing: one terse listing instead of two full ones
+    local nft_table = nft_table_terse()
+    if nft_table then
+        status.nft_active = (nft_table ~= "")
+        for line in nft_table:gmatch("[^\n]+") do
+            if line:find("set geomate_", 1, true) then
+                status.nft_sets_count = status.nft_sets_count + 1
+            end
         end
+    end
 
-        table.insert(status.filters, filter_info)
+    -- Get filter information. No element counts: no view reads them, and counting listed the
+    -- _allowed and _blocked sets of every enabled filter on each status poll (13k elements in
+    -- a CoD _blocked set are about 100 ms and 19 MB of nft memory on an Intel N100)
+    uci:foreach('geomate', 'geo_filter', function(s)
+        table.insert(status.filters, {
+            name = s.name,
+            enabled = (s.enabled == '1')
+        })
     end)
 
     -- Get recent nft errors (last 5 lines)
@@ -1029,11 +1185,9 @@ local function run_health_check()
 
     -- Check 5: nftables table (only if service is enabled)
     if config_enabled then
-        local nft_check = io.popen("nft list table inet geomate 2>/dev/null")
-        if nft_check then
-            local result = nft_check:read("*a")
-            nft_check:close()
-            if result and result ~= "" then
+        local result = nft_table_terse()
+        if result then
+            if result ~= "" then
                 health.checks.nft = { status = "ok", message = "nftables table active" }
             else
                 health.checks.nft = { status = "error", message = "nftables table not active" }
@@ -1145,6 +1299,12 @@ local methods = {
         args = { sid = 'string' },
         call = function(args)
             return get_known_servers(type(args) == "table" and args.sid or nil)
+        end
+    },
+    getServerSample = {
+        args = { filter = 'string', ip = 'string', ping = true },
+        call = function(args)
+            return get_server_sample(args)
         end
     },
     getStatus = {
