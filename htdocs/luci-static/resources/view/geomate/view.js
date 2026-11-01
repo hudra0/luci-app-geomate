@@ -617,6 +617,7 @@ function splitEntries(widget) {
 // Poll intervals in seconds
 var CONNECTIONS_INTERVAL = 5,
     STATUS_INTERVAL = 10,
+    STATUS_HIDDEN_INTERVAL = 300,   // while the tab is hidden (pollHidden)
     VERSION_INTERVAL = 3600,
     // Failed getGeomateConnections requests in a row before the status row says the list is old
     CONNECTIONS_STALE_AFTER = 3;
@@ -988,6 +989,7 @@ return view.extend({
     statusLoaded: false,    // a getStatus reply (or failure) has arrived
     health: null,       // last getHealthCheck result, null when it failed
     problems: [],       // problems of the last status poll: 'process' and check keys (updateStatus)
+    problemsAt: 0,      // time that status poll was sent
     confirmed: [],      // problems seen on two polls in a row; a new one opens the details
     versionInfo: null,  // last versionState() result, null before the first check
     readonly: true,     // no write access, or no configuration: the map only shows
@@ -998,6 +1000,7 @@ return view.extend({
     drawing: false,     // the map is drawing a circle (drawState)
     connectionsBusy: null,  // running getGeomateConnections request
     statusBusy: null,       // running status request
+    hiddenTimer: null,      // window timer of the status poll while the tab is hidden (pollHidden)
     versionBusy: null,      // running check_version request
     versionInstalled: null, // installed versions (installedKey) for which a check was last started
     connectionsTable: null, // ui.Table of the active connections
@@ -1951,10 +1954,10 @@ return view.extend({
         }
     },
 
-    // Show the last status and health check in the status row; polled: with a new status reply.
-    // A problem (service stopped although enabled, a check with an error or warning) seen on two
-    // polls in a row opens the details once, so a restart or one failed reply does not; they
-    // never close on their own
+    // Show the last status and health check in the status row; polled: with a new status reply,
+    // the time its request was sent. A problem (service stopped although enabled, a check with an
+    // error or warning) seen on two polls in a row opens the details once, so a restart or one
+    // failed reply does not; they never close on their own
     updateStatus: function(polled) {
         var n = this.nodes,
             st = this.status,
@@ -2056,14 +2059,17 @@ return view.extend({
             n.offloading.hidden = st.flow_offloading !== true;
         }
 
-        // A failed reply tells nothing, and the service builds its table while it loads
-        if (!polled || !st || !checks || loading)
+        // A failed reply tells nothing, and the service builds its table while it loads. A poll
+        // sent less than STATUS_INTERVAL after the one before (the tab is shown again, a direct
+        // call) does not count either: both replies could fall into one restart
+        if (!polled || !st || !checks || loading || polled - this.problemsAt < (STATUS_INTERVAL - 1) * 1000)
             return;
         var last = this.problems,
             confirmed = problems.filter(function(p) { return last.indexOf(p) >= 0; });
         if (confirmed.some(function(p) { return this.confirmed.indexOf(p) < 0; }, this))
             n.statusRow.open = true;
         this.problems = problems;
+        this.problemsAt = polled;
         this.confirmed = confirmed;
     },
 
@@ -2155,6 +2161,9 @@ return view.extend({
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
             poll.add(this.pollFns.status, STATUS_INTERVAL);
         }
+        else {
+            this.pollHidden(true);
+        }
         poll.add(this.pollFns.version, VERSION_INTERVAL);
 
         this.pollConnections();
@@ -2165,15 +2174,18 @@ return view.extend({
         window.addEventListener('pagehide', L.bind(this.saveRecent, this, true));
     },
 
-    // No connection and status requests while the tab is hidden. Keep the version poll in LuCI's
-    // queue: poll.remove() stops LuCI's poll when the queue runs empty, and the header would
-    // show "Paused" until the next poll.add()
+    // No connection requests while the tab is hidden, and the status only every
+    // STATUS_HIDDEN_INTERVAL seconds (pollHidden). Keep the version poll in LuCI's queue:
+    // poll.remove() stops LuCI's poll when the queue runs empty, and the header would show
+    // "Paused" until the next poll.add()
     handleVisibilityChange: function() {
         if (document.hidden) {
             poll.remove(this.pollFns.connections);
             poll.remove(this.pollFns.status);
+            this.pollHidden(true);
             this.saveRecent(true);
         } else {
+            this.pollHidden(false);
             poll.add(this.pollFns.connections, CONNECTIONS_INTERVAL);
             poll.add(this.pollFns.status, STATUS_INTERVAL);
             // Fresh data at once, unless the user paused LuCI's auto refresh
@@ -2184,9 +2196,21 @@ return view.extend({
         }
     },
 
+    // The status poll of a hidden tab runs on a window timer: its requests keep the LuCI session,
+    // and the changes staged in it, alive. LuCI's poll counts ticks, and browsers slow the timers
+    // of a hidden tab down to one per minute, so an interval in ticks could take 60 times as
+    // long. A paused auto refresh sends nothing, as in a visible tab
+    pollHidden: function(on) {
+        window.clearInterval(this.hiddenTimer);
+        this.hiddenTimer = on ? window.setInterval(L.bind(function() {
+            if (poll.active())
+                this.pollStatus();
+        }, this), STATUS_HIDDEN_INTERVAL * 1000) : null;
+    },
+
     // One request at a time, like pollConnections()
     pollStatus: function() {
-        var self = this;
+        var self = this, sent = Date.now();
 
         if (!this.statusBusy)
             this.statusBusy = Promise.all([
@@ -2211,7 +2235,7 @@ return view.extend({
                     self.backendPid = pid;
                 }
                 self.statusLoaded = true;
-                self.updateStatus(true);
+                self.updateStatus(sent);
                 self.showVersions();
                 self.checkAfterUpdate();
             }).finally(function() {
