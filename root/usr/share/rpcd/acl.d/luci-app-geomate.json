@@ -9,6 +9,7 @@
                 "uci": [ "get", "state" ]
             },
             "uci": [ "geomate" ],
+            "cgi-io": [ "download" ],
             "file": {
                 "/etc/init.d/geomate": [ "read" ],
                 "/etc/init.d/geomate check_version": [ "exec" ],

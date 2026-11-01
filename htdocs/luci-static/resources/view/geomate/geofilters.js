@@ -74,10 +74,11 @@ function ipListPath(name) {
 var FILTER_NAME_RE = /^[\w .-]+$/;
 
 // Check a filter name. The backend skips a filter whose name has other characters, so a saved
-// name fails too. A name other than the saved one must not clash with the name of another
-// filter (others): a space and '_' give the same nft set name, so 'A B' and 'A_B' would share
-// their sets, and the map's region dialog finds a filter by its name without regard to case.
-// Returns true or the error text
+// name fails too. A name other than the saved one must not start or end with a space (the map
+// dialog and Create Empty List trim names, so they could not reach that filter) and must not
+// clash with the name of another filter (others): a space and '_' give the same nft set name,
+// so 'A B' and 'A_B' would share their sets, and the map's region dialog finds a filter by its
+// name without regard to case. Returns true or the error text
 function checkFilterName(name, saved, others) {
     var key = function(n) { return String(n).toLowerCase().replace(/ /g, '_'); };
     var clash;
@@ -86,19 +87,21 @@ function checkFilterName(name, saved, others) {
         return _('Use only letters, digits, spaces, "_", "." and "-"');
     if (name === saved)
         return true;
+    if (/^\s|\s$/.test(name))
+        return _('The name must not start or end with a space.');
 
     clash = others.filter(function(n) { return n != null && key(n) === key(name); })[0];
     return (clash == null) || _('Name conflicts with filter %s.').format(clash);
 }
 
 // What is wrong with an IP list path, null if nothing. The service takes the path as it is: a
-// space at either end names another file, which its start creates empty
+// space at either end names a different file (a leading one even a relative path)
 function listPathError(path) {
     path = String(path);
     if (/[\r\n]/.test(path))
         return _('The path must be on one line.');
     if (/^\s|\s$/.test(path))
-        return _('The path must not start or end with a space: the service would use another, empty file.');
+        return _('The path must not start or end with a space: the service would use a different file.');
     if (path.charAt(0) != '/')
         return _('The path must start with "/".');
     return null;
@@ -554,15 +557,20 @@ function cleanList(text) {
 }
 
 // Save the IP list, cleaned by cleanList, as a file of the same name with one address per line:
-// the format of Upload List and of the shipped lists. rpcd's file.read sends no file of 256 KiB
-// or more (UnsupportedError) and none of 0 bytes (NoDataError)
+// the format of Upload List and of the shipped lists. Reads through cgi-download (needs the
+// cgi-io download ACL and read access to the path), which has no size limit, unlike rpcd's
+// file.read (fs.read), which refuses files of 256 KiB or more
 function downloadList(opt, path) {
     var status = opt.status;
 
     dom.content(status, [ _('Loading...') ]);
-    return fs.read(path).then(function(text) {
-        var list = cleanList(text), link;
+    return fs.read_direct(path, 'text').then(function(text) {
+        var list, link;
 
+        if (!String(text).trim())
+            return dom.content(status, [ _('%s is empty.').format(path) ]);
+
+        list = cleanList(text);
         if (!list.ips.length)
             return dom.content(status, [ _('%s has no public IPv4 addresses.').format(path) ]);
 
@@ -583,9 +591,8 @@ function downloadList(opt, path) {
     }).catch(function(err) {
         var name = err ? err.name : null;
 
-        dom.content(status, [ (name == 'NoDataError') ? _('%s is empty.').format(path)
-            : (name == 'NotFoundError') ? _('%s does not exist.').format(path)
-            : (name == 'UnsupportedError') ? _('%s is too large to download in the browser (256 KiB or more). Copy it over SSH instead.').format(path)
+        dom.content(status, [ (name == 'NotFoundError') ? _('%s does not exist.').format(path)
+            : (name == 'PermissionError') ? _('No permission to read %s.').format(path)
             : _('Failed to read %s: %s').format(path, errorText(err)) ]);
     });
 }
