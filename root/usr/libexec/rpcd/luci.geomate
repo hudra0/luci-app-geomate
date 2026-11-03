@@ -1076,8 +1076,9 @@ local function measure_route(ip, hint)
         end
         if not hint then
             -- ROUTE_BATCH TTLs at once. A reply from the deepest TTL of the batch shows that the
-            -- route goes on, so the next batch does not wait for silent hops. An echo of the
-            -- server or a batch without any reply ends the search
+            -- route goes on, so the next batch does not wait for silent hops. Only an echo of the
+            -- server ends the search: a run of silent hops longer than a batch is common in front
+            -- of cloud servers
             for first = 1, 24, ROUTE_BATCH do
                 local last = first + ROUTE_BATCH - 1
                 for ttl = first, last do
@@ -1086,11 +1087,7 @@ local function measure_route(ip, hint)
                 collect(clock() + ROUTE_WAIT, function()
                     return best and (best.endpoint or best.ttl >= last)
                 end)
-                local heard = false
-                for _, probe in pairs(probes) do
-                    heard = heard or (probe.answered and probe.ttl >= first)
-                end
-                if fault or clock() >= deadline or not heard or best.endpoint then break end
+                if fault or clock() >= deadline or (best and best.endpoint) then break end
             end
         else
             -- One probe per refresh; a second one only when the first has no reply after
