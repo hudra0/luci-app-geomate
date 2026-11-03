@@ -932,6 +932,12 @@ local ROUTE_DIR = "/tmp/geomate/route"
 local ROUTE_GAP = 2
 local ROUTE_REDISCOVER = 60
 local ROUTE_HINT_AGE = 180
+-- A reply counts within ROUTE_WAIT s of its probe, so hops and servers beyond 200 ms count
+-- too. The search sends ROUTE_BATCH TTLs at once; a refresh sends its second probe when the
+-- first has no reply after ROUTE_RETRY s
+local ROUTE_WAIT = 1.2
+local ROUTE_BATCH = 8
+local ROUTE_RETRY = 0.5
 
 local function route_uptime()
     local f = io.open("/proc/uptime", "r")
@@ -970,7 +976,8 @@ end
 
 -- Only an exact endpoint echo or a correlated TTL-expired message can supply RTT.
 -- ICMP unreachable and other control messages are not alternate latency sources.
-local function route_reply(data, host, ip, id, seq)
+-- Returns whether the server itself answered, and the sequence number of the probe
+local function route_reply(data, host, ip, id)
     if type(host) ~= "string" or not ip_number(host) or type(data) ~= "string"
             or #data < 28 or math.floor(data:byte(1) / 16) ~= 4
             or data:byte(10) ~= 1 then return nil end
@@ -981,10 +988,10 @@ local function route_reply(data, host, ip, id, seq)
             or data:byte(7) % 64 ~= 0 or data:byte(8) ~= 0
             or route_checksum(data:sub(h + 1, length)) ~= 0 then return nil end
     local kind, code = data:byte(h + 1, h + 2)
-    local tag = route_word(id) .. route_word(seq)
-    if kind == 0 and code == 0 and host == ip and data:sub(h + 5, h + 8) == tag
+    local tag = route_word(id)
+    if kind == 0 and code == 0 and host == ip and data:sub(h + 5, h + 6) == tag
             and data:sub(h + 9, length) == "geomate-route" then
-        return true
+        return true, data:byte(h + 7) * 256 + data:byte(h + 8)
     end
     if kind ~= 11 or code ~= 0 then return nil end
     local inner = h + 8
@@ -996,8 +1003,8 @@ local function route_reply(data, host, ip, id, seq)
             or data:byte(inner + 7) % 64 ~= 0 or data:byte(inner + 8) ~= 0
             or data:sub(inner + 17, inner + 20) ~= route_address(ip)
             or data:byte(echo + 1) ~= 8 or data:byte(echo + 2) ~= 0
-            or data:sub(echo + 5, echo + 8) ~= tag then return nil end
-    return false
+            or data:sub(echo + 5, echo + 6) ~= tag then return nil end
+    return false, data:byte(echo + 7) * 256 + data:byte(echo + 8)
 end
 
 local function measure_route(ip, hint)
@@ -1010,9 +1017,11 @@ local function measure_route(ip, hint)
         local started = route_uptime()
         if not started then return { error = "clock" } end
         local previous, deadline, sequence, received = started, started + 7, 0, 0
-        local fault
+        local fault, best
         local id = nixio.getpid() % 65536
         local pollset = {{ fd = sock, events = nixio.poll_flags("in") }}
+        -- The probes by sequence number: { ttl, sent, sent_wall, answered }
+        local probes = {}
         local function clock()
             local now = route_uptime()
             if not now or now < previous then fault = "clock"; return deadline end
@@ -1023,15 +1032,21 @@ local function measure_route(ip, hint)
             local sec, usec = nixio.gettimeofday()
             return sec * 1000 + usec / 1000
         end
-        local function probe(ttl, timeout)
+        local function send(ttl)
             local sent = clock()
-            if fault or sent >= deadline or sequence >= 28 or received >= 512 then return nil end
+            if fault or sent >= deadline or sequence >= 28 or received >= 512 then return false end
             sequence = sequence + 1
             local packet = route_packet(ip, id, sequence, ttl)
-            local sent_wall = wall()
-            if sock:sendto(packet, ip, 0) ~= #packet then fault = "internal"; return nil end
-            local limit = math.min(sent + timeout, deadline)
-            while not fault do
+            probes[sequence] = { ttl = ttl, sent = sent, sent_wall = wall() }
+            if sock:sendto(packet, ip, 0) ~= #packet then fault = "internal"; return false end
+            return true
+        end
+        -- Reads replies until the uptime limit or until done(). A reply counts for its own
+        -- probe, also while a later one waits. best: the echo of the server at the lowest TTL,
+        -- else the reply from the deepest TTL
+        local function collect(limit, done)
+            limit = math.min(limit, deadline)
+            while not fault and not done() do
                 local now = clock()
                 if now >= limit or received >= 512 then break end
                 local ready = nixio.poll(pollset, math.max(1, math.ceil((limit - now) * 1000)))
@@ -1040,39 +1055,54 @@ local function measure_route(ip, hint)
                 local data, host = sock:recvfrom(2048)
                 received = received + 1
                 local at, at_wall = clock(), wall()
-                local endpoint = route_reply(data, host, ip, id, sequence)
-                if endpoint ~= nil and at <= limit then
-                    local rtt = at_wall - sent_wall
+                local endpoint, seq = route_reply(data, host, ip, id)
+                local probe = endpoint ~= nil and probes[seq]
+                if probe and not probe.answered and at - probe.sent <= ROUTE_WAIT then
+                    probe.answered = true
+                    local rtt = at_wall - probe.sent_wall
                     -- /proc/uptime has 10 ms resolution. Reject wall-clock steps rather
                     -- than displaying negative or implausible RTT after time correction.
-                    if rtt < 0 or rtt > timeout * 1000 + 20
-                            or math.abs(rtt - (at - sent) * 1000) > 25 then
+                    if rtt < 0 or math.abs(rtt - (at - probe.sent) * 1000) > 25 then
                         fault = "clock"; break
                     end
-                    return { rtt = rtt, responder = host, ttl = ttl, endpoint = endpoint,
-                        measured_at = math.floor(at_wall), observed = at }
+                    if not best or (endpoint and (not best.endpoint or probe.ttl < best.ttl))
+                            or (not endpoint and not best.endpoint and probe.ttl > best.ttl) then
+                        best = { rtt = rtt, responder = host, ttl = probe.ttl, endpoint = endpoint,
+                            measured_at = math.floor(at_wall), observed = at }
+                    end
                 end
             end
         end
-        local last
         if not hint then
-            for ttl = 1, 24 do
-                local value = probe(ttl, 0.2)
-                if value then last = value end
-                if fault or clock() >= deadline or (value and value.endpoint) then break end
+            -- ROUTE_BATCH TTLs at once. A reply from the deepest TTL of the batch shows that the
+            -- route goes on, so the next batch does not wait for silent hops. An echo of the
+            -- server or a batch without any reply ends the search
+            for first = 1, 24, ROUTE_BATCH do
+                local last = first + ROUTE_BATCH - 1
+                for ttl = first, last do
+                    if not send(ttl) then break end
+                end
+                collect(clock() + ROUTE_WAIT, function()
+                    return best and (best.endpoint or best.ttl >= last)
+                end)
+                local heard = false
+                for _, probe in pairs(probes) do
+                    heard = heard or (probe.answered and probe.ttl >= first)
+                end
+                if fault or clock() >= deadline or not heard or best.endpoint then break end
             end
         else
-            -- One probe per refresh; a second one only when the first gets no reply
-            for _ = 1, 2 do
-                last = probe(hint, 0.4)
-                if last or fault or clock() >= deadline then break end
-            end
+            -- One probe per refresh; a second one only when the first has no reply after
+            -- ROUTE_RETRY s, while a late reply to the first still counts
+            local function replied() return best ~= nil end
+            if send(hint) then collect(clock() + ROUTE_RETRY, replied) end
+            if not best and send(hint) then collect(clock() + ROUTE_WAIT, replied) end
         end
         if fault then return { error = fault } end
-        if not last then return { status = "no_reply", measured_at = now_ms() } end
-        return { status = "ok", rtt = math.floor(last.rtt * 1000 + 0.5) / 1000,
-            responder = last.responder, ttl = last.ttl, endpoint = last.endpoint,
-            measured_at = last.measured_at }, last.ttl, last.observed
+        if not best then return { status = "no_reply", measured_at = now_ms() } end
+        return { status = "ok", rtt = math.floor(best.rtt * 1000 + 0.5) / 1000,
+            responder = best.responder, ttl = best.ttl, endpoint = best.endpoint,
+            measured_at = best.measured_at }, best.ttl, best.observed
     end)
     if sock then sock:close() end
     if not ok then return { error = "internal" } end
