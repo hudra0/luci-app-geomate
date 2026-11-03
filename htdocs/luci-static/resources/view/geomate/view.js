@@ -133,6 +133,12 @@ function errorText(err) {
     return String((err && err.message) || err).split('\n')[0];
 }
 
+// The session may not call the method (JSON-RPC -32002 Access denied), as a login from before an
+// update of the web interface that added it: a reload keeps the session, a new login helps
+function sessionDenied(err) {
+    return /\berror -32002\b|Access denied/.test(errorText(err));
+}
+
 // Declare RPC methods to interact with the Geomate backend. reject: a ubus error (script crash or
 // timeout, missing method, no permission) rejects instead of resolving to the expect default, so
 // L.resolveDefault() gives null: the connection list stays as it was, the status shows "unknown".
@@ -1253,7 +1259,9 @@ return view.extend({
     restartAt: 0,           // time of that change
     details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
+    detailsDenied: false,   // detailsOff because the session was denied (sessionDenied)
     routeOff: false,        // missing route method/permission; direct samples remain available
+    routeDenied: false,     // routeOff because the session was denied (sessionDenied)
     routeRequest: null,     // one route call across selections, including late replies
 
     // Only what the map needs: LuCI sends the calls of one frame as one batch that the router
@@ -4140,7 +4148,8 @@ return view.extend({
             counts = mode !== 'static', st = this.status || this.lastStatus, d, n;
 
         if (this.detailsOff)
-            return notify(_('Server measurements unavailable. Reload the page.'));
+            return notify(this.detailsDenied ? _('Server measurements unavailable. Log in again after an update of the web interface.')
+                : _('Server measurements unavailable. Reload the page.'));
         if (!validIPv4(ip) || !FILTER_NAME_RE.test(filter))
             return;
         if (this.fullscreen)
@@ -4355,6 +4364,7 @@ return view.extend({
             d.routeNextAt = performance.now() + ROUTE_INTERVAL;
             if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
                 self.routeOff = true;
+                self.routeDenied = sessionDenied(err);
                 d.routeState = 'unsupported';
             }
         }).finally(function() {
@@ -4428,10 +4438,12 @@ return view.extend({
         var n = d && d.nodes, now = performance.now(), result = d && d.routeResult,
             age = result ? result.age_ms + Math.max(0, now - d.routeReceivedAt) : 0,
             stale = !!result && age >= ROUTE_STALE,
+            // unavailable: retried after ROUTE_INTERVAL; unsupported and denied: off for the page
             notes = { no_reply: _('No route reply'), waiting: _('Waiting for measurement'),
                 unknown: _('No recent traffic'), unavailable: _('Route measurement unavailable'),
-                unsupported: _('Route measurements unavailable') },
-            text = d && notes[this.routeOff ? 'unsupported' : d.routeState] || '';
+                unsupported: _('Route RTT not supported'),
+                denied: _('Route RTT unavailable. Log in again after an update of the web interface.') },
+            text = d && notes[this.routeOff ? (this.routeDenied ? 'denied' : 'unsupported') : d.routeState] || '';
 
         if (!n || !n.routeBox)
             return;
@@ -4573,9 +4585,9 @@ return view.extend({
     },
 
     // A failed getServerSample request. A missing method or ACL entry (older luci.geomate or an
-    // rpcd that was not restarted) stops sampling, and the IPs are no links from now on. Other
-    // errors (timeout, no connection) keep sampling, and the panel says so from the third in a
-    // row
+    // rpcd that was not restarted) stops sampling, and the IPs are no links from now on; a denied
+    // session (sessionDenied) is told to log in again. Other errors (timeout, no connection) keep
+    // sampling, and the panel says so from the third in a row
     detailsFailed: function(d, err) {
         d.wait = DETAILS_INTERVAL;
         d.currentRtt = null;
@@ -4583,7 +4595,8 @@ return view.extend({
         // LuCI translates ubus status text; the numeric method/resource/permission codes stay
         // stable. JSON-RPC reports a missing method or denied session with its own error codes
         if (/\bubus code (3|4|6)\b|\berror -(32601|32002)\b|Access denied|Method not found|Object not found/.test(errorText(err))) {
-            d.state = 'unavailable';
+            this.detailsDenied = sessionDenied(err);
+            d.state = this.detailsDenied ? 'denied' : 'unavailable';
             d.stopped = true;
             this.detailsOff = true;
             this.connectionsKey = null;
@@ -4614,7 +4627,8 @@ return view.extend({
                 limit: _('Waiting for another measurement'),
                 offline: _('Router unavailable'),
                 invalid: _('Measurement unavailable'),
-                unavailable: _('Server measurements unavailable. Reload the page.')
+                unavailable: _('Server measurements unavailable. Reload the page.'),
+                denied: _('Server measurements unavailable. Log in again after an update of the web interface.')
             },
             text = notes[d.state] || '';
 
