@@ -901,8 +901,9 @@ function searchText(conn) {
 }
 
 // Selected server (openServerDetails): one getServerSample request per DETAILS_INTERVAL
-// ms while it is open and the tab is visible, the next only after the reply. The graphs show the
-// last DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
+// ms while it is open and the tab is visible, the next only after the reply and, after a slow
+// reply, twice its time after the request (sampleDetails). The graphs show the last
+// DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
 // give no rate, and the lines break there. The figures take the last DETAILS_STATS rates. After
 // DETAILS_SESSION ms the window pauses until Continue, so a forgotten window does not sample and
 // ping for hours. While other servers use up the router's limit (sample 'limit'), it asks again
@@ -4460,7 +4461,9 @@ return view.extend({
     },
 
     // One sample of the selected server, then the next DETAILS_INTERVAL ms after this one was sent
-    // (d.wait), never two at a time. Nothing while the tab is hidden (handleVisibilityChange starts
+    // (d.wait), never two at a time. A reply that took longer than half of that delays the next
+    // request to twice its time after this one was sent, so a slow router (a large _dynamic set)
+    // is not asked again at once. Nothing while the tab is hidden (handleVisibilityChange starts
     // again) or LuCI's auto refresh is paused; samples stop when the panel is collapsed or removed
     sampleDetails: function() {
         var self = this, d = this.details, sent, epoch;
@@ -4500,13 +4503,17 @@ return view.extend({
             if (self.details === d && epoch === d.sampleEpoch && !d.stopped && !d.collapsed && d.state !== 'paused' && self.detailsShown(d))
                 self.detailsFailed(d, err);
         }).finally(function() {
+            var took;
+
             d.busy = false;
             if (self.details !== d)
                 return;
             self.showDetails();
             self.sampleServerRoute(d, false);
-            if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden)
-                d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(0, d.wait - (performance.now() - sent)));
+            if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden) {
+                took = performance.now() - sent;
+                d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(d.wait, 2 * took) - took);
+            }
         });
     },
 
