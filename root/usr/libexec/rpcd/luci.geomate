@@ -805,7 +805,8 @@ end
 
 -- Check and reserve under one non-blocking lock: concurrent rpcd processes must share the
 -- budget. Closing the descriptor releases the lock even if the process exits. Keep the lock
--- file in place so every caller locks the same inode; no lock is held during nft or ping
+-- file in place so every caller locks the same inode; no lock is held during nft or ping.
+-- Returns ok, the reason when not ok, and the time of the stamp for release_sample()
 local function reserve_sample(ip)
     require("nixio.fs").mkdirr(SAMPLE_DIR)
     local lock = nixio.open(SAMPLE_DIR .. "/.lock", "w", "600")
@@ -822,7 +823,21 @@ local function reserve_sample(ip)
         ok, reason = false, "busy"
     end
     lock:close()
-    return ok, reason
+    return ok, reason, now
+end
+
+-- Takes back a reservation that brought no sample, so that the server does not count toward
+-- the limit. A newer stamp of another caller stays
+local function release_sample(ip, stamp)
+    local path = SAMPLE_DIR .. "/" .. ip
+    local f = io.open(path, "r")
+    local last = f and tonumber(f:read("*l") or "")
+    if f then
+        f:close()
+    end
+    if last == stamp then
+        os.remove(path)
+    end
 end
 
 -- Whether the 'nft list set' output of a set lists the address as an element of its own, with
@@ -866,8 +881,9 @@ end
 -- of the filter has the server, 'busy' or 'limit' (sample_allowed).
 -- The server must be one of the filter's, so the page pings no other host. LuCI's Diagnostics
 -- page already pings any host, so this keeps the window to its purpose; it is no security
--- boundary. 'nft list set' reads one set (1-2 ms each); 'nft get element' would load the whole
--- ruleset, about 80 ms per call
+-- boundary. 'nft list set' reads one set, but its cost grows with the set: about 2 ms of CPU
+-- for an empty one, 25 ms at 2000 and 185 ms at 20000 elements with counters (Intel N100).
+-- So the reservation comes first, and a 'busy' or 'limit' reply lists no set
 local function get_server_sample(args)
     args = type(args) == "table" and args or {}
     local ip, prefix = args.ip, filter_set_name(args.filter)
@@ -879,6 +895,10 @@ local function get_server_sample(args)
     if tonumber(first) == 100 and tonumber(second) >= 64 and tonumber(second) <= 127 then
         return { error = "invalid" }
     end
+    local ok, reason, stamp = reserve_sample(ip)
+    if not ok then
+        return { error = reason }
+    end
 
     -- Read one after the other, each to its end (see get_ui_dynamic_ips)
     local dynamic = nft_list_set(prefix .. "_dynamic")
@@ -888,11 +908,8 @@ local function get_server_sample(args)
     local rx_packets, rx_bytes = element_counter(rx_listing, ip)
     if not (tx_packets or rx_packets or set_lists(dynamic, ip)
             or set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)) then
+        release_sample(ip, stamp)
         return { error = "unknown" }
-    end
-    local ok, reason = reserve_sample(ip)
-    if not ok then
-        return { error = reason }
     end
 
     local reply = { t = t, ping = "off" }
