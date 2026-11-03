@@ -935,10 +935,13 @@ local ROUTE_REDISCOVER = 60
 local ROUTE_HINT_AGE = 180
 -- A reply counts within ROUTE_WAIT s of its probe, so hops and servers beyond 200 ms count
 -- too. The search sends ROUTE_BATCH TTLs at once; a refresh sends its second probe when the
--- first has no reply after ROUTE_RETRY s
+-- first has no reply after ROUTE_RETRY s. Every TTL of a batch from the server's hop on
+-- reaches the server, so a near one gets up to 8 echo requests per search. Echoes can arrive
+-- out of order: after the first, the lower TTLs of the batch have ROUTE_GRACE s to answer
 local ROUTE_WAIT = 1.2
 local ROUTE_BATCH = 8
 local ROUTE_RETRY = 0.5
+local ROUTE_GRACE = 0.05
 
 local function route_uptime()
     local f = io.open("/proc/uptime", "r")
@@ -1087,6 +1090,18 @@ local function measure_route(ip, hint)
                 collect(clock() + ROUTE_WAIT, function()
                     return best and (best.endpoint or best.ttl >= last)
                 end)
+                -- The server's hop is the lowest TTL with an echo: wait up to ROUTE_GRACE s while
+                -- a lower TTL of the batch has no reply yet
+                if best and best.endpoint then
+                    collect(clock() + ROUTE_GRACE, function()
+                        for _, probe in pairs(probes) do
+                            if probe.ttl >= first and probe.ttl < best.ttl and not probe.answered then
+                                return false
+                            end
+                        end
+                        return true
+                    end)
+                end
                 if fault or clock() >= deadline or (best and best.endpoint) then break end
             end
         else
