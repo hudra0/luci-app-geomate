@@ -1738,19 +1738,23 @@ return view.extend({
             #geomate-overview { container: gm-overview / inline-size; margin-top: 12px; }
             .gm-overview-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: 12px; align-items: stretch; }
             .gm-overview--single .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
-            /* The map is shorter while the connections are shown; a taller server panel beside it
-               stretches the map instead of leaving a gap below it */
+            /* The map is shorter while the connections are shown, and on phones; a taller server
+               panel beside it stretches the map instead of leaving a gap below it */
             #geomate-map-container { margin: 0; min-width: 0; display: flex; flex-direction: column; }
             .gm-map-frame { display: block; flex: 1 0 auto; width: 100%; height: 80vh; border: 0; }
             .gm-map-frame.gm-map-frame--short { height: 600px; height: min(600px, 80vh); }
+            @media (max-width: 767px) {
+                .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+            }
+            /* Narrow: the server panel goes below the map, which gets shorter while the panel shows */
             @container gm-overview (max-width: 900px) {
                 .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
-                .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+                #geomate-overview:not(.gm-overview--single) .gm-map-frame { height: 60vh; }
             }
             @supports not (container-type: inline-size) {
                 @media (max-width: 1100px) {
                     .gm-overview-grid { grid-template-columns: minmax(0, 1fr); }
-                    .gm-map-frame, .gm-map-frame.gm-map-frame--short { height: 60vh; }
+                    #geomate-overview:not(.gm-overview--single) .gm-map-frame { height: 60vh; }
                 }
             }
             /* Fullscreen: the map covers the window. An ancestor with its own z-index (Argon's
