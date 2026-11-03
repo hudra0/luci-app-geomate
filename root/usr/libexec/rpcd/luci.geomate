@@ -1133,9 +1133,11 @@ local function get_server_route(args)
     if tonumber(first) == 100 and tonumber(second) >= 64 and tonumber(second) <= 127 then
         return { error = "invalid_target" }
     end
-    if not (set_lists(nft_list_set(prefix .. "_dynamic"), ip)
-            or set_lists(nft_list_set(prefix .. "_rx"), ip)
-            or set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)) then
+    -- _ui_dynamic first: it holds the servers of the last 10 s, _dynamic and _rx those of the
+    -- last hour, which can be tens of thousands. Each listing is read to its end before the next
+    if not (set_lists(nft_list_set(prefix .. "_ui_dynamic"), ip)
+            or set_lists(nft_list_set(prefix .. "_dynamic"), ip)
+            or set_lists(nft_list_set(prefix .. "_rx"), ip)) then
         return { error = "unknown_target" }
     end
     require("nixio.fs").mkdirr(ROUTE_DIR)
