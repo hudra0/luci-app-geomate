@@ -779,9 +779,16 @@ var COLUMN_IP = 0, COLUMN_COUNTRY = 3, COLUMN_SEEN = 6, COLUMN_TRAFFIC = 7;
 // newest, traffic from the current rate, then the packet total
 var SORT_CHOICES = [ [ COLUMN_SEEN, false ], [ COLUMN_TRAFFIC, true ], [ COLUMN_IP, false ], [ COLUMN_COUNTRY, false ] ];
 
-// Sorted by traffic, the rows keep their order while the mouse is over the table or the focus is
-// in it, and for CONNECTIONS_TOUCH_HOLD ms after a touch on it (connectionsHeld)
+// Sorted by traffic, the rows keep their order while the mouse is over the table or the keyboard
+// focus is in it, and for CONNECTIONS_TOUCH_HOLD ms after a touch on it (connectionsHeld)
 var CONNECTIONS_TOUCH_HOLD = 5 * 1000;
+
+// The focus of el shows (:focus-visible), as after Tab, unlike the focus a mouse click leaves on a
+// link or button, or a focus() call after one (closeServerPanel). true in a browser without
+// :focus-visible
+function focusVisible(el) {
+    try { return el.matches(':focus-visible'); } catch (e) { return true; }
+}
 
 // The packet rate of a server is taken over the replies of the last RATE_WINDOW ms, once they
 // span RATE_MIN_SPAN ms. The rate the table sorts by follows it only when the two differ by more
@@ -2159,13 +2166,14 @@ return view.extend({
 
     // The rows sorted by traffic keep their order while a mouse is over the table (a touch has no
     // hover: :hover can stay on the last touched element), for CONNECTIONS_TOUCH_HOLD ms after a
-    // touch on it, or while the focus is in it. A Block or Allow button then stays under the
+    // touch on it, or while the keyboard focus is in it (focusVisible: not the focus that Close
+    // with the mouse puts on the selected IP). A Block or Allow button then stays under the
     // pointer although the rates change
     connectionsHeld: function() {
-        var wrap = this.nodes && this.nodes.connectionsWrap;
+        var wrap = this.nodes && this.nodes.connectionsWrap, focus = document.activeElement;
 
         return !!wrap && ((this.connectionsHover && wrap.matches(':hover')) || this.touchTimer != null ||
-            wrap.contains(document.activeElement));
+            (wrap.contains(focus) && focusVisible(focus)));
     },
 
     // Pointer and focus events of the table box (renderConnections). When the mouse leaves, the
