@@ -908,13 +908,13 @@ function searchText(conn) {
 
 // Selected server (openServerDetails): one getServerSample request per DETAILS_INTERVAL
 // ms while it is open and the tab is visible, the next only after the reply and, after a slow
-// reply, twice its time after the request (sampleDetails). The graphs show the last
-// DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
-// give no rate, and the lines break there. The figures take the last DETAILS_STATS rates. After
-// DETAILS_SESSION ms the panel pauses until Resume, so a forgotten panel does not sample and
-// ping for hours. While other servers use up the router's limit (sample 'limit'), it asks again
-// every DETAILS_LIMIT_RETRY ms. Ping stops after PING_GIVE_UP timeouts in a row, or after
-// PING_GIVE_UP_LATER once the server has answered
+// reply, twice its time after the request, at most DETAILS_MAX_GAP after the reply
+// (sampleDetails). The graphs show the last DETAILS_SPAN ms. Two samples further apart than
+// DETAILS_MAX_GAP (hidden tab, slow reply) give no rate, and the lines break there. The figures
+// take the last DETAILS_STATS rates. After DETAILS_SESSION ms the panel pauses until Resume, so
+// a forgotten panel does not sample and ping for hours. While other servers use up the router's
+// limit (sample 'limit'), it asks again every DETAILS_LIMIT_RETRY ms. Ping stops after
+// PING_GIVE_UP timeouts in a row, or after PING_GIVE_UP_LATER once the server has answered
 var DETAILS_INTERVAL = 1000,
     DETAILS_SPAN = 180 * 1000,
     DETAILS_MAX_GAP = 5000,
@@ -4474,9 +4474,12 @@ return view.extend({
 
     // One sample of the selected server, then the next DETAILS_INTERVAL ms after this one was sent
     // (d.wait), never two at a time. A reply that took longer than half of that delays the next
-    // request to twice its time after this one was sent, so a slow router (a large _dynamic set)
-    // is not asked again at once. Nothing while the tab is hidden (handleVisibilityChange starts
-    // again) or LuCI's auto refresh is paused; samples stop when the panel is collapsed or removed
+    // request to twice its time after this one was sent, at most DETAILS_MAX_GAP after the reply:
+    // a slow router (a large _dynamic set) is not asked again at once, and a request that failed
+    // after LuCI's 20 s timeout or a reply after the PC slept does not hold back the next sample
+    // (and the pause after DETAILS_SESSION) as long. Nothing while the tab is hidden
+    // (handleVisibilityChange starts again) or LuCI's auto refresh is paused; samples stop when
+    // the panel is collapsed or removed
     sampleDetails: function() {
         var self = this, d = this.details, sent, epoch;
 
@@ -4524,7 +4527,8 @@ return view.extend({
             self.sampleServerRoute(d, false);
             if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden) {
                 took = performance.now() - sent;
-                d.timer = window.setTimeout(L.bind(self.sampleDetails, self), Math.max(d.wait, 2 * took) - took);
+                d.timer = window.setTimeout(L.bind(self.sampleDetails, self),
+                    Math.min(Math.max(d.wait, 2 * took) - took, DETAILS_MAX_GAP));
             }
         });
     },
