@@ -911,7 +911,7 @@ function searchText(conn) {
 // reply, twice its time after the request (sampleDetails). The graphs show the last
 // DETAILS_SPAN ms. Two samples further apart than DETAILS_MAX_GAP (hidden tab, slow reply)
 // give no rate, and the lines break there. The figures take the last DETAILS_STATS rates. After
-// DETAILS_SESSION ms the window pauses until Continue, so a forgotten window does not sample and
+// DETAILS_SESSION ms the panel pauses until Resume, so a forgotten panel does not sample and
 // ping for hours. While other servers use up the router's limit (sample 'limit'), it asks again
 // every DETAILS_LIMIT_RETRY ms. Ping stops after PING_GIVE_UP timeouts in a row, or after
 // PING_GIVE_UP_LATER once the server has answered
@@ -4295,7 +4295,7 @@ return view.extend({
         this.showDetails();
     },
 
-    // Continue after the pause of DETAILS_SESSION
+    // Resume after Pause or after the pause of DETAILS_SESSION
     continueDetails: function(d) {
         if (this.details !== d || d.stopped)
             return;
