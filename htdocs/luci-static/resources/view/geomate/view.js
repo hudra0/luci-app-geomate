@@ -3997,14 +3997,14 @@ return view.extend({
         }, [ r.ip ]);
     },
 
-    // Persistent server panel beside the map; its host stays in place across selections.
+    // Persistent server panel beside the map; its host stays in place across selections. Hidden
+    // while no server is selected (openServerDetails, closeDetails)
     renderServerPanel: function() {
         var n = this.nodes;
 
         n.serverTitle = E('h3', { 'class': 'gm-server-title' }, [ _('Server') ]);
         n.serverToggle = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'aria-controls': 'gm-server-body', 'aria-expanded': 'true', 'hidden': '', 'click': L.bind(this.toggleServerPanel, this) }, [ _('Hide') ]);
         n.serverClose = E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': L.bind(this.closeServerPanel, this) }, [ _('Close') ]);
-        n.serverEmpty = E('p', { 'class': 'gm-server-empty' }, [ _('Select a server') ]);
         n.serverBody = E('div', { 'id': 'gm-server-body', 'class': 'gm-server-body' });
         n.serverPanel = E('section', { 'id': 'gm-server-panel', 'class': 'cbi-section gm-details', 'tabindex': '-1', 'aria-labelledby': 'gm-server-title' }, [
             E('style', {}, `
@@ -4014,7 +4014,6 @@ return view.extend({
                 .gm-server-collapsed .gm-server-heading { margin-bottom: 0; }
                 .gm-details .gm-server-title { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
                 .gm-server-heading .cbi-button { flex: none; margin: 0; }
-                .gm-server-empty { margin: 28px 0; opacity: 0.65; }
                 .gm-server-head { display: flex; align-items: flex-start; gap: 8px; }
                 .gm-server-meta { flex: 1; min-width: 0; }
                 .gm-server-meta .gm-status { margin-bottom: 4px; }
@@ -4062,7 +4061,7 @@ return view.extend({
                     .gm-details .gm-chart { height: 110px; }
                     .gm-packets .gm-chart { height: 65px; }
                 }
-            `), E('div', { 'class': 'gm-server-heading' }, [ n.serverTitle, n.serverToggle, n.serverClose ]), n.serverEmpty, n.serverBody
+            `), E('div', { 'class': 'gm-server-heading' }, [ n.serverTitle, n.serverToggle, n.serverClose ]), n.serverBody
         ]);
         n.serverTitle.id = 'gm-server-title';
         n.serverPanel.hidden = true;
@@ -4112,12 +4111,7 @@ return view.extend({
         var n = this.nodes, target = n.connections && n.connections.open && n.connectionsWrap &&
             n.connectionsWrap.querySelector('.gm-server-link[aria-current="true"]');
 
-        if (this.details)
-            this.closeDetails();
-        else {
-            n.serverPanel.hidden = true;
-            this.updateServerPanelLayout();
-        }
+        this.closeDetails();
         target = target || n.frame;
         if (target)
             target.focus({ preventScroll: true });
@@ -4238,7 +4232,6 @@ return view.extend({
         n.countsHint.hidden = !n.countsHint.textContent;
         this.nodes.serverTitle.textContent = ip;
         this.nodes.serverPanel.hidden = false;
-        this.nodes.serverEmpty.hidden = true;
         this.nodes.serverBody.appendChild(d.root);
         this.updateServerPanelLayout();
         this.showDetailsHead();
@@ -4273,8 +4266,7 @@ return view.extend({
         window.clearTimeout(d.timer);
         if (d.root && d.root.parentNode)
             d.root.parentNode.removeChild(d.root);
-        if (this.nodes && this.nodes.serverEmpty) {
-            this.nodes.serverEmpty.hidden = false;
+        if (this.nodes && this.nodes.serverPanel) {
             this.nodes.serverTitle.textContent = _('Server');
             this.nodes.serverPanel.hidden = true;
             this.updateServerPanelLayout();
