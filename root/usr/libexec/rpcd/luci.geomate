@@ -843,7 +843,8 @@ local function set_lists(listing, ip)
 end
 
 -- One ICMP echo, as LuCI's Diagnostics page sends it: the round trip in ms, nil without a reply
--- within 1 s. The address is a checked dotted quad
+-- within 1 s. The address is a checked dotted quad. BusyBox prints 'min/avg/max = a/b/c ms',
+-- iputils 'min/avg/max/mdev = a/b/c/d ms'
 local function ping_rtt(ip)
     local handle = io.popen("ping -c1 -W1 -q '" .. ip .. "' 2>/dev/null")
     if not handle then
@@ -851,7 +852,7 @@ local function ping_rtt(ip)
     end
     local out = handle:read("*a") or ""
     handle:close()
-    return tonumber(out:match("min/avg/max = [%d%.]+/([%d%.]+)/"))
+    return tonumber(out:match("min/avg/max%S* = [%d%.]+/([%d%.]+)/"))
 end
 
 -- getServerSample: the counters of one server of a filter for the details window, polled once
