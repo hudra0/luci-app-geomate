@@ -1241,6 +1241,7 @@ return view.extend({
     touchTimer: null,       // timer of the hold after a touch on the table (connectionsHeld)
     connectionsQuery: '',   // text of the search field, lowercase
     withCounters: false,    // the backend counts packets per server (set_counters), as the last status reply said
+    lastStatus: null,       // the last getStatus reply that arrived; this.status is null after a failed one
     backendPid: undefined,  // PID of the last status reply (null: not running, undefined: no reply yet)
     backendRuns: 0,         // PID changes since the page was loaded: each restart counts from 0 again
     configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
@@ -2531,6 +2532,7 @@ return view.extend({
                 if (r[0]) {
                     var pid = r[0].pid || null, blocks = hasCapability(r[0], 'blocked_ip');
 
+                    self.lastStatus = r[0];
                     self.withCounters = hasCapability(r[0], 'set_counters');
                     // The table offers Block and Unblock from now on, or no longer
                     if (blocks !== self.blocksIps) {
@@ -4126,10 +4128,12 @@ return view.extend({
         });
     },
 
-    // Select one server for the persistent panel. Repeated selection keeps its history.
+    // Select one server for the persistent panel. Repeated selection keeps its history. The packet
+    // counters it shows come from the capabilities of the last status reply, also when the latest
+    // poll failed
     openServerDetails: function(filter, ip) {
         var mode = this.statusMode() || uci.get('geomate', 'global', 'operational_mode') || 'dynamic',
-            counts = mode !== 'static', d, n;
+            counts = mode !== 'static', st = this.status || this.lastStatus, d, n;
 
         if (this.detailsOff)
             return notify(_('Server measurements unavailable. Reload the page.'));
@@ -4146,8 +4150,8 @@ return view.extend({
 
         d = this.details = {
             ip: ip, filter: filter,
-            rx: counts && hasCapability(this.status, 'rx_counters'),
-            tx: counts && hasCapability(this.status, 'set_counters'),
+            rx: counts && hasCapability(st, 'rx_counters'),
+            tx: counts && hasCapability(st, 'set_counters'),
             ping: true, pingFails: 0, pingReplied: false, currentRtt: null, pingTimeout: false,
             last: null, points: [], state: '', manualPause: false,
             started: performance.now(), wait: DETAILS_INTERVAL, failures: 0,
