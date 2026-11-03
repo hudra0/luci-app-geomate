@@ -773,10 +773,17 @@ var COLUMN_IP = 0, COLUMN_COUNTRY = 3, COLUMN_SEEN = 6, COLUMN_TRAFFIC = 7;
 // newest, traffic from the current rate, then the packet total
 var SORT_CHOICES = [ [ COLUMN_SEEN, false ], [ COLUMN_TRAFFIC, true ], [ COLUMN_IP, false ], [ COLUMN_COUNTRY, false ] ];
 
+// Sorted by traffic, the rows keep their order while the mouse is over the table or the focus is
+// in it, and for CONNECTIONS_TOUCH_HOLD ms after a touch on it (connectionsHeld)
+var CONNECTIONS_TOUCH_HOLD = 5 * 1000;
+
 // The packet rate of a server is taken over the replies of the last RATE_WINDOW ms, once they
-// span RATE_MIN_SPAN ms
+// span RATE_MIN_SPAN ms. The rate the table sorts by follows it only when the two differ by more
+// than RATE_SORT_BAND of the sorted one (trafficOf), so servers with near-equal rates keep their
+// order
 var RATE_WINDOW = 20 * 1000,
-    RATE_MIN_SPAN = 4 * 1000;
+    RATE_MIN_SPAN = 4 * 1000,
+    RATE_SORT_BAND = 0.1;
 
 // A packet or byte count of luci.geomate: a whole number from 0 on
 function isCount(n) {
@@ -785,18 +792,24 @@ function isCount(n) {
 
 // Counters of a server in a reply (packets and bytes its filter's _dynamic set counted), with
 // its earlier ones from the same run of Geomate (prev, recordRecent) for the rate: { packets,
-// bytes, samples: [ [ time, packets ], … ] }. Without prev (another run, see recordRecent), or
-// with a smaller count than before (the set was built again), the samples start over. A sample
-// from after now (the clock was set back) is dropped. null when the reply has none
+// bytes, samples: [ [ time, packets ], … ], sortRate }. Without prev (another run, see
+// recordRecent), or with a smaller count than before (the set was built again), the samples start
+// over. A sample from after now (the clock was set back) is dropped. sortRate: the rate of the
+// samples, or prev's sortRate while the rate stays within RATE_SORT_BAND of it; null without a
+// rate. null when the reply has none
 function trafficOf(prev, conn, now) {
-    var samples = [];
+    var samples = [], t, rate;
 
     if (!isCount(conn.packets) || !isCount(conn.bytes))
         return null;
     if (prev && conn.packets >= prev.packets)
         samples = prev.samples.filter(function(s) { return s[0] < now && now - s[0] <= RATE_WINDOW; });
     samples.push([ now, conn.packets ]);
-    return { packets: conn.packets, bytes: conn.bytes, samples: samples };
+    t = { packets: conn.packets, bytes: conn.bytes, samples: samples };
+    rate = trafficRate(t);
+    t.sortRate = (rate != null && prev && prev.sortRate != null &&
+        Math.abs(rate - prev.sortRate) <= RATE_SORT_BAND * prev.sortRate) ? prev.sortRate : rate;
+    return t;
 }
 
 // Packets per second of trafficOf() samples, null while they span less than RATE_MIN_SPAN or
@@ -807,12 +820,13 @@ function trafficRate(t) {
     return (first && last[0] - first[0] >= RATE_MIN_SPAN) ? (last[1] - first[1]) * 1000 / (last[0] - first[0]) : null;
 }
 
-// Traffic column sort key, fixed width so a string compare matches the numeric order. Current
-// packets per second (hundredths) come first, the packet total breaks ties. A past row and a live
-// row that has no rate yet sort as 0 pkt/s, so a quiet history stays below anything still sending
+// Traffic column sort key, fixed width so a string compare matches the numeric order. The sort
+// rate of trafficOf() (counters without one: the current rate) in hundredths of packets per
+// second comes first, the packet total breaks ties. A past row and a live row that has no rate
+// yet sort as 0 pkt/s, so a quiet history stays below anything still sending
 function trafficSortValue(rec, live) {
     var t = rec && rec.traffic,
-        rate = (t && live) ? trafficRate(t) : null,
+        rate = (t && live) ? ((t.sortRate !== undefined) ? t.sortRate : trafficRate(t)) : null,
         pps = (rate == null || rate < 0) ? 0 : Math.min(rate, 99999999.99),
         packets = t ? Math.min(t.packets, 999999999999) : 0;
 
@@ -845,9 +859,10 @@ function rateText(rate) {
 // packets in total of a past row and of a live row before its rate is known, '–' without counters
 // (older backend, static mode, a row an older view stored without them). The packets count those
 // the devices of the filter sent to the server since its first packet after the last service
-// start or after an hour without one. data-value is trafficSortValue(), what the column sorts by.
+// start or after an hour without one. data-value is sortValue, what the column sorts by
+// (trafficSortValue, or the place of the row while its order is held: updateActiveConnectionsList).
 // The tooltip adds the bytes, the average packet size and how long this page has seen the server
-function showTraffic(node, rec, live) {
+function showTraffic(node, rec, live, sortValue) {
     var t = rec && rec.traffic,
         rate = (t && live) ? trafficRate(t) : null,
         secs = (rec && rec.firstSeen) ? Math.round((rec.lastSeen - rec.firstSeen) / 1000) : 0,
@@ -868,7 +883,7 @@ function showTraffic(node, rec, live) {
         node.textContent = text;
     node.classList.toggle('gm-traffic--none', !t);
     node.classList.toggle('gm-traffic--past', !live);
-    node.setAttribute('data-value', trafficSortValue(rec, live));
+    node.setAttribute('data-value', sortValue);
     if (title.length)
         node.setAttribute('title', title.join('\n'));
     else
@@ -1220,6 +1235,9 @@ return view.extend({
     recentSaved: null,      // recent list as last written to sessionStorage, as JSON
     recentSavedAt: 0,       // time of the last write
     seenCells: [],          // Last seen and Traffic cells of the table: [{ node, lastSeen, traffic }], updated in place
+    trafficShown: null,     // sorted by traffic: the place of each row in the table from 0, { 'filter\0ip': place }
+    connectionsHover: false,    // a mouse is over the table (connectionsHeld)
+    touchTimer: null,       // timer of the hold after a touch on the table (connectionsHeld)
     connectionsQuery: '',   // text of the search field, lowercase
     withCounters: false,    // the backend counts packets per server (set_counters), as the last status reply said
     backendPid: undefined,  // PID of the last status reply (null: not running, undefined: no reply yet)
@@ -2112,10 +2130,55 @@ return view.extend({
                 n.connectionsSearch,
                 E('label', { 'class': 'gm-connections-sort' }, [ _('Sort by'), n.connectionsSort ])
             ]),
-            n.connectionsWrap = E('div', { 'class': 'gm-connections-wrap', 'id': 'gm-connections-wrap' }, [ this.connectionsTable.render() ])
+            n.connectionsWrap = E('div', {
+                'class': 'gm-connections-wrap',
+                'id': 'gm-connections-wrap',
+                'pointerenter': L.bind(this.holdConnections, this),
+                'pointerleave': L.bind(this.holdConnections, this),
+                'pointerdown': L.bind(this.holdConnections, this),
+                'focusout': L.bind(this.holdConnections, this)
+            }, [ this.connectionsTable.render() ])
         ]);
 
         return n.connections;
+    },
+
+    // The rows sorted by traffic keep their order while a mouse is over the table (a touch has no
+    // hover: :hover can stay on the last touched element), for CONNECTIONS_TOUCH_HOLD ms after a
+    // touch on it, or while the focus is in it. A Block or Allow button then stays under the
+    // pointer although the rates change
+    connectionsHeld: function() {
+        var wrap = this.nodes && this.nodes.connectionsWrap;
+
+        return !!wrap && ((this.connectionsHover && wrap.matches(':hover')) || this.touchTimer != null ||
+            wrap.contains(document.activeElement));
+    },
+
+    // Pointer and focus events of the table box (renderConnections). When the mouse leaves, the
+    // touch hold ends or the focus has left (looked at after focusout, once it moved on), the rows
+    // take the current order
+    holdConnections: function(ev) {
+        var self = this, touch = ev.pointerType === 'touch';
+        var release = function() {
+            if (!self.connectionsHeld())
+                self.updateActiveConnectionsList();
+        };
+
+        if (ev.type === 'pointerdown' && touch) {
+            window.clearTimeout(this.touchTimer);
+            this.touchTimer = window.setTimeout(function() {
+                self.touchTimer = null;
+                release();
+            }, CONNECTIONS_TOUCH_HOLD);
+        }
+        else if ((ev.type === 'pointerenter' || ev.type === 'pointerleave') && !touch) {
+            this.connectionsHover = ev.type === 'pointerenter';
+            if (!this.connectionsHover)
+                release();
+        }
+        else if (ev.type === 'focusout') {
+            window.setTimeout(release, 0);
+        }
     },
 
     // Sort the connections by a column of SORT_CHOICES (the "Sort by" select), as a click on its
@@ -2133,8 +2196,10 @@ return view.extend({
 
     // After ui.Table sorted the shown rows anew. Sorted by traffic, the key of the last update
     // holds the order of the rows: a changed one rebuilds the table now, while the pointer is on
-    // a column title or the select, not under a button at the next poll
+    // a column title or the select, not under a button at the next poll. The rows take the current
+    // values, also while the order is held (connectionsHeld), which keeps it from then on
     connectionsSorted: function() {
+        this.trafficShown = null;
         this.updateActiveConnectionsList();
         this.showSortChoice();
         this.updateSelectedConnection();
@@ -3722,7 +3787,9 @@ return view.extend({
     // comes from the configuration (connectionAction). The table is rebuilt only when a row
     // changed: ui.Table replaces every row, and with it a button under the pointer. The Last seen
     // and Traffic cells change in place; sorted by traffic, the table is rebuilt when the order of
-    // the packets changes. Until the first reply the table keeps saying it loads, or that the
+    // the sort values (trafficSortValue: the rate, then the packets) changes. While the order is
+    // held (connectionsHeld) each row keeps its place and a new row goes last, so rows only move
+    // once nothing holds them. Until the first reply the table keeps saying it loads, or that the
     // list is unavailable
     updateActiveConnectionsList: function() {
         var self = this, table = this.connectionsTable, recent = this.recent, now = Date.now();
@@ -3781,23 +3848,44 @@ return view.extend({
             };
         });
         var placeholder = (all.length && !entries.length) ? _('No matching connections') : null;
-        var sorting = table.getActiveSortState();
+        var sorting = table.getActiveSortState(),
+            byTraffic = !!sorting && sorting[0] === COLUMN_TRAFFIC,
+            held = byTraffic && this.trafficShown != null && this.connectionsHeld(),
+            places = held ? this.trafficShown : {},
+            next = Object.keys(places).length,
+            order;
         var key = JSON.stringify([ rows, placeholder ]);
 
+        // The Traffic sort value of each row. Live means a fresh reply, as showTraffic. Held: the
+        // place the row had in the table, a new row after the others; no two rows tie
+        var sortValues = entries.map(function(e) {
+            var id = recentKey(e.conn);
+
+            if (!held)
+                return trafficSortValue(e.rec, e.lastSeen == null);
+            if (places[id] == null)
+                places[id] = next++;
+            return ('000000' + (sorting[1] ? 999999 - places[id] : places[id])).slice(-6);
+        });
+
         // The order ui.Table gives the rows: descending negates the comparison, equal keys
-        // keep the order of the rows (stable sort). Live means a fresh reply, as showTraffic
-        if (sorting && sorting[0] === COLUMN_TRAFFIC)
-            key += JSON.stringify(entries.map(function(e, i) { return i; }).sort(function(a, b) {
-                var ka = trafficSortValue(entries[a].rec, entries[a].lastSeen == null),
-                    kb = trafficSortValue(entries[b].rec, entries[b].lastSeen == null);
+        // keep the order of the rows (stable sort)
+        if (byTraffic) {
+            order = entries.map(function(e, i) { return i; }).sort(function(a, b) {
+                var ka = sortValues[a], kb = sortValues[b];
                 return (sorting[1] ? -1 : 1) * (ka < kb ? -1 : ka > kb ? 1 : 0) || (a - b);
-            }));
+            });
+            key += JSON.stringify(order);
+            if (!held)
+                order.forEach(function(i, place) { places[recentKey(entries[i].conn)] = place; });
+        }
+        this.trafficShown = byTraffic ? places : null;
 
         if (key === this.connectionsKey) {
             this.seenCells.forEach(function(c, i) {
                 c.lastSeen = entries[i].lastSeen;
                 showSeen(c.node, c.lastSeen, now);
-                showTraffic(c.traffic, entries[i].rec, !rows[i].past);
+                showTraffic(c.traffic, entries[i].rec, !rows[i].past, sortValues[i]);
             });
             return;
         }
@@ -3817,7 +3905,7 @@ return view.extend({
             if (status[2])
                 attrs.title = status[2];
             showSeen(seen.node, seen.lastSeen, now);
-            showTraffic(seen.traffic, entries[i].rec, !r.past);
+            showTraffic(seen.traffic, entries[i].rec, !r.past, sortValues[i]);
             self.seenCells.push(seen);
 
             // Every cell is an element: names and provider strings never run as markup
