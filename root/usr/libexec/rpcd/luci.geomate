@@ -883,7 +883,8 @@ end
 -- page already pings any host, so this keeps the window to its purpose; it is no security
 -- boundary. 'nft list set' reads one set, but its cost grows with the set: about 2 ms of CPU
 -- for an empty one, 25 ms at 2000 and 185 ms at 20000 elements with counters (Intel N100).
--- So the reservation comes first, and a 'busy' or 'limit' reply lists no set
+-- 'nft get element' would load the whole ruleset, 85 ms per call with 14700 allowed and
+-- blocked IPs. So the reservation comes first, and a 'busy' or 'limit' reply lists no set
 local function get_server_sample(args)
     args = type(args) == "table" and args or {}
     local ip, prefix = args.ip, filter_set_name(args.filter)
