@@ -541,6 +541,15 @@ function listPath(opt, sid) {
     return error ? null : path;
 }
 
+// Fill in the IP List File field and check it again: setValue does not, so a field marked
+// invalid before would keep its red border and error tooltip until the next keyup, blur or Save
+function setListPath(map, sid, path) {
+    var widget = map.lookupOption('ip_list', sid)[0].getUIElement(sid);
+
+    widget.setValue(path);
+    widget.triggerValidation();
+}
+
 // The message for an IP list path that names a directory, such as /etc/geomate.d/runtime
 function directoryError(path) {
     return _('%s is a directory, not an IP list file.').format(path);
@@ -556,7 +565,7 @@ function uploadList(opt, sid, path, file) {
         return file.text().then(function(text) {
             return fs.write(path, text);
         }).then(function() {
-            opt.map.lookupOption('ip_list', sid)[0].getUIElement(sid).setValue(path);
+            setListPath(opt.map, sid, path);
             dom.content(status, [ _('Uploaded %s to %s.').format(file.name, path) ]);
         }).catch(function(err) {
             dom.content(status, [ _('Failed to upload file: %s').format(errorText(err)) ]);
@@ -1203,7 +1212,7 @@ return view.extend({
             if (!name)
                 return dom.content(this.status, [ _('Please specify a filter name first.') ]);
 
-            this.map.lookupOption('ip_list', section_id)[0].getUIElement(section_id).setValue(ipListPath(name));
+            setListPath(this.map, section_id, ipListPath(name));
             dom.content(this.status, [ _('Geomate creates a missing file at its next start.') ]);
         };
 
