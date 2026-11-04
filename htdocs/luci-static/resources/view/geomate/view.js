@@ -915,9 +915,8 @@ function searchText(conn) {
 
 // Selected server (openServerDetails): one getServerSample request per DETAILS_INTERVAL
 // ms while it is open and the tab is visible, the next only after the reply and, after a slow
-// reply, twice its time after the request, at most DETAILS_MAX_GAP after the reply
-// (sampleDetails). The graphs show the last DETAILS_SPAN ms. Two samples further apart than
-// DETAILS_MAX_GAP (hidden tab, slow reply) give no rate, and the lines break there. The figures
+// reply, later (sampleDelay). The graphs show the last DETAILS_SPAN ms. Two samples further
+// apart than DETAILS_MAX_GAP (hidden tab, slow reply) give no rate, and the lines break there. The figures
 // take the last DETAILS_STATS rates. After DETAILS_SESSION ms the panel pauses until Resume, so
 // a forgotten panel does not sample and ping for hours. While other servers use up the router's
 // limit (sample 'limit'), it asks again every DETAILS_LIMIT_RETRY ms. Ping stops after
@@ -925,14 +924,31 @@ function searchText(conn) {
 var DETAILS_INTERVAL = 1000,
     DETAILS_SPAN = 180 * 1000,
     DETAILS_MAX_GAP = 5000,
+    DETAILS_RATE_GAP = 4000,
     DETAILS_STATS = 10,
     DETAILS_SESSION = 10 * 60 * 1000,
     DETAILS_LIMIT_RETRY = 3000,
     PING_GIVE_UP = 3,
     PING_GIVE_UP_LATER = 10,
+    PING_WAIT = 1000,
     ROUTE_INTERVAL = 2000,
     ROUTE_STALE = 10000,
     ROUTE_GRAPH_GAP = 20000;
+
+// ms from a getServerSample reply to the next request, for a reply that took 'took' ms. At
+// normal speed the requests are 'wait' ms apart. A slow router (a large _dynamic set) gets a
+// pause about as long as its own share of the time, but the next request still goes out within
+// DETAILS_RATE_GAP of this one, so the two samples still give a rate (samplePoint). A ping that
+// timed out (pingTimedOut) spent PING_WAIT of 'took' waiting (ping -W1), which says nothing about
+// the router's load. After a reply slower than DETAILS_RATE_GAP (a failure after LuCI's 20 s
+// timeout, a reply after the PC slept) at most DETAILS_MAX_GAP
+function sampleDelay(wait, took, pingTimedOut) {
+    var work = Math.max(0, took - (pingTimedOut ? PING_WAIT : 0));
+
+    if (took >= DETAILS_RATE_GAP)
+        return Math.min(work, DETAILS_MAX_GAP);
+    return Math.max(0, Math.min(Math.max(wait, took + work), DETAILS_RATE_GAP) - took);
+}
 
 // Packets per second between two counter readings of getServerSample ({ packets, bytes }) dt ms
 // apart: { pps, packets, bytes } with the counts in between. null when one is missing or a count
@@ -4481,15 +4497,11 @@ return view.extend({
     },
 
     // One sample of the selected server, then the next DETAILS_INTERVAL ms after this one was sent
-    // (d.wait), never two at a time. A reply that took longer than half of that delays the next
-    // request to twice its time after this one was sent, at most DETAILS_MAX_GAP after the reply:
-    // a slow router (a large _dynamic set) is not asked again at once, and a request that failed
-    // after LuCI's 20 s timeout or a reply after the PC slept does not hold back the next sample
-    // (and the pause after DETAILS_SESSION) as long. Nothing while the tab is hidden
-    // (handleVisibilityChange starts again) or LuCI's auto refresh is paused; samples stop when
-    // the panel is collapsed or removed
+    // (d.wait), never two at a time; after a slow reply later (sampleDelay). Nothing while the
+    // tab is hidden (handleVisibilityChange starts again) or LuCI's auto refresh is paused;
+    // samples stop when the panel is collapsed or removed
     sampleDetails: function() {
-        var self = this, d = this.details, sent, epoch;
+        var self = this, d = this.details, sent, epoch, pinged, pingTimedOut = false;
 
         if (!d || d.busy || d.stopped || d.collapsed)
             return;
@@ -4519,7 +4531,9 @@ return view.extend({
         this.sampleServerRoute(d, false);
         epoch = d.sampleEpoch;
         sent = performance.now();
+        pinged = d.ping;
         callServerSample(d.filter, d.ip, d.ping).then(function(reply) {
+            pingTimedOut = pinged && L.isObject(reply) && reply.ping === 'timeout';
             if (self.details === d && epoch === d.sampleEpoch && !d.stopped && !d.collapsed && d.state !== 'paused' && self.detailsShown(d))
                 self.detailsReply(d, L.isObject(reply) ? reply : {});
         }, function(err) {
@@ -4536,7 +4550,7 @@ return view.extend({
             if (!d.stopped && !d.collapsed && d.state !== 'paused' && !document.hidden) {
                 took = performance.now() - sent;
                 d.timer = window.setTimeout(L.bind(self.sampleDetails, self),
-                    Math.min(Math.max(d.wait, 2 * took) - took, DETAILS_MAX_GAP));
+                    sampleDelay(d.wait, took, pingTimedOut));
             }
         });
     },
