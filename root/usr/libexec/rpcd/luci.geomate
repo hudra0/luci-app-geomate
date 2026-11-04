@@ -827,17 +827,25 @@ local function reserve_sample(ip)
 end
 
 -- Takes back a reservation that brought no sample, so that the server does not count toward
--- the limit. A newer stamp of another caller stays
+-- the limit. It waits for the lock of reserve_sample(), which is only held for a moment, so a
+-- newer stamp of another caller stays. Without the lock the stamp stays and counts as a sample
 local function release_sample(ip, stamp)
-    local path = SAMPLE_DIR .. "/" .. ip
-    local f = io.open(path, "r")
-    local last = f and tonumber(f:read("*l") or "")
-    if f then
-        f:close()
+    local lock = nixio.open(SAMPLE_DIR .. "/.lock", "w", "600")
+    if not lock then
+        return
     end
-    if last == stamp then
-        os.remove(path)
+    if lock:lock("lock") then
+        local path = SAMPLE_DIR .. "/" .. ip
+        local f = io.open(path, "r")
+        local last = f and tonumber(f:read("*l") or "")
+        if f then
+            f:close()
+        end
+        if last == stamp then
+            os.remove(path)
+        end
     end
+    lock:close()
 end
 
 -- Whether the 'nft list set' output of a set lists the address as an element of its own, with
