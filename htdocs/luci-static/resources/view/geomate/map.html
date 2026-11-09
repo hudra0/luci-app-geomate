@@ -689,6 +689,10 @@
         // The parent opens a details window for a server (serverDetails): the popups get a Details link
         var detailsLink = false;
 
+        // The service runs in monitor mode (monitor message): nothing is blocked, and the popups
+        // and legend rows of blocked servers say so (blockedText)
+        var monitor = false;
+
         // Initialize MarkerCluster group with customized iconCreateFunction
         var markerClusters = L.markerClusterGroup({
             iconCreateFunction: function(cluster) {
@@ -786,6 +790,31 @@
             return conn.is_allowed_ip ? 'ip' : conn.allowed ? 'allowed' : conn.is_blocked_ip === true ? 'blacklist' : 'blocked';
         }
 
+        // A text about blocked servers, with the words the view's table adds in monitor mode
+        function blockedText(text) {
+            return monitor ? text + ' (monitor)' : text;
+        }
+
+        // Popup status of a kind of connection: blocked and blacklisted servers share the marker
+        function kindStatus(kind) {
+            var k = CONNECTION_KINDS[kind];
+            return (k.icon === blockedDivIcon) ? blockedText(k.status) : k.status;
+        }
+
+        /**
+         * Monitor mode on or off: the popups of blocked servers and the legend rows about them
+         * change in place, so an open popup stays open.
+         * @param {boolean} on - The service runs in monitor mode.
+         */
+        function setMonitor(on) {
+            monitor = on;
+            Object.keys(connectionMarkers).forEach(function(ip) {
+                var marker = connectionMarkers[ip];
+                marker.getPopup().getContent().querySelector('.gm-popup-status').textContent = kindStatus(marker.gm.kind);
+            });
+            legend.blocked.forEach(function(row) { row[0].textContent = blockedText(row[1]); });
+        }
+
         // A text field of the geo lookup, or '' when luci.geomate sent none (older backend or cache)
         function geoText(geo, key) {
             return (typeof geo[key] == 'string') ? geo[key] : '';
@@ -804,7 +833,7 @@
                 isp = geoText(geo, 'isp'), org = geoText(geo, 'org');
 
             L.DomUtil.create('div', 'gm-popup-ip', box).textContent = conn.dst;
-            L.DomUtil.create('div', 'gm-popup-status gm-popup-status--' + kind, box).textContent = CONNECTION_KINDS[kind].status;
+            L.DomUtil.create('div', 'gm-popup-status gm-popup-status--' + kind, box).textContent = kindStatus(kind);
             fields = L.DomUtil.create('dl', 'gm-popup-fields', box);
             [
                 ['Filter', String(conn.filter_name || '')],
@@ -2160,22 +2189,27 @@
                 L.DomUtil.create('span', 'gm-legend-server', legendItem(body, 'Known servers (bigger: more)'));
 
                 L.DomUtil.create('h3', '', body).textContent = 'Connections';
+                // [text element, text] of the rows about blocked servers (true below): setMonitor
+                legend.blocked = [];
                 [
                     ['fa-check-circle', 'green', 'Allowed'],
-                    ['fa-exclamation-triangle', 'red', 'Blocked'],
+                    ['fa-exclamation-triangle', 'red', 'Blocked', true],
                     ['fa-user', 'blue', 'Whitelisted']
                 ].forEach(function(m) {
-                    var i = L.DomUtil.create('i', 'fa ' + m[0], legendItem(body, m[2]));
+                    var swatch = legendItem(body, m[2]), i = L.DomUtil.create('i', 'fa ' + m[0], swatch);
                     i.style.color = m[1];
                     i.setAttribute('aria-hidden', 'true');
+                    if (m[3]) legend.blocked.push([swatch.nextSibling, m[2]]);
                 });
                 [
                     ['rgba(0, 128, 0, 0.6)', 'Several allowed'],
-                    ['rgba(255, 0, 0, 0.6)', 'Several blocked'],
+                    ['rgba(255, 0, 0, 0.6)', 'Several blocked', true],
                     ['rgba(0, 0, 255, 0.6)', 'Several whitelisted'],
                     ['rgba(255, 165, 0, 0.6)', 'Mixed']
                 ].forEach(function(c) {
-                    L.DomUtil.create('span', 'gm-legend-cluster', legendItem(body, c[1])).style.background = c[0];
+                    var swatch = legendItem(body, c[1]);
+                    L.DomUtil.create('span', 'gm-legend-cluster', swatch).style.background = c[0];
+                    if (c[2]) legend.blocked.push([swatch.nextSibling, c[1]]);
                 });
 
                 L.DomUtil.create('h3', '', body).textContent = 'Map';
@@ -2669,6 +2703,7 @@
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   serverDetails     { on }                           connection popups get a Details link when true
+         *   monitor           { on }                           monitor mode: popups and legend say that nothing is blocked
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }] }
          *   fitFilter         { sid }                          start view: the circles of this filter, once, before the first setFilters
          *   cancelDraw        -                                Escape outside the map
@@ -2698,6 +2733,8 @@
                 setFullscreenState(data.on === true);
             } else if (type === 'serverDetails' && data) {
                 detailsLink = data.on === true;
+            } else if (type === 'monitor' && data) {
+                setMonitor(data.on === true);
             } else if (type === 'setReadonly') {
                 setReadonly(!data || data.readonly !== false);
             } else if (type === 'cancelDraw') {

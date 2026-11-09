@@ -320,6 +320,16 @@ function connectionStatus(conn, offMap) {
     return [ 'unknown', _('Unknown'), note ];
 }
 
+// A status (connectionStatus, pastStatus) as the table shows it. Monitor mode (monitor:
+// monitorMode of the view) blocks nothing, so the label and the tooltip of a blocked or
+// blacklisted server say so. The map adds the same words to its popups and legend
+function monitorStatus(status, monitor) {
+    if (!monitor || (status[0] !== 'blocked' && status[0] !== 'blacklist'))
+        return status;
+    return [ status[0], _('%s (monitor)').format(status[1]),
+        (status[2] ? status[2] + ' ' : '') + _('Monitor mode blocks nothing.') ];
+}
+
 // Whether a connection's geo data has a position the map draws a marker for: finite, non-zero
 // lat and lon. The same test as updateConnections in map.html; a failed lookup is an empty array
 function hasPosition(geo) {
@@ -373,13 +383,11 @@ function untrackedNote(filterName) {
     return _('Not geolocated yet.') + ' ' + effect + ' ' + next;
 }
 
-// Tooltip of a blacklisted server: the list it is in and, in monitor mode, that nothing is
-// blocked, then the note of a server without a position (notOnMapNote), if any
+// Tooltip of a blacklisted server: the list it is in, then the note of a server without a
+// position (notOnMapNote), if any. In monitor mode monitorStatus adds that nothing is blocked
 function blacklistedNote(filterName, note) {
     var text = [ _('In the blocked IPs of %s.').format(filterName) ];
 
-    if ((uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor')
-        text.push(_('Monitor mode blocks nothing.'));
     if (note)
         text.push(note);
     return text.join(' ');
@@ -1286,6 +1294,7 @@ return view.extend({
     backendRuns: 0,         // PID changes since the page was loaded: each restart counts from 0 again
     configLoads: 0,     // configuration reloads running (whileReloading); the table waits for them
     themeKey: null,         // last theme sent to the map, as JSON
+    monitor: null,          // monitor mode (monitorMode) as the table shows it and the map was told
     fullscreen: false,      // the map covers the window
     hostsLoad: null,        // promise of the Source IP suggestions (loadHostChoices)
     serversLoads: {},       // running getKnownServers request per filter section
@@ -1661,6 +1670,12 @@ return view.extend({
     statusMode: function() {
         var mode = this.status && this.status.operational_mode;
         return mode ? (MODE_ORDER.indexOf(mode) > -1 ? mode : 'dynamic') : null;
+    },
+
+    // Monitor mode, in which nothing is blocked: the mode the status row shows (statusMode),
+    // without a status the configured one
+    monitorMode: function() {
+        return (this.statusMode() || uci.get('geomate', 'global', 'operational_mode') || 'dynamic') === 'monitor';
     },
 
     modeItems: function() {
@@ -2587,8 +2602,9 @@ return view.extend({
 
                     self.lastStatus = r[0];
                     self.withCounters = hasCapability(r[0], 'set_counters');
-                    // The table offers Block and Unblock from now on, or no longer
-                    if (blocks !== self.blocksIps) {
+                    // The table offers Block and Unblock from now on, or no longer, or the mode
+                    // changed between monitor and one that blocks (monitorStatus)
+                    if (blocks !== self.blocksIps || self.monitorMode() !== self.monitor) {
                         self.blocksIps = blocks;
                         self.updateActiveConnectionsList();
                     }
@@ -2801,6 +2817,8 @@ return view.extend({
             this.sendMessageToMap('setReadonly', { readonly: this.readonly });
             // Before the connections: their popups get the Details link
             this.sendMessageToMap('serverDetails', { on: !this.detailsOff });
+            // Popups and legend name blocked servers like the table (monitorStatus)
+            this.sendMessageToMap('monitor', { on: this.monitorMode() });
             // Once, before the first setFilters, which then fits the start view to this filter
             if (this.focusSid) {
                 this.sendMessageToMap('fitFilter', { sid: this.focusSid });
@@ -3851,6 +3869,13 @@ return view.extend({
         var self = this, table = this.connectionsTable, recent = this.recent, now = Date.now();
         if (!table || !this.nodes.connectionsTitle || this.configLoads || this.connectionsAt == null) return;
 
+        // Monitor mode marks blocked servers (monitorStatus), in the map too
+        var monitor = this.monitorMode();
+        if (monitor !== this.monitor) {
+            this.monitor = monitor;
+            this.sendMessageToMap('monitor', { on: monitor });
+        }
+
         // Skip any connection object lacking filter_name to avoid errors
         var list = this.connections.filter(function(conn) {
             return conn && conn.filter_name;
@@ -3897,7 +3922,7 @@ return view.extend({
             return {
                 ip: conn.dst,
                 filter: conn.filter_name,
-                status: (e.live && liveSeen == null) ? connectionStatus(conn) : pastStatus(e, action),
+                status: monitorStatus((e.live && liveSeen == null) ? connectionStatus(conn) : pastStatus(e, action), monitor),
                 geo: [ geo.country, geo.countryCode, geo.city, geo.isp, geo.org ],
                 action: action,
                 past: e.lastSeen != null
@@ -4505,6 +4530,7 @@ return view.extend({
         status = !e ? [ 'unknown', _('Unknown'), null ]
             : (conn && this.connectionsFailed < CONNECTIONS_STALE_AFTER) ? connectionStatus(conn)
             : pastStatus(e, this.connectionAction(e.conn));
+        status = monitorStatus(status, this.monitorMode());
         geo = geoText(e && e.conn.geo);
 
         n.status.className = 'gm-status gm-status--' + status[0];
