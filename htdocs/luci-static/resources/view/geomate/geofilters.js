@@ -517,6 +517,29 @@ function withStatus(opt) {
     };
 }
 
+// Keep a saved value of a form.ListValue that is none of its choices as a choice of its own:
+// the select would otherwise show another choice and the next save would write that one. A
+// hand-written list counts as the service reads it, its entries joined by spaces. The own
+// choice shows the value itself, or the text that labels (value: text) has for it
+function keepOwnChoice(opt, labels) {
+    var load = opt.load, choices = opt.keylist.length;
+
+    opt.load = function(section_id) {
+        var value = load.apply(this, arguments);
+
+        if (Array.isArray(value))
+            value = value.join(' ');
+
+        // Without the own choice of the section loaded before
+        this.keylist = this.keylist.slice(0, choices);
+        this.vallist = this.vallist.slice(0, choices);
+
+        if (value != null && value !== '' && this.keylist.indexOf(String(value)) < 0)
+            this.value(value, labels && labels[value]);
+        return value;
+    };
+}
+
 // Filter name in the open modal, as typed
 function formName(map, sid) {
     return String(map.lookupOption('name', sid)[0].formvalue(sid) || '').trim();
@@ -1100,12 +1123,26 @@ return view.extend({
                 _('Expecting: %s').format(_('circle:<latitude>:<longitude>:<radius in meters>'));
         };
 
-        // Protocol selection (TCP/UDP)
+        // Protocol selection (TCP/UDP). The service has no default: a filter without the option
+        // matches TCP and UDP on its ports, like the saved value 'tcp udp'. A new filter (no
+        // saved name yet) gets UDP preselected, as in the map's filter dialog, and saved with
+        // the dialog. A saved filter without the option loads as 'tcp udp', so that a save
+        // without a change of the select writes nothing instead of narrowing the filter. That
+        // value shows as 'TCP + UDP', any other saved value that is neither tcp nor udp as it
+        // is written, each as a choice of its own. No other filter is offered 'TCP + UDP': an
+        // older backend may not accept the value
         o = s.option(form.ListValue, 'protocol', _('Protocol'));
         o.value('tcp', 'TCP');
         o.value('udp', 'UDP');
+        o.default = 'udp';
         o.rmempty = false;
         o.modalonly = true;
+        var loadProtocol = o.load;
+        o.load = function(section_id) {
+            var value = loadProtocol.apply(this, arguments);
+            return (value == null && uci.get('geomate', section_id, 'name')) ? 'tcp udp' : value;
+        };
+        keepOwnChoice(o, { 'tcp udp': 'TCP + UDP' });
 
         // Source IP: the devices the filter applies to, like the field "Source address" of
         // LuCI's firewall. Several entries and exceptions need a backend that reports
