@@ -1114,8 +1114,10 @@ var CHECK_ICONS = { ok: '✓', info: '○', warning: '⚠', error: '✗' };
 // Operational modes in the order of the mode menu, the values of the Geo Filters page
 var MODE_ORDER = [ 'dynamic', 'static', 'monitor' ];
 
-// After a mode change, the status row waits this long (ms) for the restart (modeChanged)
-var RESTART_WAIT = 60 * 1000;
+// After a mode change, the status row waits this long (ms) for the restart (modeChanged) and
+// asks for the status every RESTART_POLL ms meanwhile (followRestart)
+var RESTART_WAIT = 60 * 1000,
+    RESTART_POLL = 1000;
 
 // procd runs geomate's reload trigger this long (ms) after a commit (PROCD_RELOAD_DELAY in
 // /lib/functions/procd.sh); commits within that time share one reload
@@ -1280,6 +1282,7 @@ return view.extend({
     serversLoads: {},       // running getKnownServers request per filter section
     restartPid: null,       // PID of the service when a mode change was applied, until it restarted
     restartAt: 0,           // time of that change
+    restartTimer: null,     // timer of the next status request while it waits (followRestart)
     details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
     detailsDenied: false,   // detailsOff because the session was denied (sessionDenied)
@@ -4937,7 +4940,27 @@ return view.extend({
             self.restartPid = (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before))
                 ? st.pid : null;
             self.updateStatus();
+            self.followRestart(at);
         });
+    },
+
+    // procd restarts the service about a second after the commit, and the status poll would show
+    // it up to STATUS_INTERVAL later. So after the mode change of time at, the status is asked for
+    // every RESTART_POLL ms while the loading note shows (updateStatus), at most RESTART_WAIT. A
+    // hidden tab or a paused auto refresh ends it, as both stop the status poll; a later mode
+    // change takes over
+    followRestart: function(at) {
+        var self = this, st = this.status;
+
+        if (this.restartAt !== at)
+            return;
+        window.clearTimeout(this.restartTimer);
+        if (Date.now() - at > RESTART_WAIT || !(this.restartPid != null || (st && st.loading)))
+            return;
+        this.restartTimer = window.setTimeout(function() {
+            if (self.restartAt === at && !document.hidden && poll.active())
+                L.resolveDefault(self.refreshStatus()).then(function() { self.followRestart(at); });
+        }, RESTART_POLL);
     },
 
     // After an update of either component the status reports other installed versions: ask for
