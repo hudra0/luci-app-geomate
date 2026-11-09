@@ -1198,9 +1198,11 @@ return view.extend({
         o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
 
-        // Whitelist for specific IP addresses
+        // Whitelist for specific IP addresses. No '!' entries: the backend skips them with an
+        // error. The check applies to typed entries only, so a saved '!' entry stays in the
+        // list until the user removes it and does not block saving the dialog
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
-        o.datatype = 'list(neg(ip4addr))';
+        o.datatype = 'list(ip4addr)';
         o.placeholder = _('1.2.3.4 or 1.2.3.0/24');
         o.rmempty = true;
         o.modalonly = true;
