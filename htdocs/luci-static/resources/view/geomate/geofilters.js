@@ -1237,20 +1237,25 @@ return view.extend({
         o.rmempty = true;
         o.modalonly = true;
 
-        // Create Empty List button: only fills in the file name
+        // Create Empty List button: only fills in the file name, and only into an empty field.
+        // A path that is set stays, so the filter keeps its list
         o = s.option(form.Button, '_create_empty', _('Create IP List'));
         o.inputtitle = _('Create Empty List');
         o.inputstyle = 'apply';
         o.modalonly = true;
         withStatus(o);
         o.onclick = function(ev, section_id) {
-            var name = formName(this.map, section_id);
+            var name = formName(this.map, section_id),
+                path = String(this.map.lookupOption('ip_list', section_id)[0].formvalue(section_id) || '').trim(),
+                note = _('Geomate creates a missing file at its next start.');
 
+            if (path)
+                return dom.content(this.status, [ _('The IP List File is already set.') + ' ' + note ]);
             if (!name)
                 return dom.content(this.status, [ _('Please specify a filter name first.') ]);
 
             setListPath(this.map, section_id, ipListPath(name));
-            dom.content(this.status, [ _('Geomate creates a missing file at its next start.') ]);
+            dom.content(this.status, [ note ]);
         };
 
         // Upload List button: writes the chosen file as the IP list, an existing list only
