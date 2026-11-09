@@ -1358,10 +1358,6 @@ local function get_service_status()
         nft_errors = {}
     }
 
-    -- Check if filters are currently loading
-    local loading_file = nixio.fs.stat("/tmp/geomate_loading")
-    status.loading = (loading_file ~= nil)
-
     -- Check if service is running
     local pid_file = io.open("/var/run/geomate.pid", "r")
     if pid_file then
@@ -1404,6 +1400,12 @@ local function get_service_status()
             end
         end
     end
+
+    -- Check if filters are currently loading. A start creates the loading file before the table
+    -- and removes it once the sets are filled, so it is read after the table: a reply with the
+    -- table and without the file comes from a finished start (the page's restartGap relies on it)
+    local loading_file = nixio.fs.stat("/tmp/geomate_loading")
+    status.loading = (loading_file ~= nil)
 
     -- Get filter information. No element counts: no view reads them, and counting listed the
     -- _allowed and _blocked sets of every enabled filter on each status poll (13k elements in

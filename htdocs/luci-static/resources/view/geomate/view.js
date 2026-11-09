@@ -500,6 +500,13 @@ function reloadsLive(status) {
     return !!status && Array.isArray(status.capabilities) && status.capabilities.length > 0;
 }
 
+// Such a backend restarts on a reload with an unchanged configuration too while a start is
+// loading, the table is missing or the last start logged nft errors (reload_regions)
+function restartsAnyway(status) {
+    return !!status && (!!status.loading || status.nft_active === false ||
+        (Array.isArray(status.nft_errors) && status.nft_errors.length > 0));
+}
+
 // Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
 // 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
 // 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
@@ -1114,8 +1121,12 @@ var CHECK_ICONS = { ok: '✓', info: '○', warning: '⚠', error: '✗' };
 // Operational modes in the order of the mode menu, the values of the Geo Filters page
 var MODE_ORDER = [ 'dynamic', 'static', 'monitor' ];
 
-// After a mode change, the status row waits this long (ms) for the restart (modeChanged)
-var RESTART_WAIT = 60 * 1000;
+// After a mode change, the status row waits this long (ms) for the restart (modeChanged) and
+// asks for the status every RESTART_POLL ms meanwhile (followRestart). A service still stopped
+// RESTART_STOPPED ms after a reply last showed it running failed to start (restartGap)
+var RESTART_WAIT = 60 * 1000,
+    RESTART_POLL = 1000,
+    RESTART_STOPPED = 10 * 1000;
 
 // procd runs geomate's reload trigger this long (ms) after a commit (PROCD_RELOAD_DELAY in
 // /lib/functions/procd.sh); commits within that time share one reload
@@ -1280,6 +1291,8 @@ return view.extend({
     serversLoads: {},       // running getKnownServers request per filter section
     restartPid: null,       // PID of the service when a mode change was applied, until it restarted
     restartAt: 0,           // time of that change
+    restartSeen: 0,         // time a reply last showed that PID running, from the change on (restartGap)
+    restartTimer: null,     // timer of the next status request while it waits (followRestart)
     details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
     detailsDenied: false,   // detailsOff because the session was denied (sessionDenied)
@@ -2306,9 +2319,13 @@ return view.extend({
             return;
 
         // After a mode change the status reports the new mode before procd has restarted the
-        // service (modeChanged). Until a reply shows the restart (another PID, the loading file,
-        // the service stopped) the loading note shows, so the mode never looks applied early
-        if (this.restartPid != null && st && (!running || st.pid !== this.restartPid || st.loading || Date.now() - this.restartAt > RESTART_WAIT))
+        // service (modeChanged). Until a reply shows the restart (the loading file, or another PID
+        // or the service stopped outside the gap of restartGap) the loading note shows, so the
+        // mode never looks applied early
+        if (this.restartPid != null && st && running && st.pid === this.restartPid)
+            this.restartSeen = Date.now();
+        if (this.restartPid != null && st && (st.loading || Date.now() - this.restartAt > RESTART_WAIT ||
+            ((!running || st.pid !== this.restartPid) && !this.restartGap(st))))
             this.restartPid = null;
         loading = !!(st ? (st.loading || this.restartPid != null) : (this.health && this.health.loading));
 
@@ -4915,17 +4932,19 @@ return view.extend({
     // an earlier restart. A reply later than procd's reload delay may already show the restarted
     // service, so its PID counts only when it is the one from before the commit. An Undo within
     // that delay shares the switch's reload. A backend that reloads live (reloadsLive) then finds
-    // the configuration unchanged and restarts nothing: no wait. Any other backend may restart, so
+    // the configuration unchanged and restarts nothing (unless restartsAnyway): no wait. Any
+    // other backend may restart, so
     // the wait stays, at most RESTART_WAIT. The connection tooltips depend on the configured mode
     modeChanged: function(undo) {
         var self = this, at = Date.now(),
             merged = undo && this.restartPid != null && at - this.restartAt < PROCD_RELOAD_DELAY &&
-                reloadsLive(this.status),
-            before = (!merged && this.serviceUp()) ? this.status.pid : null;
+                reloadsLive(this.status) && !restartsAnyway(this.status),
+            // Inside the gap of a restart still waited for (restartGap), that wait goes on
+            before = merged ? null : this.serviceUp() ? this.status.pid : this.restartPid;
 
         // Until the reply, the loading note shows from the PID known before
         this.restartPid = before;
-        this.restartAt = at;
+        this.restartAt = this.restartSeen = at;
         this.updateStatus();
         this.updateActiveConnectionsList();
         return this.refreshStatus().then(function() {
@@ -4934,10 +4953,42 @@ return view.extend({
             // No restart to wait for, or a later mode change has taken over
             if (merged || self.restartAt !== at)
                 return;
-            self.restartPid = (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before))
-                ? st.pid : null;
+            // A reply from the gap of the restart (restartGap) waits for the PID from before
+            self.restartPid = (before != null && st && self.restartGap(st)) ? before
+                : (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before)) ? st.pid
+                : null;
             self.updateStatus();
+            self.followRestart(at);
         });
+    },
+
+    // A status reply from the middle of a restart: the stop has deleted the table and the new run
+    // loop has not created the loading file yet. It shows a new PID or, between the stop and the
+    // start, the service stopped; still stopped RESTART_STOPPED ms after a reply last showed the
+    // old PID running, the service failed to start. A reply without nft_active, or with Geomate
+    // disabled (it does not start again), is no such reply
+    restartGap: function(st) {
+        return st.nft_active === false && !st.loading && st.config_enabled !== false &&
+            (!!st.running || Date.now() - this.restartSeen < RESTART_STOPPED);
+    },
+
+    // procd restarts the service about a second after the commit, and the status poll would show
+    // it up to STATUS_INTERVAL later. So after the mode change of time at, the status is asked for
+    // every RESTART_POLL ms while the loading note shows (updateStatus), at most RESTART_WAIT. A
+    // hidden tab or a paused auto refresh ends it, as both stop the status poll; a later mode
+    // change takes over
+    followRestart: function(at) {
+        var self = this, st = this.status;
+
+        if (this.restartAt !== at)
+            return;
+        window.clearTimeout(this.restartTimer);
+        if (Date.now() - at > RESTART_WAIT || !(this.restartPid != null || (st && st.loading)))
+            return;
+        this.restartTimer = window.setTimeout(function() {
+            if (self.restartAt === at && !document.hidden && poll.active())
+                L.resolveDefault(self.refreshStatus()).then(function() { self.followRestart(at); });
+        }, RESTART_POLL);
     },
 
     // After an update of either component the status reports other installed versions: ask for
