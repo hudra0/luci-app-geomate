@@ -1115,9 +1115,11 @@ var CHECK_ICONS = { ok: '✓', info: '○', warning: '⚠', error: '✗' };
 var MODE_ORDER = [ 'dynamic', 'static', 'monitor' ];
 
 // After a mode change, the status row waits this long (ms) for the restart (modeChanged) and
-// asks for the status every RESTART_POLL ms meanwhile (followRestart)
+// asks for the status every RESTART_POLL ms meanwhile (followRestart). A service still stopped
+// RESTART_STOPPED ms after the change failed to start (restartGap)
 var RESTART_WAIT = 60 * 1000,
-    RESTART_POLL = 1000;
+    RESTART_POLL = 1000,
+    RESTART_STOPPED = 10 * 1000;
 
 // procd runs geomate's reload trigger this long (ms) after a commit (PROCD_RELOAD_DELAY in
 // /lib/functions/procd.sh); commits within that time share one reload
@@ -2309,9 +2311,11 @@ return view.extend({
             return;
 
         // After a mode change the status reports the new mode before procd has restarted the
-        // service (modeChanged). Until a reply shows the restart (another PID, the loading file,
-        // the service stopped) the loading note shows, so the mode never looks applied early
-        if (this.restartPid != null && st && (!running || st.pid !== this.restartPid || st.loading || Date.now() - this.restartAt > RESTART_WAIT))
+        // service (modeChanged). Until a reply shows the restart (the loading file, or another PID
+        // or the service stopped outside the gap of restartGap) the loading note shows, so the
+        // mode never looks applied early
+        if (this.restartPid != null && st && (st.loading || Date.now() - this.restartAt > RESTART_WAIT ||
+            ((!running || st.pid !== this.restartPid) && !this.restartGap(st))))
             this.restartPid = null;
         loading = !!(st ? (st.loading || this.restartPid != null) : (this.health && this.health.loading));
 
@@ -4937,11 +4941,22 @@ return view.extend({
             // No restart to wait for, or a later mode change has taken over
             if (merged || self.restartAt !== at)
                 return;
-            self.restartPid = (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before))
-                ? st.pid : null;
+            // A reply from the gap of the restart (restartGap) waits for the PID from before
+            self.restartPid = (before != null && st && self.restartGap(st)) ? before
+                : (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before)) ? st.pid
+                : null;
             self.updateStatus();
             self.followRestart(at);
         });
+    },
+
+    // A status reply from the middle of a restart: the stop has deleted the table and the new run
+    // loop has not created the loading file yet. It shows a new PID or, between the stop and the
+    // start, the service stopped; still stopped RESTART_STOPPED ms after the mode change, the
+    // service failed to start. A reply without nft_active is no such reply
+    restartGap: function(st) {
+        return st.nft_active === false && !st.loading &&
+            (!!st.running || Date.now() - this.restartAt < RESTART_STOPPED);
     },
 
     // procd restarts the service about a second after the commit, and the status poll would show
