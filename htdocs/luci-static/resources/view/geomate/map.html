@@ -357,6 +357,7 @@
         }
         .gm-sel-radius input:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: 1px; }
         .gm-sel-radius input[aria-invalid="true"] { border-color: var(--gm-danger); outline-color: var(--gm-danger); }
+        .gm-sel-range { font-weight: 400; color: var(--gm-danger); }
         .gm-sel-center { font-weight: 400; font-variant-numeric: tabular-nums; color: var(--gm-muted); }
         .gm-sel-count { font-weight: 400; font-variant-numeric: tabular-nums; }
         .gm-sel-count:empty { display: none; }
@@ -1787,6 +1788,12 @@
                     endSelection(true);
                 }
             });
+            // The allowed range, shown while the field holds another value (setRadiusInvalid)
+            selBar.range = L.DomUtil.create('span', 'gm-sel-range', box);
+            selBar.range.id = 'gm-sel-range';
+            selBar.range.textContent = 'Allowed: 0.001 to 20000 km';
+            selBar.range.hidden = true;
+            selBar.radius.setAttribute('aria-describedby', selBar.range.id);
 
             selBar.center = L.DomUtil.create('span', 'gm-sel-center', box);
             selBar.center.title = 'Latitude, longitude';
@@ -1821,10 +1828,22 @@
             var layer = selection.layer, c = layer.getLatLng().wrap();
             if (document.activeElement !== selBar.radius) {
                 selBar.radius.value = kmValue(layer.getRadius());
-                selBar.radius.removeAttribute('aria-invalid');
+                setRadiusInvalid(false);
             }
             selBar.center.textContent = c.lat.toFixed(4) + ', ' + c.lng.toFixed(4);
             scheduleCount();
+        }
+
+        // Marks the radius field invalid or valid; while it is invalid the allowed range shows
+        // next to it. The text can wrap the bar to one more line: the bottom controls move with it
+        function setRadiusInvalid(invalid) {
+            var h;
+            if (selBar.range.hidden === !invalid) return;
+            h = selBar.box.offsetHeight;
+            if (invalid) selBar.radius.setAttribute('aria-invalid', 'true');
+            else selBar.radius.removeAttribute('aria-invalid');
+            selBar.range.hidden = !invalid;
+            if (!selBar.box.hidden && selBar.box.offsetHeight !== h) layoutBars();
         }
 
         // The radius field applies at once; values outside 1 m .. 20000 km are marked, not applied
@@ -1832,10 +1851,10 @@
             var s = selection, m = Math.round(selBar.radius.valueAsNumber * 1000);
             if (!s) return;
             if (!(m >= 1 && m <= 20000000)) {
-                selBar.radius.setAttribute('aria-invalid', 'true');
+                setRadiusInvalid(true);
                 return;
             }
-            selBar.radius.removeAttribute('aria-invalid');
+            setRadiusInvalid(false);
             s.layer.setRadius(m);
             // New handles at the new edge; their color comes from the container
             if (s.layer.editing.enabled()) s.layer.editing.updateMarkers();
