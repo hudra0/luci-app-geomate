@@ -1021,6 +1021,27 @@ return view.extend({
 
             return checkFilterName(value, this.cfgvalue(section_id), others);
         };
+        // The service keeps the geo data and the IPs it has looked up under the filter name
+        // (<filter name>_geo_data.json, runtime/<filter name>_last_processed) and moves
+        // neither: under a new name the filter starts without located servers and the list is
+        // looked up again. A note under the field says so while the name of an existing filter
+        // differs from the saved one. It is in the page only then: an empty description takes
+        // room in some themes
+        var renderName = o.renderWidget;
+        o.renderWidget = function(section_id, option_index, cfgvalue) {
+            var node = renderName.apply(this, arguments),
+                note = E('div', { 'class': 'cbi-value-description' },
+                    [ _('A renamed filter loses its located servers until the next geolocation. Run Manual Geolocation after Save & Apply to locate them at once.') ]);
+
+            if (cfgvalue)
+                node.addEventListener('input', function(ev) {
+                    if (ev.target.value !== cfgvalue)
+                        node.after(note);
+                    else
+                        note.remove();
+                });
+            return node;
+        };
 
         // Tooltip of the status and regions columns for a hand-written 'option allowed_region'
         var optionNote = _('Written as "option allowed_region" instead of "list allowed_region": the service start skips it and the map cannot show it.');
