@@ -357,6 +357,7 @@
         }
         .gm-sel-radius input:focus-visible { outline: 2px solid var(--gm-accent); outline-offset: 1px; }
         .gm-sel-radius input[aria-invalid="true"] { border-color: var(--gm-danger); outline-color: var(--gm-danger); }
+        .gm-sel-range { font-weight: 400; color: var(--gm-danger); }
         .gm-sel-center { font-weight: 400; font-variant-numeric: tabular-nums; color: var(--gm-muted); }
         .gm-sel-count { font-weight: 400; font-variant-numeric: tabular-nums; }
         .gm-sel-count:empty { display: none; }
@@ -516,22 +517,28 @@
             .gm-icon-btn { width: 40px; height: 40px; }
         }
 
-        /* Short messages from the parent, e.g. Applied with Undo, or why a change was not applied */
+        /* Short messages from the parent, e.g. Applied with Undo, or why a change was not applied:
+           a toast with buttons, and below it a later one without buttons (showToast) */
         #gm-toast {
-            display: none;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
             position: fixed;
             top: 10px;
             left: 50%;
             transform: translateX(-50%);
             z-index: 1002;
             max-width: 80%;
+            pointer-events: none;   /* text only: clicks and drags reach the map and its controls */
+        }
+        .gm-toast-item {
             padding: 6px 12px;
             background: var(--gm-bg);
             color: var(--gm-fg);
             border-radius: 4px;
             box-shadow: 0 1px 5px rgba(0,0,0,0.4);
             font: 13px/1.4 sans-serif;
-            pointer-events: none;   /* text only: clicks and drags reach the map and its controls */
         }
         #gm-toast .gm-toast-action {
             pointer-events: auto;   /* except its action button */
@@ -549,6 +556,30 @@
         @media (pointer: coarse) {
             #gm-toast .gm-toast-action { min-height: 40px; }
         }
+
+        /* In place of the map when Leaflet could not be loaded */
+        #map.gm-map-error {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            padding: 16px;
+            font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+            text-align: center;
+            color: var(--gm-fg);
+            background: var(--gm-bg);
+        }
+
+        /* Note in the bottom left corner while the map tiles fail to load */
+        .gm-tile-note {
+            max-width: 260px;
+            padding: 6px 10px;
+            font: 400 12px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+            color: var(--gm-fg);
+            background: var(--gm-bg);
+            border-radius: 4px;
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4);
+        }
     </style>
 </head>
 <body>
@@ -559,6 +590,19 @@
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
     <script>
         'use strict';
+
+        // Leaflet and its plugins come from unpkg.com. Without them (no internet access in the
+        // browser, the host blocked) the map says so instead of staying blank and stops here:
+        // the view gets no mapReady and works on without the map
+        if (!window.L || !L.Draw || !L.markerClusterGroup) {
+            (function(box) {
+                box.className = 'gm-map-error';
+                box.setAttribute('role', 'alert');
+                box.textContent = 'Could not load the map libraries from unpkg.com. ' +
+                    'Check the internet access of this browser, then reload the page.';
+            })(document.getElementById('map'));
+            throw new Error('Geomate map: Leaflet could not be loaded');
+        }
 
         var map, drawnItems;
         var readonly = true;    // until the parent says otherwise (setReadonly)
@@ -586,6 +630,9 @@
         var refitUntil = 0;     // until then a resize fits the start view again; user input ends it
         var focusSid = null;    // filter whose circles the start view fits (fitFilter message)
         var radiusPill = null;  // radius at the resize handle (edit) or at the cursor (draw)
+        var TILE_ERRORS = 4;    // failed map tiles in a row that show the tile note
+        var tileErrors = 0;     // map tiles that failed to load since the last one that loaded
+        var tileNote = null;    // the tile note (GmTileNote), once it was needed
 
         /*
          * The selected circle, edited on its own: { layer, region, backup: { latlng, radius },
@@ -627,7 +674,8 @@
         var lastPick = null;    // { point, time, layer } of the last click that selected a circle
         // Tokens differ between iframe loads, so a late answer never hits a circle of a new map
         var tokenPrefix = Math.random().toString(36).slice(2, 10) + '-';
-        var toastTimer = null;
+        // The toasts that show: { action: { el, timer }, plain: { el, timer } } (showToast)
+        var toasts = {};
 
         /*
          * Edit handles of the selected circle: round, HANDLE_SIZE (28 px, 36 px on touch screens),
@@ -689,6 +737,10 @@
         // The parent opens a details window for a server (serverDetails): the popups get a Details link
         var detailsLink = false;
 
+        // The service runs in monitor mode (monitor message): nothing is blocked, and the popups
+        // and legend rows of blocked servers say so (blockedText)
+        var monitor = false;
+
         // Initialize MarkerCluster group with customized iconCreateFunction
         var markerClusters = L.markerClusterGroup({
             iconCreateFunction: function(cluster) {
@@ -738,14 +790,16 @@
         }
 
         /**
-         * Shows a short message on top of the map, 6 s, or 10 s with buttons.
+         * Shows a short message on top of the map, 6 s, or 10 s with buttons. A message with
+         * buttons ('action') stays for its own time when a later one without buttons ('plain')
+         * arrives, which shows below it: Undo stays in reach. Any other message replaces what shows.
          * @param {string} text - The message, shown as text.
          * @param {Array} [actions] - [{ label, name, sid, id }]: buttons that send
          *   toastAction { name, sid, id }, e.g. Undo after a change was applied.
          */
         function showToast(text, actions) {
-            var el = document.getElementById('gm-toast');
-            var hide = function() { el.style.display = 'none'; };
+            var kind = (actions && actions.length) ? 'action' : 'plain',
+                el = L.DomUtil.create('div', 'gm-toast-item');
 
             el.textContent = text;
             (actions || []).forEach(function(action) {
@@ -753,13 +807,24 @@
                 button.type = 'button';
                 button.textContent = action.label;
                 onTap(button, function() {
-                    hide();
+                    hideToast('action');
                     post('toastAction', { name: action.name, sid: action.sid, id: action.id });
                 });
             });
-            el.style.display = 'block';
-            clearTimeout(toastTimer);
-            toastTimer = setTimeout(hide, (actions && actions.length) ? 10000 : 6000);
+            hideToast('plain');
+            if (kind === 'action') hideToast('action');
+            // After a toast with buttons, which keeps its place
+            document.getElementById('gm-toast').appendChild(el);
+            toasts[kind] = { el: el, timer: setTimeout(function() { hideToast(kind); }, (kind === 'action') ? 10000 : 6000) };
+        }
+
+        // Removes the toast of this kind ('action' or 'plain'), if one shows
+        function hideToast(kind) {
+            var t = toasts[kind];
+            if (!t) return;
+            clearTimeout(t.timer);
+            L.DomUtil.remove(t.el);
+            delete toasts[kind];
         }
 
         /**
@@ -786,6 +851,31 @@
             return conn.is_allowed_ip ? 'ip' : conn.allowed ? 'allowed' : conn.is_blocked_ip === true ? 'blacklist' : 'blocked';
         }
 
+        // A text about blocked servers, with the words the view's table adds in monitor mode
+        function blockedText(text) {
+            return monitor ? text + ' (monitor)' : text;
+        }
+
+        // Popup status of a kind of connection: blocked and blacklisted servers share the marker
+        function kindStatus(kind) {
+            var k = CONNECTION_KINDS[kind];
+            return (k.icon === blockedDivIcon) ? blockedText(k.status) : k.status;
+        }
+
+        /**
+         * Monitor mode on or off: the popups of blocked servers and the legend rows about them
+         * change in place, so an open popup stays open.
+         * @param {boolean} on - The service runs in monitor mode.
+         */
+        function setMonitor(on) {
+            monitor = on;
+            Object.keys(connectionMarkers).forEach(function(ip) {
+                var marker = connectionMarkers[ip];
+                marker.getPopup().getContent().querySelector('.gm-popup-status').textContent = kindStatus(marker.gm.kind);
+            });
+            legend.blocked.forEach(function(row) { row[0].textContent = blockedText(row[1]); });
+        }
+
         // A text field of the geo lookup, or '' when luci.geomate sent none (older backend or cache)
         function geoText(geo, key) {
             return (typeof geo[key] == 'string') ? geo[key] : '';
@@ -804,7 +894,7 @@
                 isp = geoText(geo, 'isp'), org = geoText(geo, 'org');
 
             L.DomUtil.create('div', 'gm-popup-ip', box).textContent = conn.dst;
-            L.DomUtil.create('div', 'gm-popup-status gm-popup-status--' + kind, box).textContent = CONNECTION_KINDS[kind].status;
+            L.DomUtil.create('div', 'gm-popup-status gm-popup-status--' + kind, box).textContent = kindStatus(kind);
             fields = L.DomUtil.create('dl', 'gm-popup-fields', box);
             [
                 ['Filter', String(conn.filter_name || '')],
@@ -1698,6 +1788,12 @@
                     endSelection(true);
                 }
             });
+            // The allowed range, shown while the field holds another value (setRadiusInvalid)
+            selBar.range = L.DomUtil.create('span', 'gm-sel-range', box);
+            selBar.range.id = 'gm-sel-range';
+            selBar.range.textContent = 'Allowed: 0.001 to 20000 km';
+            selBar.range.hidden = true;
+            selBar.radius.setAttribute('aria-describedby', selBar.range.id);
 
             selBar.center = L.DomUtil.create('span', 'gm-sel-center', box);
             selBar.center.title = 'Latitude, longitude';
@@ -1732,10 +1828,22 @@
             var layer = selection.layer, c = layer.getLatLng().wrap();
             if (document.activeElement !== selBar.radius) {
                 selBar.radius.value = kmValue(layer.getRadius());
-                selBar.radius.removeAttribute('aria-invalid');
+                setRadiusInvalid(false);
             }
             selBar.center.textContent = c.lat.toFixed(4) + ', ' + c.lng.toFixed(4);
             scheduleCount();
+        }
+
+        // Marks the radius field invalid or valid; while it is invalid the allowed range shows
+        // next to it. The text can wrap the bar to one more line: the bottom controls move with it
+        function setRadiusInvalid(invalid) {
+            var h;
+            if (selBar.range.hidden === !invalid) return;
+            h = selBar.box.offsetHeight;
+            if (invalid) selBar.radius.setAttribute('aria-invalid', 'true');
+            else selBar.radius.removeAttribute('aria-invalid');
+            selBar.range.hidden = !invalid;
+            if (!selBar.box.hidden && selBar.box.offsetHeight !== h) layoutBars();
         }
 
         // The radius field applies at once; values outside 1 m .. 20000 km are marked, not applied
@@ -1743,10 +1851,10 @@
             var s = selection, m = Math.round(selBar.radius.valueAsNumber * 1000);
             if (!s) return;
             if (!(m >= 1 && m <= 20000000)) {
-                selBar.radius.setAttribute('aria-invalid', 'true');
+                setRadiusInvalid(true);
                 return;
             }
-            selBar.radius.removeAttribute('aria-invalid');
+            setRadiusInvalid(false);
             s.layer.setRadius(m);
             // New handles at the new edge; their color comes from the container
             if (s.layer.editing.enabled()) s.layer.editing.updateMarkers();
@@ -2160,22 +2268,27 @@
                 L.DomUtil.create('span', 'gm-legend-server', legendItem(body, 'Known servers (bigger: more)'));
 
                 L.DomUtil.create('h3', '', body).textContent = 'Connections';
+                // [text element, text] of the rows about blocked servers (true below): setMonitor
+                legend.blocked = [];
                 [
                     ['fa-check-circle', 'green', 'Allowed'],
-                    ['fa-exclamation-triangle', 'red', 'Blocked'],
+                    ['fa-exclamation-triangle', 'red', 'Blocked', true],
                     ['fa-user', 'blue', 'Whitelisted']
                 ].forEach(function(m) {
-                    var i = L.DomUtil.create('i', 'fa ' + m[0], legendItem(body, m[2]));
+                    var swatch = legendItem(body, m[2]), i = L.DomUtil.create('i', 'fa ' + m[0], swatch);
                     i.style.color = m[1];
                     i.setAttribute('aria-hidden', 'true');
+                    if (m[3]) legend.blocked.push([swatch.nextSibling, m[2]]);
                 });
                 [
                     ['rgba(0, 128, 0, 0.6)', 'Several allowed'],
-                    ['rgba(255, 0, 0, 0.6)', 'Several blocked'],
+                    ['rgba(255, 0, 0, 0.6)', 'Several blocked', true],
                     ['rgba(0, 0, 255, 0.6)', 'Several whitelisted'],
                     ['rgba(255, 165, 0, 0.6)', 'Mixed']
                 ].forEach(function(c) {
-                    L.DomUtil.create('span', 'gm-legend-cluster', legendItem(body, c[1])).style.background = c[0];
+                    var swatch = legendItem(body, c[1]);
+                    L.DomUtil.create('span', 'gm-legend-cluster', swatch).style.background = c[0];
+                    if (c[2]) legend.blocked.push([swatch.nextSibling, c[1]]);
                 });
 
                 L.DomUtil.create('h3', '', body).textContent = 'Map';
@@ -2202,6 +2315,34 @@
             }
         });
 
+        /*
+         * Tile note: a note in the bottom left corner while the map tiles fail to load (no
+         * internet access in the browser, the tile server down). It shows after TILE_ERRORS
+         * failed tiles in a row and goes with the next tile that loads. Circles, markers and
+         * tools work without tiles.
+         */
+        var GmTileNote = L.Control.extend({
+            options: { position: 'bottomleft' },
+            onAdd: function() {
+                var box = L.DomUtil.create('div', 'gm-tile-note');
+                box.setAttribute('role', 'status');
+                box.textContent = 'Could not load the map tiles. Check the internet access of this browser.';
+                L.DomEvent.disableClickPropagation(box);
+                return box;
+            }
+        });
+
+        function onTileError() {
+            if (++tileErrors !== TILE_ERRORS) return;
+            tileNote = tileNote || new GmTileNote();
+            tileNote.addTo(map);
+        }
+
+        function onTileLoad() {
+            tileErrors = 0;
+            if (tileNote) tileNote.remove();
+        }
+
         /**
          * Initializes the map and its components.
          */
@@ -2223,7 +2364,7 @@
                 attribution: '© OpenStreetMap contributors',
                 noWrap: true,
                 bounds: [[-90, -180], [90, 180]]
-            }).addTo(map);
+            }).on({ tileerror: onTileError, tileload: onTileLoad }).addTo(map);
 
             // Known servers: a canvas in a pane of their own below the circles (overlayPane, 400),
             // which takes no pointer events, so circle clicks and map clicks still arrive
@@ -2669,6 +2810,7 @@
          *   fullscreen        { on }                           the state the view has set
          *   setReadonly       { readonly }                     no drawing or editing tools when true
          *   serverDetails     { on }                           connection popups get a Details link when true
+         *   monitor           { on }                           monitor mode: popups and legend say that nothing is blocked
          *   setFilters        { filters: [{ sid, name, color, enabled, regions }] }
          *   fitFilter         { sid }                          start view: the circles of this filter, once, before the first setFilters
          *   cancelDraw        -                                Escape outside the map
@@ -2698,6 +2840,8 @@
                 setFullscreenState(data.on === true);
             } else if (type === 'serverDetails' && data) {
                 detailsLink = data.on === true;
+            } else if (type === 'monitor' && data) {
+                setMonitor(data.on === true);
             } else if (type === 'setReadonly') {
                 setReadonly(!data || data.readonly !== false);
             } else if (type === 'cancelDraw') {
