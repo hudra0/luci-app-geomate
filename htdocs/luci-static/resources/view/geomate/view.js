@@ -351,6 +351,10 @@ function notOnMapNote() {
     return _('Not on the map until geolocated.');
 }
 
+// The backend geolocates a new server within seconds, as the last status reply said: it has
+// fast_verdict and counts the waiting servers (pendingServers). Set by pollStatus
+var fastVerdict = false;
+
 // Tooltip of an untracked server of a filter: what the configured mode does with it until it
 // is geolocated. Defaults as in geomate.sh and geomate_trigger.sh
 function untrackedNote(filterName) {
@@ -372,11 +376,14 @@ function untrackedNote(filterName) {
 
     // Static mode collects no new servers, daily geolocation looks them up once a day. Frequent
     // updates run once per check interval (global check_interval, 30 minutes by default), every
-    // second check while there was nothing to look up
+    // second check while there was nothing to look up, unless the backend asks for a new server
+    // at once (fastVerdict)
     if (mode === 'static')
         next = _('Static mode does not add it to the IP list.');
     else if (uci.get('geomate', 'global', 'geolocation_mode') === 'daily')
         next = _('Geolocated with the next daily update.');
+    else if (fastVerdict)
+        next = _('Usually geolocated within seconds.');
     else
         next = _('Geolocated with one of the next automatic updates.');
 
@@ -499,6 +506,15 @@ function notify(text, type) {
 // counts as not supported
 function hasCapability(status, token) {
     return !!status && Array.isArray(status.capabilities) && status.capabilities.indexOf(token) > -1;
+}
+
+// Servers that wait for their geolocation ('pending_servers' of getStatus): a number from 0 on
+// while a backend with fast_verdict geolocates new servers within seconds. null when unknown:
+// an older backend or rpcd, static mode, daily geolocation, a failed request
+function pendingServers(status) {
+    var n = status ? status.pending_servers : null;
+
+    return (hasCapability(status, 'fast_verdict') && typeof n == 'number' && n >= 0) ? n : null;
 }
 
 // The backend reloads a configuration change live, so a reload that finds nothing changed
@@ -1604,6 +1620,7 @@ return view.extend({
         n.stopped = E('span', { 'id': 'geomate-stopped-note', 'class': 'gm-note', 'hidden': '' }, [
             E('a', { 'href': L.url('admin/system/startup') }, [ _('Start Geomate under System > Startup') ])
         ]);
+        n.pending = E('span', { 'id': 'geomate-pending-servers', 'class': 'gm-note', 'hidden': '' });
         n.stale = E('span', { 'id': 'geomate-connections-stale', 'class': 'gm-note' });
         n.reload = E('span', { 'id': 'geomate-reload-note', 'class': 'gm-note', 'hidden': '' }, [
             _('The web interface was updated.'), ' ',
@@ -1645,7 +1662,7 @@ return view.extend({
 
         n.statusRow = E('details', { 'id': 'geomate-status' }, [
             E('summary', { 'mousedown': noFocus }, [
-                n.state, n.mode, n.health, n.loading, n.disabled, n.stopped, n.stale, n.reload,
+                n.state, n.mode, n.health, n.loading, n.pending, n.disabled, n.stopped, n.stale, n.reload,
                 E('span', { 'class': 'gm-spacer' }),
                 n.version, n.update,
                 E('span', { 'class': 'gm-muted' }, [ _('Details'), ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
@@ -2484,6 +2501,11 @@ return view.extend({
         var down = !!st && !running && !loading;
         n.disabled.hidden = !down || st.config_enabled !== false;
         n.stopped.hidden = !down || st.config_enabled === false || this.confirmed.indexOf('process') < 0;
+        // Servers a device talks to right now that wait for their geolocation; none: no note
+        var pending = (running && !loading) ? pendingServers(st) : null;
+        n.pending.hidden = !pending;
+        n.pending.textContent = !pending ? ''
+            : N_(pending, '%d server waiting for geolocation', '%d servers waiting for geolocation').format(pending);
 
         // Operational mode of the committed configuration, the one the service runs with
         var mode = this.statusMode() ? modeTexts()[this.statusMode()] : null;
@@ -2865,6 +2887,7 @@ return view.extend({
 
                     self.lastStatus = r[0];
                     self.withCounters = hasCapability(r[0], 'set_counters');
+                    fastVerdict = pendingServers(r[0]) != null;
                     // The table offers Block and Unblock from now on, or no longer, or the mode
                     // changed between monitor and one that blocks (monitorStatus)
                     if (blocks !== self.blocksIps || self.monitorMode() !== self.monitor) {
