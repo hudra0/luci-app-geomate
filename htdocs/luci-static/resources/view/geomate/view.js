@@ -1528,6 +1528,8 @@ return view.extend({
             'class': 'btn cbi-button cbi-button-neutral',
             'click': L.bind(function() { this.checkForUpdates(true); }, this)
         }, [ _('Check again') ]);
+        // A second line below the update state (showVersions)
+        n.updateNote = E('div', { 'class': 'gm-muted', 'hidden': '' });
 
         n.statusRow = E('details', { 'id': 'geomate-status' }, [
             E('summary', { 'mousedown': noFocus }, [
@@ -1542,7 +1544,7 @@ return view.extend({
                 [ n.detailChecks ],
                 row(_('Backend'), n.detailBackend),
                 row(_('Frontend'), n.detailFrontend),
-                row(_('Updates'), E('span', {}, [ n.detailUpdate, n.recheck ]))
+                row(_('Updates'), E('span', {}, [ n.detailUpdate, n.recheck, n.updateNote ]))
             ))
         ]);
 
@@ -2465,7 +2467,7 @@ return view.extend({
             outdated = this.pageOutdated(),
             update = (outdated && v.update == 'both') ? 'backend' : (outdated && v.update == 'frontend') ? null : v.update,
             versions = [],
-            summary = '', detail = '', primary = false;
+            summary = '', detail = '', note = '', primary = false;
 
         if (!n)
             return;
@@ -2499,6 +2501,9 @@ return view.extend({
                     : (update == 'backend') ? _('Backend update available') : _('Frontend update available');
                 detail = (update == 'both') ? _('Backend and frontend updates available') : summary;
                 primary = true;
+                // A status reply without the backend token ui_update: updates run on the router
+                if (this.lastStatus && !hasCapability(this.lastStatus, 'ui_update'))
+                    note = _('To update, run %s on the router.').format('service geomate update');
             }
         }
         else if (v.state == 'current') {
@@ -2512,6 +2517,8 @@ return view.extend({
         n.update.textContent = summary;
         n.update.className = 'gm-wide ' + (primary ? 'gm-primary' : 'gm-muted');
         n.detailUpdate.textContent = detail;
+        n.updateNote.textContent = note;
+        n.updateNote.hidden = !note;
         n.recheck.disabled = !!this.versionBusy;
     },
 
