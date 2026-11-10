@@ -342,6 +342,24 @@ local function read_set(set_name)
     return set
 end
 
+-- Servers that wait for their geolocation: the addresses in these _pending sets, each counted
+-- once. The kernel adds a server without a verdict as '<ip> expires ...'. The backend's fast
+-- lane parks one it cannot locate as '<ip> timeout 1h expires ...', which waits for nothing.
+-- One listing after the other; a _pending set holds at most 256 elements
+local function count_pending(set_names)
+    local seen, count = {}, 0
+    for _, set_name in ipairs(set_names) do
+        for element in set_elements(set_name):gmatch("[^,]+") do
+            local ip = not element:find(" timeout ", 1, true) and element:match("%d+%.%d+%.%d+%.%d+")
+            if ip and not seen[ip] then
+                seen[ip] = true
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
 -- allowed_ip of a filter section, split like the backend splits it: list entries only
 -- (config_list_foreach), so a hand-written 'option allowed_ip', which arrives as a string,
 -- whitelists nothing; an entry can hold several addresses, prefixes or ranges, separated by
@@ -1527,6 +1545,13 @@ local function get_service_status()
     status.operational_mode = uci:get('geomate', 'global', 'operational_mode') or 'dynamic'
     status.debug_level = tonumber(uci:get('geomate', 'global', 'debug_level')) or 0
 
+    -- A backend with fast_verdict geolocates a new server within seconds (its fast lane) and
+    -- keeps a set geomate_<filter>_pending per enabled filter while that runs: dynamic and
+    -- monitor mode with frequent geolocation
+    status.capabilities = backend_capabilities()
+    local fast = table_contains(status.capabilities, "fast_verdict")
+    local pending_sets, waiting = {}, {}
+
     -- Check nftables status and count the sets, as 'grep -c' counted the lines of the full
     -- listing: one terse listing instead of two full ones
     local nft_table = nft_table_terse()
@@ -1535,6 +1560,11 @@ local function get_service_status()
         for line in nft_table:gmatch("[^\n]+") do
             if line:find("set geomate_", 1, true) then
                 status.nft_sets_count = status.nft_sets_count + 1
+                local pending = fast and line:match("set (geomate_%S+_pending) {")
+                if pending then
+                    pending_sets[pending] = true
+                    status.pending_servers = 0
+                end
             end
         end
     end
@@ -1553,7 +1583,24 @@ local function get_service_status()
             name = s.name,
             enabled = (s.enabled == '1')
         })
+
+        -- The fast lane asks only for enabled filters with a region and an IP list (the service
+        -- start reads list entries only as regions): servers of other filters wait for nothing
+        local set_name = s.enabled == '1' and filter_set_name(s.name)
+        local pending = set_name and set_name .. "_pending"
+        if pending and pending_sets[pending] and type(s.allowed_region) == "table"
+            and #s.allowed_region > 0 and s.ip_list and s.ip_list ~= "" then
+            pending_sets[pending] = nil
+            table.insert(waiting, pending)
+        end
     end)
+
+    -- Servers waiting for geolocation, counted after the loop: no nft pipe is open inside
+    -- uci:foreach. No field while unknown: a backend without fast_verdict, or a table without
+    -- a _pending set (static mode, daily geolocation, service stopped)
+    if status.pending_servers then
+        status.pending_servers = count_pending(waiting)
+    end
 
     -- Get recent nft errors (last 5 lines)
     local error_log = io.open("/tmp/geomate_nft_errors.log", "r")
@@ -1570,7 +1617,6 @@ local function get_service_status()
         end
     end
 
-    status.capabilities = backend_capabilities()
     -- After a mode change the page waits until the running sets have the configured mode. Only
     -- a backend that reports capabilities keeps the configuration copy
     if #status.capabilities > 0 then
