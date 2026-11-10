@@ -1206,8 +1206,12 @@ return view.extend({
             return E('span', {}, nodes);
         };
 
-        // Geographic regions that are allowed for this filter
-        o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'), _('Easier to edit on the map'));
+        // Geographic regions that are allowed for this filter. The description links the map
+        // page in a new tab, so that the dialog keeps what was typed: LuCI puts the description
+        // of an option into the dialog as HTML
+        o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'),
+            _('Easier to edit on the <a href="%s" target="_blank" rel="noopener noreferrer">map</a>. A filter without regions does not filter by location.')
+                .format(L.url('admin/services/geomate/view')));
         o.rmempty = true;
         o.modalonly = true;
         o.placeholder = 'circle:48.137:11.575:50000';
