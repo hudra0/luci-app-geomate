@@ -1068,12 +1068,16 @@ return view.extend({
             return node;
         };
 
-        // Tooltip of the status and regions columns for a hand-written 'option allowed_region'
+        // Reason in the status column and tooltip of the regions column for a hand-written
+        // 'option allowed_region'
         var optionNote = _('Written as "option allowed_region" instead of "list allowed_region": the service start skips it and the map cannot show it.');
 
         // Status column - what the running service does with the filter. Staged changes are not
         // active before Save & Apply, and the service sees only what that has committed. A word
-        // that needs a reason gets it as a tooltip
+        // that needs a reason gets it as a line of small text below the words: a tooltip does
+        // not show on a touch screen. The text wraps at a fixed width, so that a long reason
+        // does not widen the column, and as an inline block it keeps the alignment the theme
+        // gives the cell (Argon centers the cells of the grid)
         o = s.option(form.DummyValue, '_status', _('Status'));
         o.modalonly = false;
         o.textvalue = function(section_id) {
@@ -1107,7 +1111,10 @@ return view.extend({
             }
 
             if (!words.length) return _('Active');
-            return E('span', notes.length ? { 'title': notes.join('\n') } : {}, [ words.join(', ') ]);
+            return E('div', { 'style': 'display: inline-block; max-width: 20em; white-space: normal;' },
+                [ words.join(', ') ].concat(notes.map(function(note) {
+                    return E('div', { 'style': 'font-size: 90%; opacity: 0.75;' }, [ note ]);
+                })));
         };
 
         // Match column - the traffic the filter looks at (the options are edited in the dialog)
