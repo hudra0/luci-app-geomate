@@ -948,9 +948,10 @@ return view.extend({
         };
 
         // **Operational Mode Option**
-        // Choose between dynamic (automatic) and static (predefined) IP lists
+        // Choose between dynamic (automatic) and static (predefined) IP lists, or monitor mode,
+        // which collects like dynamic but blocks nothing
         o = s.option(form.ListValue, 'operational_mode', _('Operational Mode'),
-            _('Choose between dynamic (automatic) or static (predefined) IP lists'));
+            _('Choose between dynamic (automatic) or static (predefined) IP lists. Monitor builds the lists like dynamic but blocks nothing.'));
         o.value('dynamic', _('Dynamic - Build IP lists automatically'));
         o.value('static', _('Static - Use predefined IP lists'));
         o.value('monitor', _('Monitor - Only visualize connections, no blocking'));
