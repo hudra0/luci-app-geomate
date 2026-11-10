@@ -1392,6 +1392,80 @@ local function running_mode()
     return (mode and mode ~= "") and mode or "dynamic"
 end
 
+-- An update run of the init script holds this lock: its PID on line 1, its start time (Unix
+-- time) on line 2. At its end the run writes the result file, then deletes the lock; a killed
+-- run leaves the lock without a result. Read only with the backend token ui_update
+local UPDATE_LOCK = "/tmp/geomate/update.lock"
+local UPDATE_RESULT = "/tmp/geomate/update_result.json"
+
+-- Whether an update run is going on: running, its start time, stale. Running while the PID of
+-- the lock is a run of the init script other than update_start, which only starts one. Stale:
+-- a lock whose owner is gone or that names none. Without a lock: false, nil, false
+local function update_run()
+    local f = io.open(UPDATE_LOCK, "r")
+    if not f then
+        return false, nil, false
+    end
+    local pid, started = f:read("*l"), f:read("*l")
+    f:close()
+    pid = pid and pid:match("^%s*(%d+)%s*$")
+    started = tonumber(started and started:match("^%s*(%d+)%s*$"))
+    if not started then
+        local st = nixio.fs.stat(UPDATE_LOCK)
+        started = st and st.mtime
+    end
+    local proc = pid and io.open("/proc/" .. pid .. "/cmdline", "r")
+    local cmdline = ""
+    if proc then
+        cmdline = (proc:read("*a") or ""):gsub("%z", " ")
+        proc:close()
+    end
+    if cmdline:find("init.d/geomate ", 1, true) and not cmdline:find("init.d/geomate update_start ", 1, true) then
+        return true, started, false
+    end
+    return false, started, true
+end
+
+-- The result of the last update run, the ten keys of the backend's file with their types, or
+-- nil without a readable one. Versions that are no version markers come as "", texts are cut to
+-- 300 characters. log, the log file of a run that update_start started, only as a path below
+-- /tmp; a result file from before the key has none. All of it is text for the page: nothing of
+-- it is run or put into a command
+local function update_result()
+    local f = io.open(UPDATE_RESULT, "r")
+    if not f then
+        return nil
+    end
+    local data = jsonc.parse(f:read("*a") or "")
+    f:close()
+    if type(data) ~= "table" or type(data.rc) ~= "number" or type(data.started) ~= "number" then
+        return nil
+    end
+    local function version(v)
+        return type(v) == "string" and valid_version(v) and v or ""
+    end
+    local function text(v)
+        return type(v) == "string" and v:sub(1, 300) or ""
+    end
+    local function tmp_path(v)
+        local dir = "/tmp/"
+        v = text(v)
+        return (#v > #dir and v:sub(1, #dir) == dir and not v:find("%c") and not v:find("..", 1, true)) and v or ""
+    end
+    return {
+        rc = data.rc,
+        started = data.started,
+        finished = type(data.finished) == "number" and data.finished or data.started,
+        backend_before = version(data.backend_before),
+        backend_after = version(data.backend_after),
+        frontend_before = version(data.frontend_before),
+        frontend_after = version(data.frontend_after),
+        error = text(data.error),
+        backup_dir = text(data.backup_dir),
+        log = tmp_path(data.log)
+    }
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -1487,6 +1561,23 @@ local function get_service_status()
     -- a backend that reports capabilities keeps the configuration copy
     if #status.capabilities > 0 then
         status.running_mode = running_mode()
+    end
+    -- An update run and the result of the last one, for the Updates row of the page. No fields
+    -- while unknown: only a backend with ui_update keeps the lock and the result this way
+    if table_contains(status.capabilities, "ui_update") then
+        local running, started, stale = update_run()
+        local result = update_result()
+        status.update_running = running
+        status.update_interrupted = stale and result == nil
+        if started and (running or status.update_interrupted) then
+            status.update_started = started
+        end
+        if running and started then
+            status.update_running_for = math.max(0, os.time() - started)
+        end
+        if not running and result then
+            status.update_result = result
+        end
     end
     -- The page checks for updates again when these change, and asks for a reload when its own
     -- UI_VERSION differs from the installed one
