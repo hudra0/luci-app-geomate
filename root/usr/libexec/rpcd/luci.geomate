@@ -33,6 +33,10 @@ local GEO_TEXT_FIELDS = { "country", "countryCode", "city", "isp", "org" }
 -- Geo data of the filters: <filter name>_geo_data.json, JSON lines from ip-api
 local GEO_DATA_DIR = "/etc/geomate.d"
 
+-- Answers of the backend's fast lane that the geo data file of a filter does not hold yet:
+-- <filter name>.json in RAM, lines as in the geo data file. A missing file tells nothing
+local FAST_ANSWERS_DIR = "/tmp/geomate/fast/answers"
+
 -- Filter names the backend supports in nft set names and geo data file names. A name that
 -- matches contains no '/' and no shell quote
 local FILTER_NAME_PATTERN = "^[%w_ .%-]+$"
@@ -57,11 +61,12 @@ end
 -- A hit is cached and leaves 'wanted'. Only a line whose "query" is wanted gets a JSON parse;
 -- geolocate.sh writes the compact "query":"<ip>" form, at the end of the line. Plain finds
 -- only, an unanchored pattern would be tried at every position of the line: for one IP its
--- whole key, else the key name and the address right behind it
-local function scan_geo_file(name, wanted)
+-- whole key, else the key name and the address right behind it.
+-- path: another file of the filter with such lines, read instead of its geo data file
+local function scan_geo_file(name, wanted, path)
     -- A matching name contains no '/', so the path stays in the directory
     local f = next(wanted) and type(name) == "string" and name:match(FILTER_NAME_PATTERN)
-        and io.open(GEO_DATA_DIR .. "/" .. name .. "_geo_data.json", "r")
+        and io.open(path or GEO_DATA_DIR .. "/" .. name .. "_geo_data.json", "r")
     if not f then
         return
     end
@@ -89,11 +94,13 @@ local function scan_geo_file(name, wanted)
 end
 
 -- Looks up the IPs without a cache entry, all of one request together: wanted is
--- { [filter name] = { [ip] = true } }. First each filter's own geo data file for its IPs, then
--- the files of the other enabled filters for what is still missing, until all are found; an
--- untracked server is a miss in almost every file, so files of disabled or removed filters are
--- not read. Each file is read at most twice per request. Misses are cached too, until the
--- next service start or frequent geolocation batch deletes the cache file.
+-- { [filter name] = { [ip] = true } }. First each filter's own geo data file for its IPs and
+-- the fast lane's answers for that filter, so a server with a verdict from there has its
+-- position at once, then the geo data files of the other enabled filters for what is still
+-- missing, until all are found; an untracked server is a miss in almost every file, so files
+-- of disabled or removed filters are not read. Each file is read at most twice per request.
+-- Misses are cached too, until the next service start, frequent geolocation batch or verdict
+-- of the fast lane deletes the cache file.
 -- The caller loads the geomate config. Returns true if the cache changed
 local function lookup_geo(wanted)
     local missing, own_file = {}, {}
@@ -107,6 +114,7 @@ local function lookup_geo(wanted)
             end
         end
         scan_geo_file(name, todo)
+        scan_geo_file(name, todo, FAST_ANSWERS_DIR .. "/" .. name .. ".json")
         for ip in pairs(todo) do
             missing[ip] = true
         end
