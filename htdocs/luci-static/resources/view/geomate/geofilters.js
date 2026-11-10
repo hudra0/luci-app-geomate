@@ -50,6 +50,9 @@ var GEOLOCATION_POLL = 10;
 var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoButtonNote = null, geoReadonly = false;
 var geoTimer = null, geoChecking = false, geoUnknown = 0;
 
+// The IPs/Located option of the filter grid, set in render
+var geoCounts = null;
+
 // Source IP suggestions and host names (hostChoices), loaded with the page
 var hosts = { keys: [], labels: {}, names: {} };
 
@@ -238,10 +241,27 @@ function geolocationStatusContent() {
     return [ runningLine(), geoStatusContent() ].filter(Boolean);
 }
 
-// Puts geoStats into the status section and locks the Manual Geolocation button during a run
+// Puts the counts of geoStats into the IPs/Located column of the filter grid: LuCI fills the
+// cells of the grid only when it renders the form, so they would keep the counts the page
+// loaded with
+function showFilterCounts() {
+    if (!geoCounts)
+        return;
+
+    geoCounts.section.cfgsections().forEach(function(sid) {
+        var cell = geoCounts.map.findElement('tr[data-sid="%s"] > td[data-name="_ip_stats"]'.format(sid));
+
+        if (cell)
+            dom.content(cell, [ geoCounts.textvalue(sid) ]);
+    });
+}
+
+// Puts geoStats into the status section and the filter grid, and locks the Manual Geolocation
+// button during a run
 function showGeolocationStatus() {
     if (geoStatusNode && geoStatusContent)
         dom.content(geoStatusNode, geolocationStatusContent());
+    showFilterCounts();
     lockGeolocationButton();
 }
 
@@ -489,6 +509,24 @@ function matchText(section_id) {
     return [ proto || ((sport || dport) ? 'TCP/UDP' : _('Any protocol')), from, to ].filter(Boolean).join(' ');
 }
 
+// A word of the protocol option that the service takes as a protocol (build_base_rule in
+// geomate.sh). A value with any other word is an nft expression written by hand
+var PROTOCOL_RE = /^(tcp|udp|udplite|sctp|dccp|icmp|igmp|esp|ah|comp|gre|\d{1,3})$/;
+
+// The service gives a filter no rules (build_base_rule in geomate.sh, proto_only 2) when it
+// names protocols but no port and no device: Source IP is empty or has exceptions only ('!').
+// Such a match would cover the protocols for the whole network, the replies of the servers
+// included. A port 'any' is no port; a filter without a protocol or with an nft expression
+// as protocol is not checked there. The arguments are the values of the four options
+function matchesWholeNetwork(protocol, srcIp, srcPort, destPort) {
+    var words = L.toArray(protocol);
+    var noPort = function(v) { v = L.toArray(v).join(' '); return v === '' || v === 'any'; };
+
+    return words.length > 0 && words.every(function(w) { return PROTOCOL_RE.test(w); }) &&
+        noPort(srcPort) && noPort(destPort) &&
+        srcIpEntries(srcIp).every(function(entry) { return entry.charAt(0) == '!'; });
+}
+
 // The session has uncommitted changes in this section, or in this option of it
 function isPending(sid, option) {
     return L.toArray(pending.geomate).some(function(change) {
@@ -514,6 +552,42 @@ function withStatus(opt) {
         this.status = E('div', { 'class': 'cbi-value-description' });
         nodes.appendChild(this.status);
         return nodes;
+    };
+}
+
+// Keep a saved value of a form.ListValue that is none of its choices as a choice of its own:
+// the select would otherwise show another choice and the next save would write that one. A
+// hand-written list counts as the service reads it, its entries joined by spaces. The own
+// choice shows the value itself, or the text that labels (value: text) has for it
+function keepOwnChoice(opt, labels) {
+    var load = opt.load, choices = opt.keylist.length;
+
+    opt.load = function(section_id) {
+        var value = load.apply(this, arguments);
+
+        if (Array.isArray(value))
+            value = value.join(' ');
+
+        // Without the own choice of the section loaded before
+        this.keylist = this.keylist.slice(0, choices);
+        this.vallist = this.vallist.slice(0, choices);
+
+        if (value != null && value !== '' && this.keylist.indexOf(String(value)) < 0)
+            this.value(value, labels && labels[value]);
+        return value;
+    };
+}
+
+// Make a missing or empty option of a form.ListValue read as its default, so that a save
+// without a change of the select writes nothing: LuCI would otherwise write the default it
+// shows. Only for a default the backend has too. Called with two arguments, cfgvalue stores
+// the loaded value
+function keepDefaultUnwritten(opt) {
+    var cfgvalue = opt.cfgvalue;
+
+    opt.cfgvalue = function(section_id) {
+        var value = cfgvalue.apply(this, arguments);
+        return (arguments.length > 1 || (value != null && value !== '')) ? value : this.default;
     };
 }
 
@@ -801,13 +875,19 @@ return view.extend({
         o.rmempty = false;
 
         // **Debug Level Option**
-        // Controls the verbosity of logging (0=minimal, 1=normal, 2=verbose)
-        o = s.option(form.Value, 'debug_level', _('Debug Level'),
-            _('Set the debug level (e.g., 0, 1, 2)'));
-        o.datatype = 'uinteger';
-        o.placeholder = '0';
+        // Controls the verbosity of logging: the four levels the backend knows. A missing option
+        // is not written on save, and a hand-written value that is no level stays a choice of
+        // its own
+        o = s.option(form.ListValue, 'debug_level', _('Debug Level'),
+            _('How much Geomate writes to the system log.'));
+        o.value('0', _('0 - Minimal'));
+        o.value('1', _('1 - Normal'));
+        o.value('2', _('2 - Verbose'));
+        o.value('3', _('3 - Very verbose'));
         o.default = '0';  // Same default as the backend
         o.rmempty = false;
+        keepDefaultUnwritten(o);
+        keepOwnChoice(o);
 
         // Manual Geolocation Button
         o = s.option(form.Button, '_manual_geolocation', _('Manual Geolocation'));
@@ -826,16 +906,21 @@ return view.extend({
             return node;
         };
         o.onclick = function(ev) {
+            // A backend with geo_reload puts new geo data into the sets in place. Any other
+            // one, or an unknown one, restarts Geomate at the end of the run
+            var restart = hasCapability('geo_reload') ? [] : [
+                E('li', {}, _('Temporarily affect the filtering of game servers')),
+                E('li', {}, _('Disconnect you from your current game'))
+            ];
+
             return ui.showModal(_('Manual Geolocation'), [
                 E('div', { 'class': 'alert-message warning' }, [
                     E('strong', {}, _('Warning:')),
                     E('p', {}, _('Running manual geolocation may:')),
-                    E('ul', {}, [
-                        E('li', {}, _('Temporarily affect the filtering of game servers')),
-                        E('li', {}, _('Disconnect you from your current game')),
+                    E('ul', {}, restart.concat([
                         E('li', {}, _('Take several minutes to complete')),
                         E('li', {}, _('Use API quota for IP geolocation'))
-                    ])
+                    ]))
                 ]),
                 E('div', { 'class': 'right' }, [
                     E('button', {
@@ -882,9 +967,10 @@ return view.extend({
         };
 
         // **Operational Mode Option**
-        // Choose between dynamic (automatic) and static (predefined) IP lists
+        // Choose between dynamic (automatic) and static (predefined) IP lists, or monitor mode,
+        // which collects like dynamic but blocks nothing
         o = s.option(form.ListValue, 'operational_mode', _('Operational Mode'),
-            _('Choose between dynamic (automatic) or static (predefined) IP lists'));
+            _('Choose between dynamic (automatic) or static (predefined) IP lists. Monitor builds the lists like dynamic but blocks nothing.'));
         o.value('dynamic', _('Dynamic - Build IP lists automatically'));
         o.value('static', _('Static - Use predefined IP lists'));
         o.value('monitor', _('Monitor - Only visualize connections, no blocking'));
@@ -980,13 +1066,38 @@ return view.extend({
 
             return checkFilterName(value, this.cfgvalue(section_id), others);
         };
+        // The service keeps the geo data and the IPs it has looked up under the filter name
+        // (<filter name>_geo_data.json, runtime/<filter name>_last_processed) and moves
+        // neither: under a new name the filter starts without located servers and the list is
+        // looked up again. A note under the field says so while the name of an existing filter
+        // differs from the saved one. It is in the page only then: an empty description takes
+        // room in some themes
+        var renderName = o.renderWidget;
+        o.renderWidget = function(section_id, option_index, cfgvalue) {
+            var node = renderName.apply(this, arguments),
+                note = E('div', { 'class': 'cbi-value-description' },
+                    [ _('A renamed filter loses its located servers until the next geolocation. Run Manual Geolocation after Save & Apply to locate them at once.') ]);
 
-        // Tooltip of the status and regions columns for a hand-written 'option allowed_region'
+            if (cfgvalue)
+                node.addEventListener('input', function(ev) {
+                    if (ev.target.value !== cfgvalue)
+                        node.after(note);
+                    else
+                        note.remove();
+                });
+            return node;
+        };
+
+        // Reason in the status column and tooltip of the regions column for a hand-written
+        // 'option allowed_region'
         var optionNote = _('Written as "option allowed_region" instead of "list allowed_region": the service start skips it and the map cannot show it.');
 
         // Status column - what the running service does with the filter. Staged changes are not
         // active before Save & Apply, and the service sees only what that has committed. A word
-        // that needs a reason gets it as a tooltip
+        // that needs a reason gets it as a line of small text below the words: a tooltip does
+        // not show on a touch screen. The text wraps at a fixed width, so that a long reason
+        // does not widen the column, and as an inline block it keeps the alignment the theme
+        // gives the cell (Argon centers the cells of the grid)
         o = s.option(form.DummyValue, '_status', _('Status'));
         o.modalonly = false;
         o.textvalue = function(section_id) {
@@ -1020,7 +1131,10 @@ return view.extend({
             }
 
             if (!words.length) return _('Active');
-            return E('span', notes.length ? { 'title': notes.join('\n') } : {}, [ words.join(', ') ]);
+            return E('div', { 'style': 'display: inline-block; max-width: 20em; white-space: normal;' },
+                [ words.join(', ') ].concat(notes.map(function(note) {
+                    return E('div', { 'style': 'font-size: 90%; opacity: 0.75;' }, [ note ]);
+                })));
         };
 
         // Match column - the traffic the filter looks at (the options are edited in the dialog)
@@ -1030,9 +1144,11 @@ return view.extend({
             return E('span', {}, [ matchText(section_id) ]);
         };
 
-        // IP Stats column - shows geolocation progress per filter
+        // IP Stats column - shows geolocation progress per filter. A status request during or
+        // at the end of a geolocation run updates the cells (showFilterCounts)
         o = s.option(form.DummyValue, '_ip_stats', _('IPs/Located'));
         o.modalonly = false;
+        geoCounts = o;
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
             if (!filterName || !geoStats || !geoStats.filters) {
@@ -1090,8 +1206,12 @@ return view.extend({
             return E('span', {}, nodes);
         };
 
-        // Geographic regions that are allowed for this filter
-        o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'), _('Easier to edit on the map'));
+        // Geographic regions that are allowed for this filter. The description links the map
+        // page in a new tab, so that the dialog keeps what was typed: LuCI puts the description
+        // of an option into the dialog as HTML
+        o = s.option(form.DynamicList, 'allowed_region', _('Allowed Regions'),
+            _('Easier to edit on the <a href="%s" target="_blank" rel="noopener noreferrer">map</a>. A filter without regions does not filter by location.')
+                .format(L.url('admin/services/geomate/view')));
         o.rmempty = true;
         o.modalonly = true;
         o.placeholder = 'circle:48.137:11.575:50000';
@@ -1100,12 +1220,26 @@ return view.extend({
                 _('Expecting: %s').format(_('circle:<latitude>:<longitude>:<radius in meters>'));
         };
 
-        // Protocol selection (TCP/UDP)
+        // Protocol selection (TCP/UDP). The service has no default: a filter without the option
+        // matches TCP and UDP on its ports, like the saved value 'tcp udp'. A new filter (no
+        // saved name yet) gets UDP preselected, as in the map's filter dialog, and saved with
+        // the dialog. A saved filter without the option loads as 'tcp udp', so that a save
+        // without a change of the select writes nothing instead of narrowing the filter. That
+        // value shows as 'TCP + UDP', any other saved value that is neither tcp nor udp as it
+        // is written, each as a choice of its own. No other filter is offered 'TCP + UDP': an
+        // older backend may not accept the value
         o = s.option(form.ListValue, 'protocol', _('Protocol'));
         o.value('tcp', 'TCP');
         o.value('udp', 'UDP');
+        o.default = 'udp';
         o.rmempty = false;
         o.modalonly = true;
+        var loadProtocol = o.load;
+        o.load = function(section_id) {
+            var value = loadProtocol.apply(this, arguments);
+            return (value == null && uci.get('geomate', section_id, 'name')) ? 'tcp udp' : value;
+        };
+        keepOwnChoice(o, { 'tcp udp': 'TCP + UDP' });
 
         // Source IP: the devices the filter applies to, like the field "Source address" of
         // LuCI's firewall. Several entries and exceptions need a backend that reports
@@ -1149,21 +1283,39 @@ return view.extend({
                 this.cfgvalue(section_id), multi);
         };
 
-        // Source port configuration
-        o = s.option(form.Value, 'src_port', _('Source Port'));
+        // Source port configuration. A filter the service would give no rules
+        // (matchesWholeNetwork) is not saved. LuCI checks this field again after every change
+        // in the dialog, and on Save after Source IP, which comes before it, has added text
+        // typed without Enter. The other options count as the dialog has them, one that is
+        // not in the dialog as saved
+        o = s.option(form.Value, 'src_port', _('Source Port'),
+            _('Local port of the game on the device. Empty: any port.'));
         o.datatype = 'list(neg(portrange))';
         o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
+        o.validate = function(section_id, value) {
+            var map = this.map;
+            var field = function(name) {
+                var opt = map.lookupOption(name, section_id);
+                return opt ? opt[0].formvalue(section_id) : uci.get('geomate', section_id, name);
+            };
+
+            return !matchesWholeNetwork(field('protocol'), field('src_ip'), value, field('dest_port')) ||
+                _('Set a port or a device in Source IP: the protocol alone would match the whole network.');
+        };
 
         // Destination port configuration
-        o = s.option(form.Value, 'dest_port', _('Destination Port'));
+        o = s.option(form.Value, 'dest_port', _('Destination Port'),
+            _('Port of the game servers. Empty: any port.'));
         o.datatype = 'list(neg(portrange))';
         o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
 
-        // Whitelist for specific IP addresses
+        // Whitelist for specific IP addresses. No '!' entries: the backend skips them with an
+        // error. The check applies to typed entries only, so a saved '!' entry stays in the
+        // list until the user removes it and does not block saving the dialog
         o = s.option(form.DynamicList, 'allowed_ip', _('Allowed IPs'));
-        o.datatype = 'list(neg(ip4addr))';
+        o.datatype = 'list(ip4addr)';
         o.placeholder = _('1.2.3.4 or 1.2.3.0/24');
         o.rmempty = true;
         o.modalonly = true;
@@ -1180,8 +1332,9 @@ return view.extend({
             o.modalonly = true;
         }
 
-        // Path to the IP list file
-        o = s.option(form.Value, 'ip_list', _('IP List File'));
+        // Path to the IP list file. The three list buttons follow it
+        o = s.option(form.Value, 'ip_list', _('IP List File'),
+            _('File in which Geomate keeps the server IPs of this filter.'));
         o.rmempty = false;
         o.modalonly = true;
         // Only a changed path is checked: a saved one does not block saving the other options
@@ -1190,30 +1343,25 @@ return view.extend({
             return value === this.cfgvalue(section_id) || listPathError(value) || true;
         };
 
-        // IP expiry days - removes inactive IPs after specified days
-        o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
-            _('Automatically remove IPs not seen for this many days. Set to 0 to disable. ' +
-              'Useful for games with dynamic servers where IPs change frequently.'));
-        o.datatype = 'uinteger';
-        o.placeholder = '0';
-        o.default = '0';  // Default for existing filters: disabled
-        o.rmempty = true;
-        o.modalonly = true;
-
-        // Create Empty List button: only fills in the file name
+        // Create Empty List button: only fills in the file name, and only into an empty field.
+        // A path that is set stays, so the filter keeps its list
         o = s.option(form.Button, '_create_empty', _('Create IP List'));
         o.inputtitle = _('Create Empty List');
         o.inputstyle = 'apply';
         o.modalonly = true;
         withStatus(o);
         o.onclick = function(ev, section_id) {
-            var name = formName(this.map, section_id);
+            var name = formName(this.map, section_id),
+                path = String(this.map.lookupOption('ip_list', section_id)[0].formvalue(section_id) || '').trim(),
+                note = _('Geomate creates a missing file at its next start.');
 
+            if (path)
+                return dom.content(this.status, [ _('The IP List File is already set.') + ' ' + note ]);
             if (!name)
                 return dom.content(this.status, [ _('Please specify a filter name first.') ]);
 
             setListPath(this.map, section_id, ipListPath(name));
-            dom.content(this.status, [ _('Geomate creates a missing file at its next start.') ]);
+            dom.content(this.status, [ note ]);
         };
 
         // Upload List button: writes the chosen file as the IP list, an existing list only
@@ -1257,6 +1405,16 @@ return view.extend({
 
             return path ? downloadList(this, path) : null;
         };
+
+        // IP expiry days - removes inactive IPs after specified days
+        o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
+            _('Automatically remove IPs not seen for this many days. Set to 0 to disable. ' +
+              'Useful for games with dynamic servers where IPs change frequently.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '0';
+        o.default = '0';  // Default for existing filters: disabled
+        o.rmempty = true;
+        o.modalonly = true;
 
         return m.render().then(function(node) {
             // A run that was going on when the page loaded (manual or daily)
