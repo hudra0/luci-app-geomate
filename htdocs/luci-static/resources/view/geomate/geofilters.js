@@ -578,6 +578,19 @@ function keepOwnChoice(opt, labels) {
     };
 }
 
+// Make a missing or empty option of a form.ListValue read as its default, so that a save
+// without a change of the select writes nothing: LuCI would otherwise write the default it
+// shows. Only for a default the backend has too. Called with two arguments, cfgvalue stores
+// the loaded value
+function keepDefaultUnwritten(opt) {
+    var cfgvalue = opt.cfgvalue;
+
+    opt.cfgvalue = function(section_id) {
+        var value = cfgvalue.apply(this, arguments);
+        return (arguments.length > 1 || (value != null && value !== '')) ? value : this.default;
+    };
+}
+
 // Filter name in the open modal, as typed
 function formName(map, sid) {
     return String(map.lookupOption('name', sid)[0].formvalue(sid) || '').trim();
@@ -862,13 +875,19 @@ return view.extend({
         o.rmempty = false;
 
         // **Debug Level Option**
-        // Controls the verbosity of logging (0=minimal, 1=normal, 2=verbose)
-        o = s.option(form.Value, 'debug_level', _('Debug Level'),
-            _('Set the debug level (e.g., 0, 1, 2)'));
-        o.datatype = 'uinteger';
-        o.placeholder = '0';
+        // Controls the verbosity of logging: the four levels the backend knows. A missing option
+        // is not written on save, and a hand-written value that is no level stays a choice of
+        // its own
+        o = s.option(form.ListValue, 'debug_level', _('Debug Level'),
+            _('How much Geomate writes to the system log.'));
+        o.value('0', _('0 - Minimal'));
+        o.value('1', _('1 - Normal'));
+        o.value('2', _('2 - Verbose'));
+        o.value('3', _('3 - Very verbose'));
         o.default = '0';  // Same default as the backend
         o.rmempty = false;
+        keepDefaultUnwritten(o);
+        keepOwnChoice(o);
 
         // Manual Geolocation Button
         o = s.option(form.Button, '_manual_geolocation', _('Manual Geolocation'));
