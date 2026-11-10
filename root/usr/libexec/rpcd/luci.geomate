@@ -935,7 +935,7 @@ local function get_server_sample(args)
     return reply
 end
 
--- Route RTT is independent of server ping. One globally locked job sends at most 24
+-- Route RTT is independent of server ping. One globally locked job sends at most 27
 -- small ICMP probes, to the selected server only. TTL hints avoid repeated full traces.
 local ROUTE_DIR = "/tmp/geomate/route"
 local ROUTE_GAP = 2
@@ -945,11 +945,13 @@ local ROUTE_HINT_AGE = 180
 -- too. The search sends ROUTE_BATCH TTLs at once; a refresh sends its second probe when the
 -- first has no reply after ROUTE_RETRY s. Every TTL of a batch from the server's hop on
 -- reaches the server, so a near one gets up to 8 echo requests per search. Echoes can arrive
--- out of order: after the first, the lower TTLs of the batch have ROUTE_GRACE s to answer
+-- out of order: after the first, the lower TTLs of the batch have ROUTE_GRACE s to answer.
+-- A search that ends at a hop probes the ROUTE_REPROBE TTLs behind it once more
 local ROUTE_WAIT = 1.2
 local ROUTE_BATCH = 8
 local ROUTE_RETRY = 0.5
 local ROUTE_GRACE = 0.05
+local ROUTE_REPROBE = 3
 
 local function route_uptime()
     local f = io.open("/proc/uptime", "r")
@@ -1111,6 +1113,18 @@ local function measure_route(ip, hint)
                     end)
                 end
                 if fault or clock() >= deadline or (best and best.endpoint) then break end
+            end
+            -- Each TTL had one probe: when the reply of the deepest hop is lost, a nearer hop is
+            -- left as the end of the route and as the hint. So the up to ROUTE_REPROBE TTLs behind
+            -- the hop found get one more probe each; a deeper hop that answers takes its place
+            if best and not best.endpoint then
+                local last = math.min(best.ttl + ROUTE_REPROBE, 24)
+                for ttl = best.ttl + 1, last do
+                    if not send(ttl) then break end
+                end
+                collect(clock() + ROUTE_WAIT, function()
+                    return best.endpoint or best.ttl >= last
+                end)
             end
         else
             -- One probe per refresh; a second one only when the first has no reply after

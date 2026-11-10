@@ -948,7 +948,8 @@ var DETAILS_INTERVAL = 1000,
     PING_WAIT = 1000,
     ROUTE_INTERVAL = 2000,
     ROUTE_STALE = 10000,
-    ROUTE_GRAPH_GAP = 20000;
+    ROUTE_GRAPH_GAP = 20000,
+    ROUTE_MEDIAN = 5;
 
 // ms from a getServerSample reply to the next request, for a reply that took 'took' ms. At
 // normal speed the requests are 'wait' ms apart. A slow router (a large _dynamic set) gets a
@@ -1003,6 +1004,22 @@ function median(values) {
     var v = values.slice().sort(function(a, b) { return a - b; }), m = v.length >> 1;
 
     return !v.length ? null : (v.length % 2) ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+
+// The route RTT to show: the median of the last ROUTE_MEDIAN measurements of the newest hop in
+// the route points (addRoutePoint), null without one. A changed hop (the point without a value)
+// ends the series, and only measurements up to ROUTE_STALE before the newest one count, so the
+// value follows at once after a pause and with rare replies
+function routeMedian(points) {
+    var values = [], newest = points[points.length - 1], i, p;
+
+    for (i = points.length - 1; i >= 0 && values.length < ROUTE_MEDIAN; i--) {
+        p = points[i];
+        if (p.rtt == null || newest.t - p.t > ROUTE_STALE)
+            break;
+        values.push(p.rtt);
+    }
+    return median(values);
 }
 
 // Figures of one direction ('rx' or 'tx') over the last DETAILS_STATS rates of the points: { rate:
@@ -4517,6 +4534,8 @@ return view.extend({
         var n = d && d.nodes, now = performance.now(), result = d && d.routeResult,
             age = result ? result.age_ms + Math.max(0, now - d.routeReceivedAt) : 0,
             stale = !!result && age >= ROUTE_STALE,
+            // The median of the hop's last measurements; the graph shows every single one
+            shown = result && !stale ? routeMedian(d.routePoints) : null,
             // unavailable: retried after ROUTE_INTERVAL; unsupported and denied: off for the page
             notes = { no_reply: _('No route reply'), waiting: _('Waiting for measurement'),
                 unknown: _('No recent traffic'), unavailable: _('Route measurement unavailable'),
@@ -4528,7 +4547,8 @@ return view.extend({
             return;
         if (stale)
             text = _('Measurement expired');
-        n.routeValue.textContent = result && !stale ? msText(result.rtt) : '–';
+        n.routeValue.textContent = shown != null ? msText(shown) : '–';
+        n.routeValue.title = shown != null ? _('Median of the latest measurements') : '';
         n.routeMeta.hidden = !result;
         n.routeMeta.textContent = result ? _('%s · Hop %d · %d s ago').format(result.responder, result.ttl, Math.floor(age / 1000)) : '';
         n.routeMeta.title = result ? new Date(result.measured_at).toLocaleString() : '';
