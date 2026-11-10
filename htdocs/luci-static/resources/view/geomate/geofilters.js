@@ -50,6 +50,9 @@ var GEOLOCATION_POLL = 10;
 var geoStatusNode = null, geoStatusContent = null, geoButton = null, geoButtonNote = null, geoReadonly = false;
 var geoTimer = null, geoChecking = false, geoUnknown = 0;
 
+// The IPs/Located option of the filter grid, set in render
+var geoCounts = null;
+
 // Source IP suggestions and host names (hostChoices), loaded with the page
 var hosts = { keys: [], labels: {}, names: {} };
 
@@ -238,10 +241,27 @@ function geolocationStatusContent() {
     return [ runningLine(), geoStatusContent() ].filter(Boolean);
 }
 
-// Puts geoStats into the status section and locks the Manual Geolocation button during a run
+// Puts the counts of geoStats into the IPs/Located column of the filter grid: LuCI fills the
+// cells of the grid only when it renders the form, so they would keep the counts the page
+// loaded with
+function showFilterCounts() {
+    if (!geoCounts)
+        return;
+
+    geoCounts.section.cfgsections().forEach(function(sid) {
+        var cell = geoCounts.map.findElement('tr[data-sid="%s"] > td[data-name="_ip_stats"]'.format(sid));
+
+        if (cell)
+            dom.content(cell, [ geoCounts.textvalue(sid) ]);
+    });
+}
+
+// Puts geoStats into the status section and the filter grid, and locks the Manual Geolocation
+// button during a run
 function showGeolocationStatus() {
     if (geoStatusNode && geoStatusContent)
         dom.content(geoStatusNode, geolocationStatusContent());
+    showFilterCounts();
     lockGeolocationButton();
 }
 
@@ -1097,9 +1117,11 @@ return view.extend({
             return E('span', {}, [ matchText(section_id) ]);
         };
 
-        // IP Stats column - shows geolocation progress per filter
+        // IP Stats column - shows geolocation progress per filter. A status request during or
+        // at the end of a geolocation run updates the cells (showFilterCounts)
         o = s.option(form.DummyValue, '_ip_stats', _('IPs/Located'));
         o.modalonly = false;
+        geoCounts = o;
         o.textvalue = function(section_id) {
             var filterName = uci.get('geomate', section_id, 'name');
             if (!filterName || !geoStats || !geoStats.filters) {
