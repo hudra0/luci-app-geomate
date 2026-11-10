@@ -489,6 +489,24 @@ function matchText(section_id) {
     return [ proto || ((sport || dport) ? 'TCP/UDP' : _('Any protocol')), from, to ].filter(Boolean).join(' ');
 }
 
+// A word of the protocol option that the service takes as a protocol (build_base_rule in
+// geomate.sh). A value with any other word is an nft expression written by hand
+var PROTOCOL_RE = /^(tcp|udp|udplite|sctp|dccp|icmp|igmp|esp|ah|comp|gre|\d{1,3})$/;
+
+// The service gives a filter no rules (build_base_rule in geomate.sh, proto_only 2) when it
+// names protocols but no port and no device: Source IP is empty or has exceptions only ('!').
+// Such a match would cover the protocols for the whole network, the replies of the servers
+// included. A port 'any' is no port; a filter without a protocol or with an nft expression
+// as protocol is not checked there. The arguments are the values of the four options
+function matchesWholeNetwork(protocol, srcIp, srcPort, destPort) {
+    var words = L.toArray(protocol);
+    var noPort = function(v) { v = L.toArray(v).join(' '); return v === '' || v === 'any'; };
+
+    return words.length > 0 && words.every(function(w) { return PROTOCOL_RE.test(w); }) &&
+        noPort(srcPort) && noPort(destPort) &&
+        srcIpEntries(srcIp).every(function(entry) { return entry.charAt(0) == '!'; });
+}
+
 // The session has uncommitted changes in this section, or in this option of it
 function isPending(sid, option) {
     return L.toArray(pending.geomate).some(function(change) {
@@ -1186,11 +1204,25 @@ return view.extend({
                 this.cfgvalue(section_id), multi);
         };
 
-        // Source port configuration
+        // Source port configuration. A filter the service would give no rules
+        // (matchesWholeNetwork) is not saved. LuCI checks this field again after every change
+        // in the dialog, and on Save after Source IP, which comes before it, has added text
+        // typed without Enter. The other options count as the dialog has them, one that is
+        // not in the dialog as saved
         o = s.option(form.Value, 'src_port', _('Source Port'));
         o.datatype = 'list(neg(portrange))';
         o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
+        o.validate = function(section_id, value) {
+            var map = this.map;
+            var field = function(name) {
+                var opt = map.lookupOption(name, section_id);
+                return opt ? opt[0].formvalue(section_id) : uci.get('geomate', section_id, name);
+            };
+
+            return !matchesWholeNetwork(field('protocol'), field('src_ip'), value, field('dest_port')) ||
+                _('Set a port or a device in Source IP: the protocol alone would match the whole network.');
+        };
 
         // Destination port configuration
         o = s.option(form.Value, 'dest_port', _('Destination Port'));
