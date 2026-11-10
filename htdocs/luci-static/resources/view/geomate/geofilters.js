@@ -867,16 +867,21 @@ return view.extend({
             return node;
         };
         o.onclick = function(ev) {
+            // A backend with geo_reload puts new geo data into the sets in place. Any other
+            // one, or an unknown one, restarts Geomate at the end of the run
+            var restart = hasCapability('geo_reload') ? [] : [
+                E('li', {}, _('Temporarily affect the filtering of game servers')),
+                E('li', {}, _('Disconnect you from your current game'))
+            ];
+
             return ui.showModal(_('Manual Geolocation'), [
                 E('div', { 'class': 'alert-message warning' }, [
                     E('strong', {}, _('Warning:')),
                     E('p', {}, _('Running manual geolocation may:')),
-                    E('ul', {}, [
-                        E('li', {}, _('Temporarily affect the filtering of game servers')),
-                        E('li', {}, _('Disconnect you from your current game')),
+                    E('ul', {}, restart.concat([
                         E('li', {}, _('Take several minutes to complete')),
                         E('li', {}, _('Use API quota for IP geolocation'))
-                    ])
+                    ]))
                 ]),
                 E('div', { 'class': 'right' }, [
                     E('button', {
