@@ -1509,6 +1509,15 @@ return view.extend({
         n.mode = this.readonly ? this.renderModeLabel() : this.renderModeMenu();
         n.health = E('span', { 'id': 'health-check-status' });
         n.loading = E('span', { 'id': 'geomate-loading-indicator', 'class': 'gm-note' }, [ _('Loading GeoFilter data ...') ]);
+        // The next step while the service is not running: disabled in the configuration, or
+        // stopped (updateStatus)
+        n.disabled = E('span', { 'id': 'geomate-disabled-note', 'class': 'gm-note', 'hidden': '' }, [
+            _('Geomate is disabled.'), ' ',
+            E('a', { 'href': L.url('admin/services/geomate/geofilters') }, [ _('Enable it on the Geo Filters page') ])
+        ]);
+        n.stopped = E('span', { 'id': 'geomate-stopped-note', 'class': 'gm-note', 'hidden': '' }, [
+            E('a', { 'href': L.url('admin/system/startup') }, [ _('Start Geomate under System > Startup') ])
+        ]);
         n.stale = E('span', { 'id': 'geomate-connections-stale', 'class': 'gm-note' });
         n.reload = E('span', { 'id': 'geomate-reload-note', 'class': 'gm-note', 'hidden': '' }, [
             _('The web interface was updated.'), ' ',
@@ -1532,7 +1541,7 @@ return view.extend({
 
         n.statusRow = E('details', { 'id': 'geomate-status' }, [
             E('summary', { 'mousedown': noFocus }, [
-                n.state, n.mode, n.health, n.loading, n.stale, n.reload,
+                n.state, n.mode, n.health, n.loading, n.disabled, n.stopped, n.stale, n.reload,
                 E('span', { 'class': 'gm-spacer' }),
                 n.version, n.update,
                 E('span', { 'class': 'gm-muted' }, [ _('Details'), ' ', E('span', { 'class': 'gm-arrow' }, [ '▾' ]) ])
@@ -2352,6 +2361,13 @@ return view.extend({
         n.detailService.textContent = pid ? _('Running (PID %d)').format(pid) : state;
         n.loading.hidden = !loading;
 
+        // Not running and no start on its way: the next step. Disabled in the configuration shows
+        // at once. Stopped shows once two polls in a row saw it (confirmed, below), like the
+        // details: a single poll may fall between the stop and the start of a restart
+        var down = !!st && !running && !loading;
+        n.disabled.hidden = !down || st.config_enabled !== false;
+        n.stopped.hidden = !down || st.config_enabled === false || this.confirmed.indexOf('process') < 0;
+
         // Operational mode of the committed configuration, the one the service runs with
         var mode = this.statusMode() ? modeTexts()[this.statusMode()] : null;
         n.mode.hidden = !mode;
@@ -2383,9 +2399,12 @@ return view.extend({
             labels = (errors.length ? errors : warnings).map(function(c) { return c.label; }).join(', ');
 
         n.health.title = shown.map(function(c) { return c.label + ':' + c.message; }).join('\n');
+        // Not running: the service pill says it, and a disabled service skips the process and
+        // nftables checks, so no "All checks passed" beside it
         dom.content(n.health, !shown.length ? null
             : errors.length ? E('span', { 'class': 'gm-icon--error' }, [ CHECK_ICONS.error + ' ' + labels ])
             : warnings.length ? [ E('span', { 'class': 'gm-icon--warning' }, [ CHECK_ICONS.warning ]), ' ' + labels ]
+            : (st && !running) ? null
             : E('span', { 'class': 'gm-muted' }, [ CHECK_ICONS.ok + ' ' + _('All checks passed') ]));
 
         // The check rows change in place, so a selected message stays selected
@@ -2440,6 +2459,8 @@ return view.extend({
         this.problems = problems;
         this.problemsAt = polled;
         this.confirmed = confirmed;
+        // 'process' is confirmed only while an enabled service neither runs nor loads
+        n.stopped.hidden = confirmed.indexOf('process') < 0;
     },
 
     // The installed view.js (status.installed, from rpcd) is another version than this page: an
