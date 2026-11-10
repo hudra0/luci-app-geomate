@@ -1211,6 +1211,57 @@ function versionState(entry) {
     };
 }
 
+// An update started from the status row (startUpdate): while it starts or runs, the status is
+// asked for every UPDATE_POLL ms (followUpdate). A run that shows neither as running nor with a
+// result UPDATE_START_WAIT ms after the click did not start. The browser keeps the start time of
+// the result or interrupted run that was dismissed last, so the row does not show it again
+var UPDATE_POLL = 2000,
+    UPDATE_START_WAIT = 30 * 1000,
+    UPDATE_SEEN_KEY = 'geomate-update-seen';
+
+/**
+ * State of an update run for the Updates row, from the update fields of a getStatus reply. Only
+ * a backend with the token ui_update sends them; without them the state is 'none'.
+ * @param {object} st - The last status reply that arrived, or null.
+ * @param {object} run - { at, prev } of an update started from this page, or null: the time of
+ *   the click and the start time of the result known then (null without one).
+ * @param {number} seen - Start time of the result or interrupted run dismissed last, or null.
+ * @param {boolean} denied - The last status request was denied (sessionDenied).
+ * @returns {string} 'denied', 'running', 'starting', 'interrupted', 'done', 'failed' or 'none'.
+ */
+function updateState(st, run, seen, denied) {
+    var result;
+
+    st = st || {};
+    // Without a start time it is no result: Dismiss could not tell it from a later one
+    result = (L.isObject(st.update_result) && typeof st.update_result.started == 'number') ? st.update_result : null;
+
+    if (denied && (run || st.update_running === true))
+        return 'denied';
+    if (st.update_running === true)
+        return 'running';
+    // The run has not taken the lock yet: no result, or still the one from before the click
+    if (run && st.update_interrupted !== true && (!result || result.started === run.prev))
+        return 'starting';
+    if (st.update_interrupted === true && st.update_started !== seen)
+        return 'interrupted';
+    if (result && result.started !== seen)
+        return (result.rc === 0) ? 'done' : 'failed';
+    return 'none';
+}
+
+// Start time of the result or interrupted run that was dismissed last in this browser, or null
+function updateSeen() {
+    var seen = null;
+
+    try { seen = window.localStorage.getItem(UPDATE_SEEN_KEY); } catch (e) {}
+    return /^\d+$/.test(seen || '') ? +seen : null;
+}
+
+function storeUpdateSeen(started) {
+    try { window.localStorage.setItem(UPDATE_SEEN_KEY, String(started)); } catch (e) {}
+}
+
 // A version marker as the updater stamps it: 'dev', a release such as 1.2.0 or a commit hash
 function validVersion(v) {
     return typeof v == 'string' && (v === 'dev' || /^\d+\.\d+\.\d+$/.test(v) || /^[0-9a-f]{7,40}$/.test(v));
@@ -1327,6 +1378,10 @@ return view.extend({
     restartTimer: null,     // timer of the next status request while it waits (followRestart)
     modeWait: false,        // after a mode change, until the running sets have the configured mode (modeBuilt)
     modeSeen: 0,            // time a reply last showed the service running or loading, from that change on
+    statusDenied: false,    // the last status request was denied (sessionDenied)
+    updateRun: null,        // { at, prev } of an update started here, until a reply shows how it ended (updateState)
+    updateTimer: null,      // timer of the next status request while an update starts or runs (followUpdate)
+    updateShown: 'none',    // update state the Updates row shows (showVersions)
     details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
     detailsDenied: false,   // detailsOff because the session was denied (sessionDenied)
@@ -1457,6 +1512,12 @@ return view.extend({
             #geomate-status .gm-status-details::before { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; border: 1px solid currentColor; border-radius: 4px; opacity: 0.2; pointer-events: none; }
             #geomate-status .gm-contents { display: contents; }
             #geomate-status .gm-status-details .cbi-button { margin: 0 0 0 8px; }
+            /* Updates row: the state and its buttons wrap with gaps, a wrapped button starts
+               below the text. The label stands on the first line of a value of several lines */
+            #geomate-status .gm-first-line { align-self: baseline; }
+            #geomate-status .gm-update-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+            #geomate-status .gm-update-line > :empty { display: none; }
+            #geomate-status .gm-status-details .gm-update-line .cbi-button { margin: 0; }
             @media (max-width: 639px) {
                 #geomate-status .gm-wide { display: none; }
             }
@@ -1523,9 +1584,9 @@ return view.extend({
             #gm-mode-menu .gm-mode-note { display: block; font-size: 90%; opacity: 0.7; }
         `);
 
-        // A key and its value in the details panel
-        var row = function(label, value) {
-            return [ E('span', { 'class': 'gm-muted' }, [ label ]), value ];
+        // A key and its value in the details panel. cls: a class of the key
+        var row = function(label, value, cls) {
+            return [ E('span', { 'class': cls ? 'gm-muted ' + cls : 'gm-muted' }, [ label ]), value ];
         };
 
         n.state = E('span', { 'id': 'service-status-text', 'class': 'gm-status gm-status--neutral gm-muted' });
@@ -1563,6 +1624,24 @@ return view.extend({
             'class': 'btn cbi-button cbi-button-neutral',
             'click': L.bind(function() { this.checkForUpdates(true); }, this)
         }, [ _('Check again') ]);
+        // showVersions() shows them for a backend that updates from the page (canUpdate)
+        n.updateBtn = E('button', {
+            'class': 'btn cbi-button cbi-button-action',
+            'hidden': '',
+            'click': L.bind(this.confirmUpdate, this)
+        }, [ _('Update') ]);
+        n.channelBtn = E('button', {
+            'class': 'btn cbi-button cbi-button-neutral',
+            'hidden': '',
+            'click': L.bind(this.changeChannel, this)
+        }, [ _('Change channel') ]);
+        n.dismiss = E('button', {
+            'class': 'btn cbi-button cbi-button-neutral',
+            'hidden': '',
+            'click': L.bind(this.dismissUpdate, this)
+        }, [ _('Dismiss') ]);
+        // Second lines below the update state (showVersions)
+        n.updateNote = E('div', { 'class': 'gm-muted', 'hidden': '' });
 
         n.statusRow = E('details', { 'id': 'geomate-status' }, [
             E('summary', { 'mousedown': noFocus }, [
@@ -1577,7 +1656,10 @@ return view.extend({
                 [ n.detailChecks ],
                 row(_('Backend'), n.detailBackend),
                 row(_('Frontend'), n.detailFrontend),
-                row(_('Updates'), E('span', {}, [ n.detailUpdate, n.recheck ]))
+                row(_('Updates'), E('span', { 'class': 'gm-first-line' }, [
+                    E('span', { 'class': 'gm-update-line' }, [ n.detailUpdate, n.recheck, n.updateBtn, n.channelBtn, n.dismiss ]),
+                    n.updateNote
+                ]), 'gm-first-line')
             ))
         ]);
 
@@ -2509,16 +2591,103 @@ return view.extend({
             UI_VERSION !== 'dev' && installed !== UI_VERSION;
     },
 
+    // Updates and channel changes can be started from this page: write access, a backend with
+    // the token ui_update and a stamped version (a 'dev' backend updates from the CLI only), and
+    // a page that is the installed one
+    canUpdate: function() {
+        var st = this.lastStatus,
+            inst = st && st.installed,
+            backend = L.isObject(inst) ? inst.backend : null;
+
+        return !this.readonly && hasCapability(st, 'ui_update') && validVersion(backend) &&
+            backend !== 'dev' && !this.pageOutdated();
+    },
+
+    // State of an update run (updateState) as the last status reply and this page know it
+    updateRunState: function() {
+        return updateState(this.lastStatus, this.updateRun, updateSeen(), this.statusDenied);
+    },
+
+    // An update starts or runs: no version check and no second update meanwhile
+    updateBusy: function() {
+        var state = this.updateRunState();
+
+        return state == 'starting' || state == 'running';
+    },
+
+    // Texts of the Updates row for an update state: { summary, detail, notes, primary }, null
+    // for 'none'. Versions, error and the two paths of the result are shown as plain text. A
+    // version counts as updated when the run left another one than it found
+    updateTexts: function(state) {
+        var st = this.lastStatus || {},
+            res = L.isObject(st.update_result) ? st.update_result : {},
+            updated = function(before, after) {
+                return (typeof after == 'string' && after !== '' && after !== before) ? formatVersionDisplay(after) : null;
+            },
+            backend = updated(res.backend_before, res.backend_after),
+            frontend = updated(res.frontend_before, res.frontend_after),
+            backup = (typeof res.backup_dir == 'string' && res.backup_dir !== '')
+                ? [ _('Files you had changed were replaced. Copies are in %s until the next reboot.').format(res.backup_dir) ] : [];
+
+        switch (state) {
+        case 'starting':
+            return { summary: _('Starting update...'), detail: _('Starting update...'), notes: [] };
+        case 'running':
+            return {
+                summary: _('Updating...'),
+                detail: (typeof st.update_running_for == 'number')
+                    ? _('Update running for %d s').format(st.update_running_for) : _('Updating...'),
+                notes: []
+            };
+        case 'done':
+            // A run that finished an interrupted one may replace changed files and no version
+            if (!backend && !frontend)
+                return { summary: _('Up to date'), detail: _('Nothing to update.'), notes: backup };
+            return {
+                summary: _('Updated'),
+                detail: (backend && frontend) ? _('Updated to backend %s and frontend %s.').format(backend, frontend)
+                    : backend ? _('Backend updated to %s.').format(backend) : _('Frontend updated to %s.').format(frontend),
+                notes: backup
+            };
+        case 'failed':
+            return {
+                summary: _('Update failed'),
+                detail: (typeof res.error == 'string' && res.error !== '')
+                    ? _('Update failed: %s').format(res.error) : _('Update failed.'),
+                // Only a run started from a page (update_start) writes a log
+                notes: backup.concat((typeof res.log == 'string' && res.log !== '')
+                    ? [ _('See %s on the router.').format(res.log) ] : []),
+                primary: true
+            };
+        case 'interrupted':
+            return {
+                summary: _('Update interrupted'),
+                detail: _('The update was interrupted. Run it again.'),
+                notes: [],
+                primary: true
+            };
+        case 'denied':
+            return {
+                summary: _('Log in again'),
+                detail: _('Log in again to see the result of the update.'),
+                notes: [],
+                primary: true
+            };
+        }
+        return null;
+    },
+
     // Show the versions and the update state of versionInfo; before the first result the
     // frontend version of this file. On an outdated page (pageOutdated) the reload note shows,
-    // and a frontend update is not offered: check_version compares the installed frontend
+    // and a frontend update is not offered: check_version compares the installed frontend.
+    // An update run and its result (updateState) show in the same nodes, with the buttons
     showVersions: function() {
         var n = this.nodes,
             v = this.versionInfo || versionState({}),
             outdated = this.pageOutdated(),
             update = (outdated && v.update == 'both') ? 'backend' : (outdated && v.update == 'frontend') ? null : v.update,
             versions = [],
-            summary = '', detail = '', primary = false;
+            summary = '', detail = '', note = '', primary = false;
 
         if (!n)
             return;
@@ -2552,6 +2721,9 @@ return view.extend({
                     : (update == 'backend') ? _('Backend update available') : _('Frontend update available');
                 detail = (update == 'both') ? _('Backend and frontend updates available') : summary;
                 primary = true;
+                // A status reply without the backend token ui_update: updates run on the router
+                if (this.lastStatus && !hasCapability(this.lastStatus, 'ui_update'))
+                    note = _('To update, run %s on the router.').format('service geomate update');
             }
         }
         else if (v.state == 'current') {
@@ -2562,10 +2734,38 @@ return view.extend({
             detail = v.limited ? _('GitHub limit reached. Try again later.') : _('GitHub did not answer. Try again later.');
         }
 
+        // An update run or its result takes the place of the version state until it is dismissed
+        var state = this.updateRunState(),
+            texts = this.updateTexts(state),
+            busy = (state == 'starting' || state == 'running'),
+            can = this.canUpdate(),
+            notes = texts ? texts.notes : note ? [ note ] : [],
+            noteKey = notes.join('\n');
+
+        if (texts) {
+            summary = texts.summary;
+            detail = texts.detail;
+            primary = texts.primary === true;
+        }
+        // The details open once when an update failed or was interrupted
+        if (state !== this.updateShown && (state == 'failed' || state == 'interrupted'))
+            n.statusRow.open = true;
+        this.updateShown = state;
+
         n.update.textContent = summary;
         n.update.className = 'gm-wide ' + (primary ? 'gm-primary' : 'gm-muted');
         n.detailUpdate.textContent = detail;
-        n.recheck.disabled = !!this.versionBusy;
+        // One line per note, built again only when a text changed: a selected path stays selected
+        if (noteKey !== n.updateNoteKey) {
+            n.updateNoteKey = noteKey;
+            dom.content(n.updateNote, notes.map(function(t) { return E('div', {}, [ t ]); }));
+        }
+        n.updateNote.hidden = !notes.length;
+        n.recheck.disabled = !!this.versionBusy || busy;
+        n.updateBtn.hidden = !(can && (update || state == 'interrupted'));
+        n.channelBtn.hidden = !can;
+        n.updateBtn.disabled = n.channelBtn.disabled = busy || state == 'denied';
+        n.dismiss.hidden = [ 'done', 'failed', 'interrupted' ].indexOf(state) < 0;
     },
 
     // Polls are added once, after the first render, as bound functions: poll.add() skips only a
@@ -2640,13 +2840,20 @@ return view.extend({
         }, this), STATUS_HIDDEN_INTERVAL * 1000) : null;
     },
 
-    // One request at a time, like pollConnections()
+    // One request at a time, like pollConnections(). A failed status request changes nothing
+    // about an update, the last reply that arrived counts; only a denied one shows (updateState)
     pollStatus: function() {
         var self = this, sent = performance.now();
 
         if (!this.statusBusy)
             this.statusBusy = Promise.all([
-                L.resolveDefault(callGetStatus(), null),
+                callGetStatus().then(function(st) {
+                    self.statusDenied = false;
+                    return st;
+                }, function(err) {
+                    self.statusDenied = sessionDenied(err);
+                    return null;
+                }),
                 L.resolveDefault(callGetHealthCheck(), null)
             ]).then(function(r) {
                 self.status = r[0];
@@ -2667,11 +2874,13 @@ return view.extend({
                     if (self.backendPid !== undefined && pid !== self.backendPid)
                         self.backendRuns++;
                     self.backendPid = pid;
+                    self.updateReplied(r[0]);
                 }
                 self.statusLoaded = true;
                 self.updateStatus(sent);
                 self.showVersions();
                 self.checkAfterUpdate();
+                self.followUpdate();
             }).finally(function() {
                 self.statusBusy = null;
             });
@@ -5083,16 +5292,171 @@ return view.extend({
         }, RESTART_POLL);
     },
 
+    // Dialog of the Update button: what the update installs. After an interrupted run it
+    // finishes that one, which installs both components again. Cancel first: Escape clicks the
+    // first button of the dialog
+    confirmUpdate: function() {
+        var self = this, n = this.nodes,
+            v = this.versionInfo || versionState({}),
+            interrupted = this.updateRunState() == 'interrupted',
+            lines = [],
+            line = function(text, c) {
+                return text.format(formatVersionDisplay(c.current), formatVersionDisplay(c.latest));
+            };
+
+        if (!this.canUpdate() || this.updateBusy() || !(v.update || interrupted))
+            return;
+
+        if (v.update == 'both' || v.update == 'backend')
+            lines.push(line(_('Backend: %s → %s'), v.backend));
+        if (v.update == 'both' || v.update == 'frontend')
+            lines.push(line(_('Frontend: %s → %s'), v.frontend));
+        if (!lines.length)
+            lines.push(_('Installs backend and frontend again.'));
+        if (interrupted || v.update == 'both' || v.update == 'backend')
+            lines.push(_('Geomate restarts after a backend update.'));
+
+        var confirm = E('button', { 'class': 'btn cbi-button-action', 'click': function() {
+            ui.hideModal();
+            self.startUpdate([ '-y' ]);
+        } }, [ _('Update') ]);
+
+        ui.showModal(_('Update Geomate?'), lines.map(function(text) {
+            return E('p', {}, [ text ]);
+        }).concat([
+            E('div', { 'class': 'right' }, [
+                E('button', { 'class': 'btn', 'click': function() {
+                    ui.hideModal();
+                    n.updateBtn.focus();
+                } }, [ _('Cancel') ]), ' ', confirm
+            ])
+        ]));
+        confirm.focus();
+    },
+
+    // Dialog of the Change channel button: release or snapshot for both components. The channel
+    // the backend is not on comes selected; a channel both are on already cannot be picked
+    changeChannel: function() {
+        var self = this, n = this.nodes,
+            inst = (this.lastStatus && L.isObject(this.lastStatus.installed)) ? this.lastStatus.installed : {};
+
+        if (!this.canUpdate() || this.updateBusy())
+            return;
+
+        var confirm = E('button', { 'class': 'btn cbi-button-action', 'click': function() {
+            ui.hideModal();
+            self.startUpdate([ '-v', select.value ]);
+        } }, [ _('Switch') ]);
+        var mark = function() {
+            confirm.disabled = (inst.backend_channel === select.value && inst.frontend_channel === select.value);
+        };
+        var select = E('select', { 'class': 'cbi-input-select', 'change': mark }, [
+            E('option', { 'value': 'release' }, [ _('Release (stable versions)') ]),
+            E('option', { 'value': 'snapshot' }, [ _('Snapshot (latest code from the main branch)') ])
+        ]);
+
+        select.value = (inst.backend_channel === 'release') ? 'snapshot' : 'release';
+        mark();
+
+        ui.showModal(_('Change update channel'), [
+            E('p', {}, [ E('label', {}, [ _('Channel'), ' ', select ]) ]),
+            E('p', {}, [ _('Installs the latest version of the channel for backend and frontend, even if it is older than the installed one. Geomate restarts.') ]),
+            E('div', { 'class': 'right' }, [
+                E('button', { 'class': 'btn', 'click': function() {
+                    ui.hideModal();
+                    n.channelBtn.focus();
+                } }, [ _('Cancel') ]), ' ', confirm
+            ])
+        ]);
+        select.focus();
+    },
+
+    /**
+     * Start an update run in the background: '/etc/init.d/geomate update_start' with args, which
+     * the backend accepts as '-y', '-v release' or '-v snapshot' only. The Updates row shows it
+     * as starting until a status reply shows the run or its result (updateState). Exit code 3:
+     * a run is going on already, and the row follows that one.
+     * @param {string[]} args - Arguments of update_start.
+     */
+    startUpdate: function(args) {
+        var self = this,
+            result = this.lastStatus && this.lastStatus.update_result,
+            firstLine = function(text) { return String(text || '').trim().split('\n')[0]; },
+            failed = function(text) {
+                self.updateRun = null;
+                notify(_('Could not start the update: %s').format(text));
+                self.showVersions();
+            };
+
+        this.updateRun = { at: Date.now(), prev: L.isObject(result) ? result.started : null };
+        this.showVersions();
+
+        return fs.exec('/etc/init.d/geomate', [ 'update_start' ].concat(args)).then(function(res) {
+            if (res.code !== 0 && res.code !== 3)
+                return failed(firstLine(res.stderr) || firstLine(res.stdout) || _('Exit code %d').format(res.code));
+            if (res.code === 3)
+                notify(_('An update is already running.'), 'info');
+            return self.refreshStatus();
+        }, function(err) {
+            failed(errorText(err));
+        });
+    },
+
+    // A status reply came in while an update started here is waited for. The wait ends when the
+    // run is over (the reply shows its result, or the run as interrupted) and when the reply has
+    // no update fields: a channel change to an older version replaced luci.geomate
+    updateReplied: function(st) {
+        if (this.updateRun && (typeof st.update_running != 'boolean' ||
+            (!st.update_running && this.updateRunState() != 'starting')))
+            this.updateRun = null;
+    },
+
+    // While an update starts or runs, the status is asked for every UPDATE_POLL ms, as
+    // followRestart() does after a mode change; every status reply calls this (pollStatus), so
+    // a run started in another tab or from the CLI is followed too. A hidden tab or a paused
+    // auto refresh leaves it to the status poll. An update started here that shows no run and
+    // no result after UPDATE_START_WAIT did not start
+    followUpdate: function() {
+        var self = this, state = this.updateRunState();
+
+        window.clearTimeout(this.updateTimer);
+        if (state == 'starting' && Date.now() - this.updateRun.at > UPDATE_START_WAIT) {
+            this.updateRun = null;
+            notify(_('The update did not start.'));
+            this.showVersions();
+            return;
+        }
+        if (state != 'starting' && state != 'running')
+            return;
+        this.updateTimer = window.setTimeout(function() {
+            if (!document.hidden && poll.active())
+                L.resolveDefault(self.refreshStatus());
+        }, UPDATE_POLL);
+    },
+
+    // Dismiss button: the result or the interrupted run that the Updates row shows is not shown
+    // again in this browser, until a later run replaces it
+    dismissUpdate: function() {
+        var st = this.lastStatus || {},
+            started = (this.updateShown == 'interrupted') ? st.update_started
+                : L.isObject(st.update_result) ? st.update_result.started : null;
+
+        if (typeof started == 'number')
+            storeUpdateSeen(started);
+        this.showVersions();
+    },
+
     // After an update of either component the status reports other installed versions: ask for
     // the versions again, once per change. A plain restart changes nothing here. A result cached
     // for these versions (e.g. by another tab) is shown without a request (checkForUpdates), and
     // any result stays while the status has no installed versions. A check that fails without a
     // result is not repeated by the status poll, the hourly poll tries again. A busy check is no
-    // reason to wait: it ends here (checkForUpdates) and finds versions that changed meanwhile
+    // reason to wait: it ends here (checkForUpdates) and finds versions that changed meanwhile.
+    // An update that starts or runs is one: the check follows when it is over
     checkAfterUpdate: function() {
         var installed = installedKey(this.status);
 
-        if (installed == null || installed === this.versionInstalled || this.versionBusy)
+        if (installed == null || installed === this.versionInstalled || this.versionBusy || this.updateBusy())
             return;
         this.versionInstalled = installed;
         this.checkForUpdates();
@@ -5124,6 +5488,11 @@ return view.extend({
             // A status request on its way tells which installed versions this check belongs to
             return Promise.resolve(self.statusBusy).catch(function() {});
         }).then(function() {
+            // No check while an update starts or runs, which the status reply that came
+            // meanwhile may show: the updater asks GitHub itself. versionInstalled stays as it
+            // is, so the check follows once the versions have changed (checkAfterUpdate)
+            if (self.updateBusy())
+                return null;
             installed = installedKey(self.status);
             self.versionInstalled = installed;
             // With the installed versions known now, an entry stored for them may count after all
@@ -5139,7 +5508,8 @@ return view.extend({
                 return entry;
             });
         }).then(function(entry) {
-            self.versionInfo = versionState(entry);
+            if (entry)
+                self.versionInfo = versionState(entry);
         }).catch(function(error) {
             // No answer: a timeout means GitHub was slow, anything else that the command did
             // not run (e.g. no permission). Nothing to cache; known versions stay
