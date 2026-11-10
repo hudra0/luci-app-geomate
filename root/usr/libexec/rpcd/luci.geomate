@@ -1342,6 +1342,56 @@ local function nft_table_terse()
     return result
 end
 
+-- The configuration the running sets were built with: the backend puts a copy of the config
+-- file there once a start has filled the sets and deletes it at the next start and at a stop.
+-- 'pending' holds the uci changes that were staged, not committed, at that start
+local BUILT_CONFIG_DIR = "/tmp/geomate/config"
+
+-- A word of a uci config line without its quotes: 'word', "word" or word
+local function uci_word(s)
+    return s:match("^'([^']*)'") or s:match('^"([^"]*)"') or s:match("^(%S+)")
+end
+
+-- Operational mode the running sets were built with, from that copy: 'operational_mode' of the
+-- section named 'global', then the staged changes of it in 'pending', the last one wins. As in
+-- the backend, a missing or empty option is 'dynamic'. "" while there is no copy (stopped, or a
+-- start that is still loading). Read from the files: luci.model.uci reads the live config only
+local function running_mode()
+    local f = io.open(BUILT_CONFIG_DIR .. "/geomate", "r")
+    if not f then
+        return ""
+    end
+    local mode, in_global = nil, false
+    for line in f:lines() do
+        local keyword, rest = line:match("^%s*(%a+)%s+(.-)%s*$")
+        if keyword == "config" then
+            -- config <type> <name>
+            local name = rest:match("^%S+%s+(.+)$")
+            in_global = name ~= nil and uci_word(name) == "global"
+        elseif keyword == "option" and in_global then
+            local key, value = rest:match("^(%S+)%s+(.+)$")
+            if key and uci_word(key) == "operational_mode" then
+                mode = uci_word(value)
+            end
+        end
+    end
+    f:close()
+
+    f = io.open(BUILT_CONFIG_DIR .. "/pending", "r")
+    if f then
+        for line in f:lines() do
+            local value = line:match("^geomate%.global%.operational_mode=(.-)%s*$")
+            if value then
+                mode = value:match("^'(.*)'$") or value
+            elseif line:match("^%-geomate%.global%.operational_mode%s*$") then
+                mode = nil
+            end
+        end
+        f:close()
+    end
+    return (mode and mode ~= "") and mode or "dynamic"
+end
+
 -- Get service status information
 local function get_service_status()
     local status = {
@@ -1433,6 +1483,11 @@ local function get_service_status()
     end
 
     status.capabilities = backend_capabilities()
+    -- After a mode change the page waits until the running sets have the configured mode. Only
+    -- a backend that reports capabilities keeps the configuration copy
+    if #status.capabilities > 0 then
+        status.running_mode = running_mode()
+    end
     -- The page checks for updates again when these change, and asks for a reload when its own
     -- UI_VERSION differs from the installed one
     status.installed = installed_versions()
