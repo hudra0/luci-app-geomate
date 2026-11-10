@@ -549,6 +549,30 @@
         @media (pointer: coarse) {
             #gm-toast .gm-toast-action { min-height: 40px; }
         }
+
+        /* In place of the map when Leaflet could not be loaded */
+        #map.gm-map-error {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            padding: 16px;
+            font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+            text-align: center;
+            color: var(--gm-fg);
+            background: var(--gm-bg);
+        }
+
+        /* Note in the bottom left corner while the map tiles fail to load */
+        .gm-tile-note {
+            max-width: 260px;
+            padding: 6px 10px;
+            font: 400 12px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+            color: var(--gm-fg);
+            background: var(--gm-bg);
+            border-radius: 4px;
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4);
+        }
     </style>
 </head>
 <body>
@@ -559,6 +583,19 @@
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
     <script>
         'use strict';
+
+        // Leaflet and its plugins come from unpkg.com. Without them (no internet access in the
+        // browser, the host blocked) the map says so instead of staying blank and stops here:
+        // the view gets no mapReady and works on without the map
+        if (!window.L || !L.Draw || !L.markerClusterGroup) {
+            (function(box) {
+                box.className = 'gm-map-error';
+                box.setAttribute('role', 'alert');
+                box.textContent = 'Could not load the map libraries from unpkg.com. ' +
+                    'Check the internet access of this browser, then reload the page.';
+            })(document.getElementById('map'));
+            throw new Error('Geomate map: Leaflet could not be loaded');
+        }
 
         var map, drawnItems;
         var readonly = true;    // until the parent says otherwise (setReadonly)
@@ -586,6 +623,9 @@
         var refitUntil = 0;     // until then a resize fits the start view again; user input ends it
         var focusSid = null;    // filter whose circles the start view fits (fitFilter message)
         var radiusPill = null;  // radius at the resize handle (edit) or at the cursor (draw)
+        var TILE_ERRORS = 4;    // failed map tiles in a row that show the tile note
+        var tileErrors = 0;     // map tiles that failed to load since the last one that loaded
+        var tileNote = null;    // the tile note (GmTileNote), once it was needed
 
         /*
          * The selected circle, edited on its own: { layer, region, backup: { latlng, radius },
@@ -2236,6 +2276,34 @@
             }
         });
 
+        /*
+         * Tile note: a note in the bottom left corner while the map tiles fail to load (no
+         * internet access in the browser, the tile server down). It shows after TILE_ERRORS
+         * failed tiles in a row and goes with the next tile that loads. Circles, markers and
+         * tools work without tiles.
+         */
+        var GmTileNote = L.Control.extend({
+            options: { position: 'bottomleft' },
+            onAdd: function() {
+                var box = L.DomUtil.create('div', 'gm-tile-note');
+                box.setAttribute('role', 'status');
+                box.textContent = 'Could not load the map tiles. Check the internet access of this browser.';
+                L.DomEvent.disableClickPropagation(box);
+                return box;
+            }
+        });
+
+        function onTileError() {
+            if (++tileErrors !== TILE_ERRORS) return;
+            tileNote = tileNote || new GmTileNote();
+            tileNote.addTo(map);
+        }
+
+        function onTileLoad() {
+            tileErrors = 0;
+            if (tileNote) tileNote.remove();
+        }
+
         /**
          * Initializes the map and its components.
          */
@@ -2257,7 +2325,7 @@
                 attribution: '© OpenStreetMap contributors',
                 noWrap: true,
                 bounds: [[-90, -180], [90, 180]]
-            }).addTo(map);
+            }).on({ tileerror: onTileError, tileload: onTileLoad }).addTo(map);
 
             // Known servers: a canvas in a pane of their own below the circles (overlayPane, 400),
             // which takes no pointer events, so circle clicks and map clicks still arrive
