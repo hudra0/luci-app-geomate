@@ -1284,7 +1284,8 @@ return view.extend({
         // in the dialog, and on Save after Source IP, which comes before it, has added text
         // typed without Enter. The other options count as the dialog has them, one that is
         // not in the dialog as saved
-        o = s.option(form.Value, 'src_port', _('Source Port'));
+        o = s.option(form.Value, 'src_port', _('Source Port'),
+            _('Local port of the game on the device. Empty: any port.'));
         o.datatype = 'list(neg(portrange))';
         o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
@@ -1300,7 +1301,8 @@ return view.extend({
         };
 
         // Destination port configuration
-        o = s.option(form.Value, 'dest_port', _('Destination Port'));
+        o = s.option(form.Value, 'dest_port', _('Destination Port'),
+            _('Port of the game servers. Empty: any port.'));
         o.datatype = 'list(neg(portrange))';
         o.placeholder = _('25200 25300 or 27015-27020');
         o.modalonly = true;
@@ -1326,8 +1328,9 @@ return view.extend({
             o.modalonly = true;
         }
 
-        // Path to the IP list file
-        o = s.option(form.Value, 'ip_list', _('IP List File'));
+        // Path to the IP list file. The three list buttons follow it
+        o = s.option(form.Value, 'ip_list', _('IP List File'),
+            _('File in which Geomate keeps the server IPs of this filter.'));
         o.rmempty = false;
         o.modalonly = true;
         // Only a changed path is checked: a saved one does not block saving the other options
@@ -1335,16 +1338,6 @@ return view.extend({
         o.validate = function(section_id, value) {
             return value === this.cfgvalue(section_id) || listPathError(value) || true;
         };
-
-        // IP expiry days - removes inactive IPs after specified days
-        o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
-            _('Automatically remove IPs not seen for this many days. Set to 0 to disable. ' +
-              'Useful for games with dynamic servers where IPs change frequently.'));
-        o.datatype = 'uinteger';
-        o.placeholder = '0';
-        o.default = '0';  // Default for existing filters: disabled
-        o.rmempty = true;
-        o.modalonly = true;
 
         // Create Empty List button: only fills in the file name, and only into an empty field.
         // A path that is set stays, so the filter keeps its list
@@ -1408,6 +1401,16 @@ return view.extend({
 
             return path ? downloadList(this, path) : null;
         };
+
+        // IP expiry days - removes inactive IPs after specified days
+        o = s.option(form.Value, 'ip_expiry_days', _('IP Expiry (Days)'),
+            _('Automatically remove IPs not seen for this many days. Set to 0 to disable. ' +
+              'Useful for games with dynamic servers where IPs change frequently.'));
+        o.datatype = 'uinteger';
+        o.placeholder = '0';
+        o.default = '0';  // Default for existing filters: disabled
+        o.rmempty = true;
+        o.modalonly = true;
 
         return m.render().then(function(node) {
             // A run that was going on when the page loaded (manual or daily)
