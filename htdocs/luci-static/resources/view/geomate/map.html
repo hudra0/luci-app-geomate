@@ -516,22 +516,28 @@
             .gm-icon-btn { width: 40px; height: 40px; }
         }
 
-        /* Short messages from the parent, e.g. Applied with Undo, or why a change was not applied */
+        /* Short messages from the parent, e.g. Applied with Undo, or why a change was not applied:
+           a toast with buttons, and below it a later one without buttons (showToast) */
         #gm-toast {
-            display: none;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
             position: fixed;
             top: 10px;
             left: 50%;
             transform: translateX(-50%);
             z-index: 1002;
             max-width: 80%;
+            pointer-events: none;   /* text only: clicks and drags reach the map and its controls */
+        }
+        .gm-toast-item {
             padding: 6px 12px;
             background: var(--gm-bg);
             color: var(--gm-fg);
             border-radius: 4px;
             box-shadow: 0 1px 5px rgba(0,0,0,0.4);
             font: 13px/1.4 sans-serif;
-            pointer-events: none;   /* text only: clicks and drags reach the map and its controls */
         }
         #gm-toast .gm-toast-action {
             pointer-events: auto;   /* except its action button */
@@ -667,7 +673,8 @@
         var lastPick = null;    // { point, time, layer } of the last click that selected a circle
         // Tokens differ between iframe loads, so a late answer never hits a circle of a new map
         var tokenPrefix = Math.random().toString(36).slice(2, 10) + '-';
-        var toastTimer = null;
+        // The toasts that show: { action: { el, timer }, plain: { el, timer } } (showToast)
+        var toasts = {};
 
         /*
          * Edit handles of the selected circle: round, HANDLE_SIZE (28 px, 36 px on touch screens),
@@ -782,14 +789,16 @@
         }
 
         /**
-         * Shows a short message on top of the map, 6 s, or 10 s with buttons.
+         * Shows a short message on top of the map, 6 s, or 10 s with buttons. A message with
+         * buttons ('action') stays for its own time when a later one without buttons ('plain')
+         * arrives, which shows below it: Undo stays in reach. Any other message replaces what shows.
          * @param {string} text - The message, shown as text.
          * @param {Array} [actions] - [{ label, name, sid, id }]: buttons that send
          *   toastAction { name, sid, id }, e.g. Undo after a change was applied.
          */
         function showToast(text, actions) {
-            var el = document.getElementById('gm-toast');
-            var hide = function() { el.style.display = 'none'; };
+            var kind = (actions && actions.length) ? 'action' : 'plain',
+                el = L.DomUtil.create('div', 'gm-toast-item');
 
             el.textContent = text;
             (actions || []).forEach(function(action) {
@@ -797,13 +806,24 @@
                 button.type = 'button';
                 button.textContent = action.label;
                 onTap(button, function() {
-                    hide();
+                    hideToast('action');
                     post('toastAction', { name: action.name, sid: action.sid, id: action.id });
                 });
             });
-            el.style.display = 'block';
-            clearTimeout(toastTimer);
-            toastTimer = setTimeout(hide, (actions && actions.length) ? 10000 : 6000);
+            hideToast('plain');
+            if (kind === 'action') hideToast('action');
+            // After a toast with buttons, which keeps its place
+            document.getElementById('gm-toast').appendChild(el);
+            toasts[kind] = { el: el, timer: setTimeout(function() { hideToast(kind); }, (kind === 'action') ? 10000 : 6000) };
+        }
+
+        // Removes the toast of this kind ('action' or 'plain'), if one shows
+        function hideToast(kind) {
+            var t = toasts[kind];
+            if (!t) return;
+            clearTimeout(t.timer);
+            L.DomUtil.remove(t.el);
+            delete toasts[kind];
         }
 
         /**
