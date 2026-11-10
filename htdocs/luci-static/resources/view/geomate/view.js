@@ -515,6 +515,12 @@ function restartsAnyway(status) {
         (Array.isArray(status.nft_errors) && status.nft_errors.length > 0));
 }
 
+// The running sets were built with the configured mode. Without the field (an older
+// luci.geomate, or a backend that keeps no configuration copy) nothing is known: no wait
+function modeBuilt(st) {
+    return typeof st.running_mode != 'string' || st.running_mode === (st.operational_mode || 'dynamic');
+}
+
 // Source IP suggestions from luci-rpc getHostHints, labelled like LuCI's Static Leases page:
 // 'IP (name)', without a name 'IP (MAC)'. The router's own addresses (getNetworkDevices) and
 // 127.0.0.0/8 are left out: a geo filter for them has no use. An address of two hosts counts
@@ -1319,6 +1325,8 @@ return view.extend({
     restartAt: 0,           // time of that change
     restartSeen: 0,         // time a reply last showed that PID running, from the change on (restartGap)
     restartTimer: null,     // timer of the next status request while it waits (followRestart)
+    modeWait: false,        // after a mode change, until the running sets have the configured mode (modeBuilt)
+    modeSeen: 0,            // time a reply last showed the service running or loading, from that change on
     details: null,          // the selected server (openServerDetails), null without a selection
     detailsOff: false,      // getServerSample is missing or not granted: no details links
     detailsDenied: false,   // detailsOff because the session was denied (sessionDenied)
@@ -2368,7 +2376,17 @@ return view.extend({
         if (this.restartPid != null && st && (st.loading || Date.now() - this.restartAt > RESTART_WAIT ||
             ((!running || st.pid !== this.restartPid) && !this.restartGap(st))))
             this.restartPid = null;
-        loading = !!(st ? (st.loading || this.restartPid != null) : (this.health && this.health.loading));
+        // A second mode change (an Undo) may meet the restart of the first one, whose start then
+        // ends with the mode from before: the note also stays until the running sets have the
+        // configured mode. A service that neither runs nor loads for RESTART_STOPPED ms ends it
+        if (this.modeWait && st) {
+            if (running || st.loading)
+                this.modeSeen = Date.now();
+            if (modeBuilt(st) || st.config_enabled === false || Date.now() - this.restartAt > RESTART_WAIT ||
+                Date.now() - this.modeSeen >= RESTART_STOPPED)
+                this.modeWait = false;
+        }
+        loading = !!(st ? (st.loading || this.restartPid != null || this.modeWait) : (this.health && this.health.loading));
 
         var state = st ? (running ? _('Running') : _('Not running'))
             : (this.statusLoaded ? _('Status unknown') : _('Loading status...'));
@@ -5012,14 +5030,21 @@ return view.extend({
         // Until the reply, the loading note shows from the PID known before
         this.restartPid = before;
         this.restartAt = this.restartSeen = at;
+        this.modeWait = true;
+        this.modeSeen = at;
         this.updateStatus();
         this.updateActiveConnectionsList();
         return this.refreshStatus().then(function() {
             var st = self.status;
 
-            // No restart to wait for, or a later mode change has taken over
-            if (merged || self.restartAt !== at)
+            // A later mode change has taken over
+            if (self.restartAt !== at)
                 return;
+            // No restart to wait for, unless the running sets have another mode (modeWait)
+            if (merged) {
+                self.followRestart(at);
+                return;
+            }
             // A reply from the gap of the restart (restartGap) waits for the PID from before
             self.restartPid = (before != null && st && self.restartGap(st)) ? before
                 : (self.serviceUp() && !st.loading && (Date.now() - at < PROCD_RELOAD_DELAY || st.pid === before)) ? st.pid
@@ -5050,7 +5075,7 @@ return view.extend({
         if (this.restartAt !== at)
             return;
         window.clearTimeout(this.restartTimer);
-        if (Date.now() - at > RESTART_WAIT || !(this.restartPid != null || (st && st.loading)))
+        if (Date.now() - at > RESTART_WAIT || !(this.restartPid != null || this.modeWait || (st && st.loading)))
             return;
         this.restartTimer = window.setTimeout(function() {
             if (self.restartAt === at && !document.hidden && poll.active())
